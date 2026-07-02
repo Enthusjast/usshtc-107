@@ -103,16 +103,21 @@ class ProxyServer extends EventEmitter {
   _bridgeSshToWss(channel, client, clientStr) {
     console.log(`[proxy] Bridging for ${clientStr}`);
     console.log(`[proxy] WSS URL: ${this.wssUrl}`);
-    console.log(`[proxy] Cookie length: ${this.cookie?.length || 0}`);
+    console.log(`[proxy] Cookie: ${this.cookie?.slice(0, 80) || '(empty)'}...`);
+    self.emit('proxy-log', 'info', 'wss', `Connecting: ${this.wssUrl}`);
+    self.emit('proxy-log', 'info', 'wss', `Cookie: ${this.cookie?.slice(0, 80) || '(empty)'}`);
 
     if (!this.cookie || this.cookie.length === 0) {
-      console.error(`[proxy] No cookie available — WSS will likely fail (401)`);
+      const msg = 'No cookie available — WSS will likely fail (401)';
+      console.error(`[proxy] ${msg}`);
+      self.emit('proxy-log', 'error', 'wss', msg);
     }
 
     const ws = new WebSocket(this.wssUrl, {
       headers: {
         Cookie: this.cookie,
         Origin: PLATFORM.origin,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       },
       rejectUnauthorized: false,
       handshakeTimeout: WSS_HANDSHAKE_TIMEOUT,
@@ -200,7 +205,9 @@ class ProxyServer extends EventEmitter {
 
     // SSH channel → WebSocket
     ws.on('open', () => {
-      console.log(`[proxy] WSS connected for ${clientStr}`);
+      const msg = `WSS connected for ${clientStr}`;
+      console.log(`[proxy] ${msg}`);
+      self.emit('proxy-log', 'info', 'wss', msg);
       startPingPong();
       channel.on('data', (data) => {
         if (ws.readyState === WebSocket.OPEN) {
