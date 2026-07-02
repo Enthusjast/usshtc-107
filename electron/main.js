@@ -538,6 +538,11 @@ async function startProxyServer() {
 
   // ---- Proxy events ----
 
+  // Forward proxy-internal logs to app log UI
+  proxyServer.on('proxy-log', (level, source, message) => {
+    addLog(level, source, message);
+  });
+
   proxyServer.on('started', ({ host, port }) => {
     state.proxyStatus = 'started';
     addLog('info', 'proxy', `Server started on ${host}:${port}`);

@@ -102,6 +102,12 @@ class ProxyServer extends EventEmitter {
 
   _bridgeSshToWss(channel, client, clientStr) {
     console.log(`[proxy] Bridging for ${clientStr}`);
+    console.log(`[proxy] WSS URL: ${this.wssUrl}`);
+    console.log(`[proxy] Cookie length: ${this.cookie?.length || 0}`);
+
+    if (!this.cookie || this.cookie.length === 0) {
+      console.error(`[proxy] No cookie available — WSS will likely fail (401)`);
+    }
 
     const ws = new WebSocket(this.wssUrl, {
       headers: {
@@ -194,6 +200,7 @@ class ProxyServer extends EventEmitter {
 
     // SSH channel → WebSocket
     ws.on('open', () => {
+      console.log(`[proxy] WSS connected for ${clientStr}`);
       startPingPong();
       channel.on('data', (data) => {
         if (ws.readyState === WebSocket.OPEN) {
@@ -219,7 +226,20 @@ class ProxyServer extends EventEmitter {
     });
 
     ws.on('unexpected-response', (_req, res) => {
-      console.error(`[proxy] WSS ${res.statusCode} for ${clientStr}`);
+      const msg = `WSS HTTP ${res.statusCode} for ${clientStr}`;
+      console.error(`[proxy] ${msg}`);
+      self.emit('proxy-log', 'error', 'wss', msg);
+      // Log response headers for debugging
+      console.error(`[proxy] WSS response headers:`, JSON.stringify(res.headers));
+      self.emit('proxy-log', 'debug', 'wss', `Response headers: ${JSON.stringify(res.headers)}`);
+      let body = '';
+      res.on('data', (chunk) => { body += chunk.toString(); });
+      res.on('end', () => {
+        if (body) {
+          console.error(`[proxy] WSS response body: ${body.slice(0, 500)}`);
+          self.emit('proxy-log', 'error', 'wss', `Response body: ${body.slice(0, 300)}`);
+        }
+      });
       if (res.statusCode === 401 || res.statusCode === 403) {
         self.emit('auth-error', { statusCode: res.statusCode, clientStr });
       }
@@ -227,12 +247,16 @@ class ProxyServer extends EventEmitter {
     });
 
     ws.on('error', (err) => {
-      console.error(`[proxy] WSS error for ${clientStr}:`, err.message);
+      const msg = `WSS error for ${clientStr}: ${err.message}`;
+      console.error(`[proxy] ${msg}`);
+      self.emit('proxy-log', 'error', 'wss', msg);
       cleanup();
     });
 
-    ws.on('close', (code) => {
-      console.log(`[proxy] WSS closed for ${clientStr}: code=${code}`);
+    ws.on('close', (code, reason) => {
+      const msg = `WSS closed for ${clientStr}: code=${code} reason=${reason?.toString() || 'none'}`;
+      console.log(`[proxy] ${msg}`);
+      self.emit('proxy-log', 'info', 'wss', msg);
       if (AUTH_CLOSE_CODES.has(code)) {
         self.emit('auth-error', { statusCode: code, clientStr });
       }
