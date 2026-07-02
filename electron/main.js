@@ -443,6 +443,9 @@ async function createLoginWindow() {
 
 let loggedIn = false;
 
+// Store cookies captured during login so they survive window close
+let capturedCookieString = '';
+
 async function onLoginFinalized(cookies) {
   if (state.loginStatus === 'success') return;
 
@@ -452,7 +455,11 @@ async function onLoginFinalized(cookies) {
   state.cookieCount = cookies.length;
   state.wssUrl = buildWssUrl();
 
+  // Build cookie string BEFORE closing login window (session cookies get deleted on close)
+  capturedCookieString = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
+
   addLog('info', 'auth', `Web SSH page reached — ${cookies.length} cookies read`);
+  addLog('info', 'auth', `Cookie names: ${cookies.map(c => c.name).join(', ')}`);
   sendToMain('login-status', 'success');
   sendToMain('cookie-status', { cookieValid: true, cookieCount: cookies.length });
   sendToMain('login-progress', { status: 'done', message: 'Cookies captured — starting proxy' });
@@ -462,7 +469,7 @@ async function onLoginFinalized(cookies) {
     loginWindow.close();
   }
 
-  await startProxyServer();
+  await startProxyServer(capturedCookieString);
 }
 
 // =========================================================================
@@ -484,6 +491,7 @@ async function updateCookieState() {
     if (cookies.length > 0) {
       state.cookieValid = true;
       state.cookieCount = cookies.length;
+      capturedCookieString = cookieStr; // keep captured cookies in sync
       if (proxyServer) proxyServer.updateCookie(cookieStr);
       sendToMain('cookie-status', { cookieValid: true, cookieCount: cookies.length });
     } else {
@@ -500,7 +508,7 @@ async function updateCookieState() {
 // Proxy Server
 // =========================================================================
 
-async function startProxyServer() {
+async function startProxyServer(cookieString) {
   if (state.proxyStatus === 'started' || state.proxyStatus === 'starting') return;
 
   state.proxyStatus = 'starting';
@@ -515,13 +523,17 @@ async function startProxyServer() {
     proxyServer = null;
   }
 
-  let cookies;
-  try {
-    cookies = await session.defaultSession.cookies.get({ domain: PLATFORM.domain });
-  } catch (_) {
-    cookies = [];
+  // Use provided cookie string (from login capture) or query from session (auto-connect)
+  let currentCookie = cookieString || '';
+  if (!currentCookie) {
+    let cookies;
+    try {
+      cookies = await session.defaultSession.cookies.get({ domain: PLATFORM.domain });
+    } catch (_) {
+      cookies = [];
+    }
+    currentCookie = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
   }
-  const currentCookie = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
 
   state.wssUrl = buildWssUrl();
 
