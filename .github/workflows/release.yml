@@ -5,16 +5,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version tag (e.g. v1.0.0)'
-        required: false
 
 permissions:
   contents: write
 
 jobs:
-  # ── Build for each platform ──────────────────────────────────────
   build:
     strategy:
       fail-fast: false
@@ -22,18 +17,12 @@ jobs:
         include:
           - os: ubuntu-latest
             target: linux
-            artifact_name: usshtc107-linux
-            artifact_pattern: release/*.AppImage release/*.deb
 
           - os: macos-latest
             target: mac
-            artifact_name: usshtc107-macos
-            artifact_pattern: release/*.dmg
 
           - os: windows-latest
             target: win
-            artifact_name: usshtc107-windows
-            artifact_pattern: release/*.exe
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -48,28 +37,32 @@ jobs:
 
       - run: npm run build
 
-      # macOS: generate .icns from .png (built-in sips tool)
+      # macOS: generate .icns from .png before electron-builder runs
       - name: Generate macOS icon
         if: matrix.target == 'mac'
         run: |
           mkdir -p build
-          sips -s format icns build/icon.png --out build/icon.icns 2>/dev/null || true
+          sips -s format icns build/icon.png --out build/icon.icns
 
-      # Build & package
+      # Linux: install AppImage build deps
+      - name: Install Linux deps
+        if: matrix.target == 'linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libfuse2
+
       - name: Package ${{ matrix.target }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npx electron-builder --${{ matrix.target }} --publish never
 
-      # List artifacts for debugging
-      - name: List artifacts
-        run: ls -la release/ 2>/dev/null || echo "No release dir"
+      - name: List built artifacts
+        run: ls -lh release/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.artifact_pattern }}
-          if-no-files-found: warn
+          name: usshtc107-${{ matrix.target }}
+          path: release/*
+          if-no-files-found: error
 
-  # ── Create GitHub Release ────────────────────────────────────────
   release:
     needs: build
     runs-on: ubuntu-latest
@@ -83,12 +76,11 @@ jobs:
       - name: List collected artifacts
         run: ls -lhR artifacts/
 
-      - name: Create Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           name: ${{ github.ref_name }}
-          files: artifacts/**
+          files: artifacts/*
           generate_release_notes: true
           fail_on_unmatched_files: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
