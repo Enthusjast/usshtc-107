@@ -910,3 +910,9 @@ process.on('unhandledRejection', (reason) => {
   log.error(`[app] Unhandled rejection: ${msg}`);
   addLog('error', 'app', `Unhandled: ${msg}`);
 });
+
+process.on('uncaughtException', (err) => {
+  log.error(`[app] Uncaught exception: ${err.message}`);
+  addLog('error', 'app', `Uncaught: ${err.message}`);
+  // Don't crash the app — log and continue
+});

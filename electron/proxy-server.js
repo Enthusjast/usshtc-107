@@ -170,10 +170,12 @@ class ProxyServer extends EventEmitter {
 
       // Clean up all listeners to prevent leaks
       ws.removeAllListeners();
-      // Destroy underlying socket directly — both ws.close() and ws.terminate()
-      // throw when WebSocket is still in CONNECTING state.
-      try { ws._socket?.destroy(); } catch (_) {}
-      try { ws.terminate(); } catch (_) {}
+      // Destroy underlying socket directly — ws.close() and ws.terminate()
+      // throw asynchronously when WebSocket is in CONNECTING state,
+      // and try-catch cannot catch their async error paths.
+      if (ws._socket) {
+        try { ws._socket.destroy(); } catch (_) {}
+      }
       channel.removeAllListeners();
       try { if (!channel.closed) channel.close(); } catch (_) {}
       try { client.end(); } catch (_) {}
