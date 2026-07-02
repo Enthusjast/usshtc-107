@@ -180,16 +180,22 @@ class ProxyServer extends EventEmitter {
 
     ws.on('message', (data) => {
       if (done) return;
+      outputCount++;
       try {
         const raw = data.toString('utf-8');
         const msg = JSON.parse(raw);
         if (msg.$case === 'exit' || msg.$case === 'close' || msg.$case === 'logout') {
+          self.emit('proxy-log', 'info', 'wss', `Exec: session ended (${msg.$case})`);
           finishExec(0);
           return;
         }
         if (msg.$case === 'data' && msg.data?.data) {
           const text = msg.data.data;
           outputBuffer += text;
+          // Log first few messages for debugging
+          if (outputCount <= 5) {
+            self.emit('proxy-log', 'info', 'wss', `Exec recv msg #${outputCount}: ${JSON.stringify(text).slice(0, 120)}`);
+          }
 
           session.bytesReceived += text.length;
           self._totalBytesReceived += text.length;
@@ -214,16 +220,25 @@ class ProxyServer extends EventEmitter {
       } catch (_) {}
     });
 
+    // Track WSS output for debugging
+    let outputCount = 0;
+
     ws.on('open', () => {
       self.emit('proxy-log', 'info', 'wss', `WSS connected (exec): ${clientStr}`);
-      // Send the command + marker
-      ws.send(JSON.stringify({ $case: 'data', data: { data: fullCommand + '\n' } }));
-      commandSent = true;
+      // Wait for shell to initialize (platform sends initial prompt/banner)
+      // before sending the command. The interactive shell needs to be ready.
+      self.emit('proxy-log', 'info', 'wss', `Waiting 1s for shell init before sending command...`);
+      setTimeout(() => {
+        const payload = JSON.stringify({ $case: 'data', data: { data: fullCommand + '\n' } });
+        ws.send(payload);
+        commandSent = true;
+        self.emit('proxy-log', 'info', 'wss', `Command sent: ${fullCommand}`);
+      }, 1000);
 
       // Safety timeout
       safetyTimer = setTimeout(() => {
         if (!done) {
-          self.emit('proxy-log', 'warn', 'wss', `Exec safety timeout (60s): ${command}`);
+          self.emit('proxy-log', 'warn', 'wss', `Exec timeout (60s): ${command} (got ${outputCount} msgs)`);
           finishExec(0);
         }
       }, 60000);
