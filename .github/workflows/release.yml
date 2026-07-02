@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v1.0.0)'
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Build for each platform ──────────────────────────────────────
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux
+            artifact_name: usshtc107-linux
+            artifact_pattern: release/*.AppImage release/*.deb
+
+          - os: macos-latest
+            target: mac
+            artifact_name: usshtc107-macos
+            artifact_pattern: release/*.dmg
+
+          - os: windows-latest
+            target: win
+            artifact_name: usshtc107-windows
+            artifact_pattern: release/*.exe
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run build
+
+      # macOS: generate .icns from .png (built-in sips tool)
+      - name: Generate macOS icon
+        if: matrix.target == 'mac'
+        run: |
+          mkdir -p build
+          sips -s format icns build/icon.png --out build/icon.icns 2>/dev/null || true
+
+      # Build & package
+      - name: Package ${{ matrix.target }}
+        run: npx electron-builder --${{ matrix.target }} --publish never
+
+      # List artifacts for debugging
+      - name: List artifacts
+        run: ls -la release/ 2>/dev/null || echo "No release dir"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_pattern }}
+          if-no-files-found: warn
+
+  # ── Create GitHub Release ────────────────────────────────────────
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: usshtc107-*
+          merge-multiple: true
+          path: artifacts
+
+      - name: List collected artifacts
+        run: ls -lhR artifacts/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          files: artifacts/**
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
