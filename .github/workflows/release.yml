@@ -55,6 +55,7 @@ jobs:
         run: npx electron-builder --${{ matrix.target }} --publish never
 
       - name: List built artifacts
+        shell: bash
         run: ls -lh release/
 
       - uses: actions/upload-artifact@v4
@@ -74,6 +75,7 @@ jobs:
           path: artifacts
 
       - name: List collected artifacts
+        shell: bash
         run: ls -lhR artifacts/
 
       - name: Create GitHub Release
