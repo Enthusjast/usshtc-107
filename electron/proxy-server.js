@@ -281,32 +281,42 @@ class ProxyServer extends EventEmitter {
   _onSshClient(client) {
     this._clients.add(client);
     this.emit('connection', this._clients.size);
+    const addr = (client._sock && `${client._sock.remoteAddress}:${client._sock.remotePort}`) || 'unknown';
+    console.log(`[proxy] SSH client connected: ${addr}`);
+    this.emit('proxy-log', 'info', 'ssh', `Client connected: ${addr}`);
 
     client.on('authentication', (ctx) => {
+      console.log(`[proxy] SSH auth: ${ctx.method} accepted`);
+      this.emit('proxy-log', 'info', 'ssh', `Auth (${ctx.method}) accepted`);
       ctx.accept();
     });
 
     client.on('ready', () => {
-      console.log('[proxy] SSH client authenticated');
+      console.log(`[proxy] SSH client ready: ${addr}`);
+      this.emit('proxy-log', 'info', 'ssh', `Client ready: ${addr}`);
 
       client.on('session', (acceptSession) => {
         const session = acceptSession();
+        console.log(`[proxy] SSH session opened: ${addr}`);
+        this.emit('proxy-log', 'info', 'ssh', `Session opened: ${addr}`);
 
         session.on('pty', (acceptPty, _rejectPty, info) => {
           console.log(`[proxy] PTY: ${info.term} ${info.cols}x${info.rows}`);
+          this.emit('proxy-log', 'info', 'ssh', `PTY: ${info.term} ${info.cols}x${info.rows}`);
           if (acceptPty) acceptPty();
         });
 
         session.on('shell', (acceptShell) => {
+          console.log(`[proxy] Shell requested: ${addr}`);
+          this.emit('proxy-log', 'info', 'ssh', `Shell requested: ${addr} — starting WSS bridge`);
           const channel = acceptShell();
-          const addr = (client._sock && `${client._sock.remoteAddress}:${client._sock.remotePort}`) || 'unknown';
           this._bridgeSshToWss(channel, client, addr);
         });
 
         session.on('exec', (acceptExec, _rejectExec, info) => {
           console.log(`[proxy] Exec: ${info.command}`);
+          this.emit('proxy-log', 'info', 'ssh', `Exec: ${info.command}`);
           const channel = acceptExec();
-          const addr = (client._sock && `${client._sock.remoteAddress}:${client._sock.remotePort}`) || 'unknown';
           this._bridgeSshToWss(channel, client, `${addr} [exec]`);
         });
 
@@ -321,12 +331,15 @@ class ProxyServer extends EventEmitter {
     });
 
     client.on('close', () => {
+      console.log(`[proxy] SSH client disconnected: ${addr}`);
+      this.emit('proxy-log', 'info', 'ssh', `Client disconnected: ${addr}`);
       this._clients.delete(client);
       this.emit('connection', this._clients.size);
     });
 
     client.on('error', (err) => {
-      console.error('[proxy] SSH client error:', err.message);
+      console.error(`[proxy] SSH client error: ${err.message}`);
+      this.emit('proxy-log', 'error', 'ssh', `Client error: ${err.message}`);
     });
   }
 
