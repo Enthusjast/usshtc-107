@@ -766,7 +766,7 @@ function setupIPCHandlers() {
   // ---- SSH Config ----
   ipcMain.handle('ssh-config:generate', async (_e, { host, port, alias } = {}) => {
     const h = host || state.host || '127.0.0.1';
-    const p = port || state.port || 2222;
+    const p = port || state.port || 3000;
     const a = alias || 'ustc107';
 
     const sshDir = path.join(os.homedir(), '.ssh');

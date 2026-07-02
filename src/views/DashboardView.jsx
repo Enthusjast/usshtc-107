@@ -40,7 +40,7 @@ export default function DashboardView() {
     cookieValid: false,
     cookieCount: 0,
     host: '127.0.0.1',
-    port: 2222,
+    port: 3000,
     wssUrl: '',
     error: null,
   });

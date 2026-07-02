@@ -3,7 +3,7 @@
 USTC 算力平台 SSH 代理客户端 — 将本地 SSH 工具通过 WebSocket 桥接到中国科学技术大学 107 算力平台。
 
 ```bash
-ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 user@127.0.0.1
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 3000 user@127.0.0.1
 ```
 
 ## 功能
@@ -81,7 +81,7 @@ npm run dist:win     # NSIS installer
 4. 在终端执行 SSH 命令连接：
 
 ```bash
-ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 user@127.0.0.1
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 3000 user@127.0.0.1
 ```
 
 也可在 Settings → SSH Config 中生成 `~/.ssh/config` 条目，之后直接：
@@ -95,12 +95,16 @@ ssh ustc107
 | 设置 | 默认值 | 说明 |
 |------|--------|------|
 | Host | 127.0.0.1 | 代理监听地址 |
-| Port | 2222 | 代理监听端口 |
+| Port | 3000 | 代理监听端口 |
 | Cluster | training | 算力平台集群 |
 | Login Node | 11.11.10.202 | 登录节点 IP |
 | Cols / Rows | 80 / 24 | 终端行列数 |
 | Auto-connect | 开启 | 启动时自动连接 |
 | Start minimized | 关闭 | 启动时最小化到托盘 |
+
+> **Windows 用户注意**：如果启动代理时遇到 `EACCES: permission denied`，说明端口被 Hyper-V/WSL 预留了。
+> 在 PowerShell（管理员）中运行 `netsh interface ipv4 show excludedportrange protocol=tcp` 查看预留范围，
+> 然后在 Settings 中改用一个不在预留范围内的端口（如 4000、6000）。
 
 ## 目录结构
 

@@ -9,7 +9,7 @@ const LocaleContext = createContext(null);
 
 /**
  * Resolve a translation key — supports plain strings, functions, and dot-path access.
- * Usage: t('auth.login') or t('nCookies', 3) or t('listeningOn', '127.0.0.1', 2222)
+ * Usage: t('auth.login') or t('nCookies', 3) or t('listeningOn', '127.0.0.1', 3000)
  */
 function resolve(obj, path) {
   const keys = path.split('.');

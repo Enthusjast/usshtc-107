@@ -5,7 +5,7 @@ import { useLocale } from '../i18n/LocaleContext';
 import { IconSettings, IconServer, IconFileEdit, IconInfo, IconGlobe } from '../components/Icons';
 
 const DEFAULT_SETTINGS = {
-  port: 2222,
+  port: 3000,
   host: '127.0.0.1',
   cluster: 'training',
   loginNode: '11.11.10.202',

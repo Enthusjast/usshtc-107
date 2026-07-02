@@ -2,7 +2,7 @@
 // Imported by both main process and renderer to avoid duplication.
 
 const DEFAULTS = {
-  port: 2222,
+  port: 3000,
   host: '127.0.0.1',
   cluster: 'training',
   loginNode: '11.11.10.202',

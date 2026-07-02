@@ -57,7 +57,7 @@ class Session {
 class ProxyServer extends EventEmitter {
   constructor(options = {}) {
     super();
-    this.port = options.port || 2222;
+    this.port = options.port || 3000;
     this.host = options.host || '127.0.0.1';
     this.cookie = options.cookie || '';
     this.wssUrl = options.wssUrl;
