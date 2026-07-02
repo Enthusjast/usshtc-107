@@ -205,32 +205,51 @@ class ProxyServer extends EventEmitter {
     });
 
     // SSH channel → WebSocket
+    // Register data handler immediately (not inside ws.on('open')) so exec
+    // commands that arrive before WSS connects are not lost.
+    let wssReady = false;
+    const pendingData = [];
+
+    function sendToWss(data) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(buildClientMessage(data));
+        session.bytesSent += data.length;
+        self._totalBytesSent += data.length;
+        self.emit('traffic', { sessionId, direction: 'sent', bytes: data.length });
+
+        // Only treat 0x04 as Ctrl+D when it's a lone byte
+        if (!closed && data.length === 1 && data[0] === 0x04) {
+          console.log(`[proxy] Ctrl+D detected for ${clientStr}`);
+          if (drainTimer) clearTimeout(drainTimer);
+          drainTimer = setTimeout(() => {
+            if (!closed && ws.readyState === WebSocket.OPEN) {
+              console.log(`[proxy] Proactively closing WSS for ${clientStr}`);
+              ws.close(1000);
+            }
+          }, CTRL_D_DRAIN_MS);
+        }
+      }
+    }
+
+    channel.on('data', (data) => {
+      if (wssReady) {
+        sendToWss(data);
+      } else {
+        pendingData.push(data);
+      }
+    });
+
     ws.on('open', () => {
       const msg = `WSS connected for ${clientStr}`;
       console.log(`[proxy] ${msg}`);
       self.emit('proxy-log', 'info', 'wss', msg);
+      wssReady = true;
       startPingPong();
-      channel.on('data', (data) => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(buildClientMessage(data));
-          // Track bytes
-          session.bytesSent += data.length;
-          self._totalBytesSent += data.length;
-          self.emit('traffic', { sessionId, direction: 'sent', bytes: data.length });
-
-          // Only treat 0x04 as Ctrl+D when it's a lone byte (not embedded in binary/escape data)
-          if (!closed && data.length === 1 && data[0] === 0x04) {
-            console.log(`[proxy] Ctrl+D detected for ${clientStr}`);
-            if (drainTimer) clearTimeout(drainTimer);
-            drainTimer = setTimeout(() => {
-              if (!closed && ws.readyState === WebSocket.OPEN) {
-                console.log(`[proxy] Proactively closing WSS for ${clientStr}`);
-                ws.close(1000);
-              }
-            }, CTRL_D_DRAIN_MS);
-          }
-        }
-      });
+      // Flush any data that arrived before WSS was ready (e.g. exec command)
+      for (const buf of pendingData) {
+        sendToWss(buf);
+      }
+      pendingData.length = 0;
     });
 
     ws.on('unexpected-response', (_req, res) => {
