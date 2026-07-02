@@ -170,11 +170,9 @@ class ProxyServer extends EventEmitter {
 
       // Clean up all listeners to prevent leaks
       ws.removeAllListeners();
-      try {
-        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-          ws.close();
-        }
-      } catch (_) {}
+      // Use terminate() instead of close() — close() throws when called
+      // during CONNECTING state. terminate() works in any state.
+      try { ws.terminate(); } catch (_) {}
       channel.removeAllListeners();
       try { if (!channel.closed) channel.close(); } catch (_) {}
       try { client.end(); } catch (_) {}
