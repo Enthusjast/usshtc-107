@@ -272,8 +272,11 @@ class ProxyServer extends EventEmitter {
           this._bridgeSshToWss(channel, client, addr);
         });
 
-        session.on('exec', (_acceptExec, rejectExec) => {
-          rejectExec();
+        session.on('exec', (acceptExec, _rejectExec, info) => {
+          console.log(`[proxy] Exec: ${info.command}`);
+          const channel = acceptExec();
+          const addr = (client._sock && `${client._sock.remoteAddress}:${client._sock.remotePort}`) || 'unknown';
+          this._bridgeSshToWss(channel, client, `${addr} [exec]`);
         });
 
         session.on('env', (acceptEnv) => {
