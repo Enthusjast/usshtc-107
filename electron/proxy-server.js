@@ -101,11 +101,13 @@ class ProxyServer extends EventEmitter {
   }
 
   _bridgeSshToWss(channel, client, clientStr) {
+    const self = this;
     console.log(`[proxy] Bridging for ${clientStr}`);
     console.log(`[proxy] WSS URL: ${this.wssUrl}`);
     console.log(`[proxy] Cookie: ${this.cookie?.slice(0, 80) || '(empty)'}...`);
     self.emit('proxy-log', 'info', 'wss', `Connecting: ${this.wssUrl}`);
     self.emit('proxy-log', 'info', 'wss', `Cookie: ${this.cookie?.slice(0, 80) || '(empty)'}`);
+
 
     if (!this.cookie || this.cookie.length === 0) {
       const msg = 'No cookie available — WSS will likely fail (401)';
@@ -123,7 +125,6 @@ class ProxyServer extends EventEmitter {
       handshakeTimeout: WSS_HANDSHAKE_TIMEOUT,
     });
 
-    const self = this;
     let closed = false;
     let pingTimer = null;
     let pongTimer = null;
