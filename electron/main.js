@@ -742,7 +742,13 @@ function setupIPCHandlers() {
 
   // ---- Login ----
   ipcMain.handle('login:start', () => {
-    if (state.loginStatus === 'success' || state.loginStatus === 'sso_done') return;
+    // Allow re-login: reset state if already logged in
+    if (state.loginStatus === 'success') {
+      state.loginStatus = 'idle';
+      loggedIn = false;
+      capturedCookieString = '';
+    }
+    if (state.loginStatus === 'sso_done') return;
     state.loginStatus = 'pending';
     sendToMain('login-status', 'pending');
     createLoginWindow();
