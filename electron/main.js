@@ -446,6 +446,11 @@ let loggedIn = false;
 // Store cookies captured during login so they survive window close
 let capturedCookieString = '';
 
+// Restore captured cookie from settings (persists across app restarts)
+if (settings.savedCookie) {
+  capturedCookieString = settings.savedCookie;
+}
+
 async function onLoginFinalized(cookies) {
   if (state.loginStatus === 'success') return;
 
@@ -457,6 +462,10 @@ async function onLoginFinalized(cookies) {
 
   // Build cookie string BEFORE closing login window (session cookies get deleted on close)
   capturedCookieString = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
+
+  // Persist cookie to settings so it survives app restart
+  settings.savedCookie = capturedCookieString;
+  persistSettings(settings);
 
   addLog('info', 'auth', `Web SSH page reached — ${cookies.length} cookies read`);
   addLog('info', 'auth', `Cookie names: ${cookies.map(c => c.name).join(', ')}`);
@@ -683,20 +692,35 @@ function showNotification(title, body) {
 async function tryAutoConnect() {
   if (!settings.autoConnect) return;
   try {
-    const cookies = await session.defaultSession.cookies.get({ domain: PLATFORM.domain });
-    if (cookies.length > 0) {
-      addLog('info', 'app', `Auto-connect: ${cookies.length} cookies found`);
-      const cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
+    // Prefer saved cookie (captured at login time, guaranteed complete)
+    // over Electron session cookies (session cookies like SCOW_USER may be lost)
+    if (capturedCookieString) {
+      addLog('info', 'app', 'Auto-connect: using saved cookie from previous session');
       state.cookieValid = true;
-      state.cookieCount = cookies.length;
+      state.cookieCount = 2;
       state.loginStatus = 'success';
       state.wssUrl = buildWssUrl();
       loggedIn = true;
       sendToMain('login-status', 'success');
-      sendToMain('cookie-status', { cookieValid: true, cookieCount: cookies.length });
-      await startProxyServer();
+      sendToMain('cookie-status', { cookieValid: true, cookieCount: 2 });
+      await startProxyServer(capturedCookieString);
     } else {
-      addLog('info', 'app', 'Auto-connect: no cookies found, waiting for manual login');
+      // No saved cookie — check Electron session for fresh login
+      const cookies = await session.defaultSession.cookies.get({ domain: PLATFORM.domain });
+      if (cookies.length > 0) {
+        addLog('info', 'app', `Auto-connect: ${cookies.length} cookies found`);
+        capturedCookieString = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
+        state.cookieValid = true;
+        state.cookieCount = cookies.length;
+        state.loginStatus = 'success';
+        state.wssUrl = buildWssUrl();
+        loggedIn = true;
+        sendToMain('login-status', 'success');
+        sendToMain('cookie-status', { cookieValid: true, cookieCount: cookies.length });
+        await startProxyServer(capturedCookieString);
+      } else {
+        addLog('info', 'app', 'Auto-connect: no cookies found, waiting for manual login');
+      }
     }
   } catch (err) {
     addLog('warn', 'app', `Auto-connect check failed: ${err.message}`);
@@ -726,7 +750,8 @@ function setupIPCHandlers() {
   ipcMain.handle('settings:get', () => ({ ...settings }));
   ipcMain.handle('settings:save', (_e, s) => {
     // Whitelist allowed keys to prevent injection of unexpected properties
-    const ALLOWED = new Set(Object.keys(DEFAULTS));
+    // savedCookie is managed internally, not user-editable
+    const ALLOWED = new Set(Object.keys(DEFAULTS).filter((k) => k !== 'savedCookie'));
     for (const key of Object.keys(s)) {
       if (!ALLOWED.has(key)) continue;
       settings[key] = s[key];
@@ -755,6 +780,8 @@ function setupIPCHandlers() {
       state.loginStatus = 'idle';
       loggedIn = false;
       capturedCookieString = '';
+      settings.savedCookie = '';
+      persistSettings(settings);
     }
     if (state.loginStatus === 'sso_done') return;
     state.loginStatus = 'pending';

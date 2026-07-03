@@ -12,6 +12,7 @@ const DEFAULTS = {
   autoConnect: true,
   startMinimized: false,
   theme: 'dark',
+  savedCookie: '',
 };
 
 const PLATFORM = {
