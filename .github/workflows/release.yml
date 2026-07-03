@@ -45,22 +45,41 @@ jobs:
             target: win
 
     runs-on: ${{ matrix.os }}
-    if: >-
-      github.event_name == 'push' ||
-      github.event.inputs.platform == 'all' ||
-      github.event.inputs.platform == matrix.target
 
     steps:
+      - name: Check platform filter
+        if: >-
+          github.event_name != 'push' &&
+          github.event.inputs.platform != 'all' &&
+          github.event.inputs.platform != matrix.target
+        run: echo "Skipping ${{ matrix.target }}"
+
       - uses: actions/checkout@v4
+        if: >-
+          github.event_name == 'push' ||
+          github.event.inputs.platform == 'all' ||
+          github.event.inputs.platform == matrix.target
 
       - uses: actions/setup-node@v4
+        if: >-
+          github.event_name == 'push' ||
+          github.event.inputs.platform == 'all' ||
+          github.event.inputs.platform == matrix.target
         with:
           node-version: 20
           cache: npm
 
       - run: npm ci
+        if: >-
+          github.event_name == 'push' ||
+          github.event.inputs.platform == 'all' ||
+          github.event.inputs.platform == matrix.target
 
       - run: npm run build
+        if: >-
+          github.event_name == 'push' ||
+          github.event.inputs.platform == 'all' ||
+          github.event.inputs.platform == matrix.target
 
       # macOS: generate .icns from .png before electron-builder runs
       - name: Generate macOS icon
@@ -76,6 +95,10 @@ jobs:
 
       # Cache electron-builder downloads (NSIS, Wine, etc.)
       - name: Cache electron-builder
+        if: >-
+          github.event_name == 'push' ||
+          github.event.inputs.platform == 'all' ||
+          github.event.inputs.platform == matrix.target
         uses: actions/cache@v4
         with:
           path: |
@@ -86,10 +109,18 @@ jobs:
             electron-builder-${{ matrix.target }}-${{ runner.os }}-
 
       - name: Package ${{ matrix.target }}
+        if: >-
+          github.event_name == 'push' ||
+          github.event.inputs.platform == 'all' ||
+          github.event.inputs.platform == matrix.target
         run: npx electron-builder --${{ matrix.target }} --publish never
 
       # Remove auto-update metadata (not needed in release assets)
       - name: Clean release artifacts
+        if: >-
+          github.event_name == 'push' ||
+          github.event.inputs.platform == 'all' ||
+          github.event.inputs.platform == matrix.target
         shell: bash
         run: |
           cd release
@@ -97,6 +128,10 @@ jobs:
           ls -lh .
 
       - uses: actions/upload-artifact@v4
+        if: >-
+          github.event_name == 'push' ||
+          github.event.inputs.platform == 'all' ||
+          github.event.inputs.platform == matrix.target
         with:
           name: usshtc107-${{ matrix.target }}
           path: release/*
