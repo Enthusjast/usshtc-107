@@ -634,10 +634,15 @@ async function startProxyServer(cookieString) {
     if (!statsThrottle) {
       statsThrottle = setTimeout(() => {
         statsThrottle = null;
-        sendToMain('stats-update', proxyServer.getStats());
+        if (proxyServer) sendToMain('stats-update', proxyServer.getStats());
       }, 500);
     }
   });
+
+  // Periodic stats update (uptime ticks, session count changes)
+  _statsTimer = setInterval(() => {
+    if (proxyServer) sendToMain('stats-update', proxyServer.getStats());
+  }, 1000);
 
   try {
     await proxyServer.start();
@@ -654,8 +659,11 @@ async function startProxyServer(cookieString) {
   }
 }
 
+let _statsTimer = null;
+
 async function stopProxyServer() {
   if (!proxyServer || state.proxyStatus === 'stopped') return;
+  if (_statsTimer) { clearInterval(_statsTimer); _statsTimer = null; }
   await proxyServer.stop();
   proxyServer.removeAllListeners();
   proxyServer = null;

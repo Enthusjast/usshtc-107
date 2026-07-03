@@ -21,10 +21,10 @@ export default function SessionsView() {
   }, []);
 
   useEffect(() => {
-    getSessions().then((s) => {
-      if (Array.isArray(s)) setSessions(s);
-      setLoaded(true);
-    });
+    getSessions()
+      .then((s) => { if (Array.isArray(s)) setSessions(s); })
+      .catch(() => {})
+      .finally(() => setLoaded(true));
   }, []);
 
   useEffect(() => {

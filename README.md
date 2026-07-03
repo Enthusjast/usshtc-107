@@ -10,7 +10,8 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 3000 user@127
 
 - **SSO 自动登录** — 内嵌浏览器完成学校统一认证，自动提取鉴权 Cookie
 - **TCP ↔ WebSocket 桥接** — 本地 SSH 服务器（ssh2）将标准 SSH 流量实时转发到平台 WSS
-- **实时仪表盘** — 连接数、Cookie 状态、流量统计（上行/下行字节数、运行时长）
+- **Exec 命令支持** — 通过交互式 shell 模拟 exec 通道，支持 `ssh host 'command'` 远程执行
+- **实时仪表盘** — 连接数、Cookie 状态、流量统计（上行/下行字节数、运行时长）每秒刷新
 - **会话管理** — 查看所有活跃 SSH 会话，支持逐会话强制断开
 - **系统托盘** — 关闭窗口时最小化到托盘，代理持续在后台运行
 - **自启动连接** — 启动时自动检测有效 Cookie 并启动代理（可配置）
@@ -88,6 +89,20 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 3000 user@127
 
 ```bash
 ssh ustc107
+```
+
+### 远程命令执行
+
+通过 exec 通道可以在远程服务器执行命令并获取输出：
+
+```bash
+# 执行单条命令
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 3000 user@127.0.0.1 'ls -la'
+
+# 执行多条命令
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 3000 user@127.0.0.1 'cd /path && make build'
+
+# 配合 Claude Code 等 AI 工具使用
 ```
 
 ## 配置

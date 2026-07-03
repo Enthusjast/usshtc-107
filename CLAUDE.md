@@ -5,7 +5,7 @@
 usshtc107 是一个 Electron 桌面客户端，用于将本地 SSH 工具桥接到中国科学技术大学 107 算力平台。
 用户通过 SSO 登录后，本机启动 TCP 代理（默认 127.0.0.1:3000），将 SSH 流量经 WebSocket 转发到算力平台。
 
-**核心目标**: `ssh -p 3000 user@127.0.0.1` 直连算力平台运行 Claude Code 等工具。
+**核心目标**: `ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 3000 user@127.0.0.1` 直连算力平台运行 Claude Code 等工具。
 
 ## 架构
 
@@ -40,6 +40,20 @@ Main Process (Electron)              Renderer (React + Vite)
 - `_starting` 标志防并发
 - `AUTH_CLOSE_CODES = [1008, 1011]`（不含 1006 异常断开，避免网络抖动误判）
 
+### Exec 通道
+- 平台 WSS 仅支持交互式 shell，不支持原生 exec
+- Exec 请求通过交互式 shell 模拟：先发命令，再发 DONE 标记
+- `DONE_ID` 唯一标记：`echo DONE_<id> $?` 作为独立命令发送（延迟 2s）
+- `outputMessages[]` 数组存储 WSS 消息，按序号查找 DONE 标记
+- 完成后提取输出：截断到 DONE 标记 → 剥离 ANSI → `lastIndexOf(command + '\r\n')` 定位终端回显 → 剥离尾部 prompt
+- Prompt 正则支持 `~` 路径：`/[\w.\-]+@[\w.\-]+:[\w.\/~\- ]*[\$#]\s*$/`
+- 安全超时 60s 强制结束
+
+### 交互式会话
+- 数据流中检测 `logout` 关键字 → 2s 后主动关闭 WSS
+- cleanup 时先 `channel.exit(0)` 再 `channel.close()`，确保 SSH 客户端正确退出
+- `ws._socket?.destroy()` 处理 CONNECTING 状态的 WSS（避免 ws 库抛不可捕获异常）
+
 ### 登录流程
 1. 打开 loginWindow → 加载 107.ustc.edu.cn
 2. `setWindowOpenHandler` 用 `new URL()` 做 hostname 精确匹配（非子串）
@@ -47,9 +61,11 @@ Main Process (Electron)              Renderer (React + Vite)
 4. Cookie 提取后**先关闭登录窗口**，再 `await startProxyServer()`（避免卡窗口）
 
 ### 状态管理
-- 主进程维护全局 `state` 对象
+- 主进程维护全局 `state` 对象（**不含不可序列化的值**，如定时器句柄）
 - 渲染进程通过 IPC 事件接收状态更新（`login-status`, `proxy-status`, `cookie-status`, `stats-update`, `session-update`, `theme-changed`）
+- `stats-update` 每秒定时推送（uptime 实时刷新）+ 流量触发节流（500ms）
 - 所有事件订阅返回 unsubscribe 函数
+- 所有视图初始加载用 `.catch().finally()` 防止 IPC 失败卡在 skeleton
 
 ### 设置持久化
 - `app.getPath('userData')/settings.json`
@@ -84,6 +100,7 @@ npm run dist:win      # 打包 Windows (NSIS)
 - **新的格式化函数放到 `src/lib/format.js`** — 不要在视图文件中重复定义
 - **主进程 event handler 用 `event.preventDefault()` 模式** — Electron 不等待 async handler
 - **IPC 设置 key 必须在 `DEFAULTS` 白名单中**
+- **`state` 对象中不要放不可序列化的值** — 如定时器句柄、函数引用等，会破坏 IPC 传递
 
 ## 已知注意事项
 
@@ -93,3 +110,4 @@ npm run dist:win      # 打包 Windows (NSIS)
 - `exitApp` 通过 preload 暴露但当前无组件调用（保留以备将来 UI 退出按钮使用）
 - 登录窗口 `sandbox: true`，无 preload
 - 主窗口 `contextIsolation: true`, `nodeIntegration: false`
+- `_statsTimer` 定时器句柄存在模块级变量，不在 `state` 对象中（避免 IPC 序列化失败）

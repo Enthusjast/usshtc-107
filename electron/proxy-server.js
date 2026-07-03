@@ -114,13 +114,14 @@ class ProxyServer extends EventEmitter {
     this.emit('session-open', this._sessionSnapshot(session));
     this._emitStats();
 
-    // Unique marker to detect command completion
-    const MARKER = `__EXEC_DONE_${Date.now()}_${Math.random().toString(36).slice(2, 8)}__`;
-    // Full command: user command, then echo marker (so marker appears in output after command finishes)
-    const fullCommand = `${command}; echo ${MARKER}`;
+    // Unique done-marker — sent as a separate echo command after the user command.
+    // Uses a unique string that will NEVER appear in the user command's echo.
+    const DONE_ID = `D${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`;
+    // done-pattern to search for in output: "DONE_<id> <digits>\r?\n"
+    const DONE_RE = new RegExp(`DONE_${DONE_ID}\\s+(\\d+)\\r?\\n`);
 
     self.emit('proxy-log', 'info', 'wss', `Connecting (exec): ${this.wssUrl}`);
-    self.emit('proxy-log', 'info', 'wss', `Exec command: ${command}`);
+    self.emit('proxy-log', 'info', 'wss', `Exec command: ${command} (doneId=${DONE_ID})`);
 
     const ws = new WebSocket(this.wssUrl, {
       headers: {
@@ -135,7 +136,7 @@ class ProxyServer extends EventEmitter {
     let closed = false;
     let commandSent = false;
     let done = false;
-    let outputBuffer = '';
+    let outputMessages = [];  // individual messages for extraction
     let safetyTimer = null;
 
     function safeCleanup() {
@@ -159,23 +160,60 @@ class ProxyServer extends EventEmitter {
     function finishExec(exitCode) {
       if (done) return;
       done = true;
-      // Strip the marker line from output before sending to client
-      const markerIdx = outputBuffer.indexOf(MARKER);
-      let cleanOutput = outputBuffer;
-      if (markerIdx !== -1) {
-        // Remove the marker line and everything after it
-        cleanOutput = outputBuffer.substring(0, markerIdx);
-        // Also remove trailing newline before marker
-        cleanOutput = cleanOutput.replace(/\n$/, '');
+
+      try {
+        self.emit('proxy-log', 'info', 'wss', `Exec finishing: exitCode=${exitCode}, ${outputMessages.length} msgs`);
+
+        // Combine messages EXCEPT done-marker related ones.
+        // Find the first message containing the done-marker command text
+        // and exclude it and everything after it.
+        const doneCmdText = `echo DONE_${DONE_ID}`;
+        let cutoffIdx = outputMessages.length;
+        for (let i = 0; i < outputMessages.length; i++) {
+          if (outputMessages[i].includes(doneCmdText) || outputMessages[i].includes(`DONE_${DONE_ID}`)) {
+            cutoffIdx = i;
+            break;
+          }
+        }
+        const outputText = outputMessages.slice(0, cutoffIdx).join('');
+        self.emit('proxy-log', 'info', 'wss', `Cutoff at msg #${cutoffIdx}, combined ${outputText.length} chars`);
+
+        // Strip ANSI
+        let stripped = outputText.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
+        stripped = stripped.replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, '');
+        stripped = stripped.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
+
+        self.emit('proxy-log', 'info', 'wss', `Output msgs combined (${stripped.length}): ${JSON.stringify(stripped).slice(0, 120)}`);
+
+        // Find the LAST command echo with \r\n — this is the terminal echo,
+        // right before the actual output.
+        const cmdWithNl = command + '\r\n';
+        const cmdIdx = stripped.lastIndexOf(cmdWithNl);
+        self.emit('proxy-log', 'info', 'wss', `lastIndexOf cmdWithNl at ${cmdIdx}`);
+
+        let cleanOutput = '';
+        if (cmdIdx !== -1) {
+          cleanOutput = stripped.substring(cmdIdx + cmdWithNl.length);
+        } else {
+          cleanOutput = stripped;
+        }
+        // Strip trailing prompt pattern: user@host:path$ or user@host:path#
+        // Path can contain: word chars, dots, /, ~, -, spaces
+        cleanOutput = cleanOutput.replace(/[\w.\-]+@[\w.\-]+:[\w.\/~\- ]*[\$#]\s*$/, '');
+        cleanOutput = cleanOutput.replace(/^\s+/, '').replace(/\s+$/, '');
+
+        self.emit('proxy-log', 'info', 'wss', `Exec output: ${JSON.stringify(cleanOutput).slice(0, 100)}`);
+
+        if (!channel.closed) {
+          if (cleanOutput) channel.write(Buffer.from(cleanOutput + '\n'));
+          channel.exit(exitCode);
+          channel.end();
+        }
+      } catch (err) {
+        self.emit('proxy-log', 'error', 'wss', `finishExec error: ${err.message}`);
+      } finally {
+        setTimeout(safeCleanup, 1000);
       }
-      // Send any remaining clean output
-      if (cleanOutput && !channel.closed) {
-        channel.write(Buffer.from(cleanOutput));
-      }
-      // Send exit status and close
-      try { channel.exit(exitCode); } catch (_) {}
-      try { if (!channel.closed) channel.close(); } catch (_) {}
-      setTimeout(safeCleanup, 200);
     }
 
     ws.on('message', (data) => {
@@ -191,30 +229,28 @@ class ProxyServer extends EventEmitter {
         }
         if (msg.$case === 'data' && msg.data?.data) {
           const text = msg.data.data;
-          outputBuffer += text;
           // Log first few messages for debugging
-          if (outputCount <= 5) {
+          if (outputCount <= 8) {
             self.emit('proxy-log', 'info', 'wss', `Exec recv msg #${outputCount}: ${JSON.stringify(text).slice(0, 120)}`);
           }
 
           session.bytesReceived += text.length;
           self._totalBytesReceived += text.length;
 
-          // Check if marker appeared — command is done
-          if (commandSent && outputBuffer.includes(MARKER)) {
-            finishExec(0);
-            return;
-          }
+          // Store message individually
+          outputMessages.push(text);
 
-          // Stream output to SSH channel (before marker is detected)
-          // Don't send the marker line itself
-          if (!channel.closed) {
-            const markerIdx = outputBuffer.indexOf(MARKER);
-            if (markerIdx === -1) {
-              // No marker yet, send the text
-              channel.write(Buffer.from(text));
+          // Check if this message contains the done-marker output.
+          // Pattern: "DONE_<id> <exitcode>" — $? is expanded to digit by shell.
+          if (commandSent) {
+            const donePattern = new RegExp(`DONE_${DONE_ID}\\s+(\\d+)`);
+            const doneMatch = text.match(donePattern);
+            if (doneMatch) {
+              const exitCode = parseInt(doneMatch[1], 10) || 0;
+              self.emit('proxy-log', 'info', 'wss', `Done in msg #${outputCount}, exitCode=${exitCode}`);
+              finishExec(exitCode);
+              return;
             }
-            // If marker found, finishExec will send the clean output
           }
         }
       } catch (_) {}
@@ -225,20 +261,27 @@ class ProxyServer extends EventEmitter {
 
     ws.on('open', () => {
       self.emit('proxy-log', 'info', 'wss', `WSS connected (exec): ${clientStr}`);
-      // Wait for shell to initialize (platform sends initial prompt/banner)
-      // before sending the command. The interactive shell needs to be ready.
-      self.emit('proxy-log', 'info', 'wss', `Waiting 1s for shell init before sending command...`);
+      self.emit('proxy-log', 'info', 'wss', `Waiting 1s for shell init...`);
       setTimeout(() => {
-        const payload = JSON.stringify({ $case: 'data', data: { data: fullCommand + '\n' } });
-        ws.send(payload);
+        // Step 1: Send user command
+        ws.send(JSON.stringify({ $case: 'data', data: { data: command + '\n' } }));
         commandSent = true;
-        self.emit('proxy-log', 'info', 'wss', `Command sent: ${fullCommand}`);
+        self.emit('proxy-log', 'info', 'wss', `Command sent: ${command}`);
+
+        // Step 2: After command executes, send marker as separate command
+        setTimeout(() => {
+          if (!done && ws.readyState === WebSocket.OPEN) {
+            const doneCmd = `echo DONE_${DONE_ID} $?`;
+            ws.send(JSON.stringify({ $case: 'data', data: { data: doneCmd + '\n' } }));
+            self.emit('proxy-log', 'info', 'wss', `Done marker sent: ${doneCmd}`);
+          }
+        }, 2000);
       }, 1000);
 
       // Safety timeout
       safetyTimer = setTimeout(() => {
         if (!done) {
-          self.emit('proxy-log', 'warn', 'wss', `Exec timeout (60s): ${command} (got ${outputCount} msgs)`);
+          self.emit('proxy-log', 'warn', 'wss', `Exec safety timeout (60s): ${command}`);
           finishExec(0);
         }
       }, 60000);
@@ -350,7 +393,13 @@ class ProxyServer extends EventEmitter {
       // Do NOT call ws._socket.destroy() or ws.terminate() — both
       // throw uncatchable async errors during CONNECTING state.
 
-      try { if (!channel.closed) channel.close(); } catch (_) {}
+      // Send exit-status before closing channel so SSH client knows the session ended
+      try {
+        if (!channel.closed) {
+          channel.exit(0);
+          channel.close();
+        }
+      } catch (_) {}
       try { client.end(); } catch (_) {}
     }
 
@@ -370,6 +419,21 @@ class ProxyServer extends EventEmitter {
           session.bytesReceived += buf.length;
           self._totalBytesReceived += buf.length;
           self.emit('traffic', { sessionId, direction: 'received', bytes: buf.length });
+
+          // Detect shell exit: "logout" followed by end of stream
+          // When user types `exit`, the shell sends `logout` then the WSS should close.
+          // If WSS doesn't close within 2s, force cleanup to unblock the SSH client.
+          if (/\blogout\b/.test(result.payload)) {
+            self.emit('proxy-log', 'info', 'wss', `Detected 'logout' for ${clientStr}`);
+            if (!closed) {
+              setTimeout(() => {
+                if (!closed && ws.readyState === WebSocket.OPEN) {
+                  self.emit('proxy-log', 'info', 'wss', `Closing WSS after logout for ${clientStr}`);
+                  ws.close(1000);
+                }
+              }, 2000);
+            }
+          }
         }
       }
     });

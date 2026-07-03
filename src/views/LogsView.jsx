@@ -13,10 +13,10 @@ export default function LogsView() {
   const listRef = useRef(null);
 
   useEffect(() => {
-    getLogs().then((l) => {
-      setLogs(l);
-      setLoaded(true);
-    });
+    getLogs()
+      .then((l) => setLogs(l))
+      .catch(() => {})
+      .finally(() => setLoaded(true));
   }, []);
 
   useEffect(() => {

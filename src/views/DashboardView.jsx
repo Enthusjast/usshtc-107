@@ -58,11 +58,13 @@ export default function DashboardView() {
   const sshCommand = `ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p ${state.port} user@${state.host}`;
 
   useEffect(() => {
-    Promise.all([getStatus(), getStats()]).then(([s, st]) => {
-      if (s) setState((prev) => ({ ...prev, ...s }));
-      if (st) setStats(st);
-      setLoaded(true);
-    });
+    Promise.all([getStatus(), getStats()])
+      .then(([s, st]) => {
+        if (s) setState((prev) => ({ ...prev, ...s }));
+        if (st) setStats(st);
+      })
+      .catch(() => {})
+      .finally(() => setLoaded(true));
   }, []);
 
   useEffect(() => {
