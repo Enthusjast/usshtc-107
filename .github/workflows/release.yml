@@ -1,13 +1,33 @@
-name: Release
+name: Build & Release
 
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Target platform'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - linux
+          - mac
+          - win
+      release:
+        description: 'Create GitHub Release'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -25,6 +45,11 @@ jobs:
             target: win
 
     runs-on: ${{ matrix.os }}
+    if: >-
+      github.event_name == 'push' ||
+      github.event.inputs.platform == 'all' ||
+      github.event.inputs.platform == matrix.target
+
     steps:
       - uses: actions/checkout@v4
 
@@ -49,9 +74,18 @@ jobs:
         if: matrix.target == 'linux'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libfuse2
 
+      # Cache electron-builder downloads (NSIS, Wine, etc.)
+      - name: Cache electron-builder
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/electron
+            ~/.cache/electron-builder
+          key: electron-builder-${{ matrix.target }}-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            electron-builder-${{ matrix.target }}-${{ runner.os }}-
+
       - name: Package ${{ matrix.target }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npx electron-builder --${{ matrix.target }} --publish never
 
       # Remove auto-update metadata (not needed in release assets)
@@ -67,23 +101,22 @@ jobs:
           name: usshtc107-${{ matrix.target }}
           path: release/*
           if-no-files-found: error
+          retention-days: 7
 
   release:
     needs: build
     runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'push' ||
+      github.event.inputs.release == 'true'
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: usshtc107-*
           merge-multiple: true
           path: artifacts
-
-      # Remove any metadata that slipped through
-      - name: Clean collected artifacts
-        shell: bash
-        run: |
-          find artifacts \( -name '*.yml' -o -name '*.yaml' -o -name '*.blockmap' \) -delete
-          ls -lhR artifacts/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

@@ -2,7 +2,7 @@
   "name": "usshtc107",
   "version": "1.1.0",
   "description": "USTC computing platform SSH proxy client",
-  "author": "usshtc107 <dev@ustc.edu.cn>",
+  "author": "Enthusjast <enthusjast@outlook.com>",
   "main": "electron/main.js",
   "scripts": {
     "dev": "concurrently -k -n vite,electron -c blue,green \"vite --port 5173\" \"wait-on http://localhost:5173 && cross-env ELECTRON_DEV=true electron .\"",
