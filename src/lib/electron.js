@@ -38,6 +38,20 @@ export async function saveSettings(settings) {
   return api?.saveSettings?.(settings);
 }
 
+// ---- SSO Credentials (encrypted) ----
+
+export async function saveSsoCredentials(username, password) {
+  if (!hasElectronRuntime()) return;
+  const api = getAPI();
+  return api?.saveSsoCredentials?.(username, password);
+}
+
+export async function getSsoCredentials() {
+  if (!hasElectronRuntime()) return { username: '', password: '' };
+  const api = getAPI();
+  return api?.getSsoCredentials?.() ?? { username: '', password: '' };
+}
+
 // ---- Login ----
 
 export async function startLogin() {

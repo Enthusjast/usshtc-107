@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { getSettings, saveSettings, getRuntimeInfo, generateSshConfig } from '../lib/electron';
+import { getSettings, saveSettings, getRuntimeInfo, generateSshConfig, saveSsoCredentials, getSsoCredentials } from '../lib/electron';
 import { useToast } from '../components/Toast';
 import { useLocale } from '../i18n/LocaleContext';
 import { IconSettings, IconServer, IconFileEdit, IconInfo, IconGlobe } from '../components/Icons';
@@ -27,10 +27,20 @@ export default function SettingsView() {
   const [needsRestart, setNeedsRestart] = useState(false);
   const [sshConfigResult, setSshConfigResult] = useState(null);
   const [generating, setGenerating] = useState(false);
+  const [ssoUsername, setSsoUsername] = useState('');
+  const [ssoPassword, setSsoPassword] = useState('');
+  const [ssoLoaded, setSsoLoaded] = useState(false);
 
   useEffect(() => {
     getSettings().then((s) => { if (s) setSettings((prev) => ({ ...prev, ...s })); });
     getRuntimeInfo().then(setRuntime);
+    getSsoCredentials().then((c) => {
+      if (c) {
+        setSsoUsername(c.username || '');
+        setSsoPassword(c.password || '');
+      }
+      setSsoLoaded(true);
+    });
   }, []);
 
   const update = (key, value) => {
@@ -46,6 +56,8 @@ export default function SettingsView() {
     }
     const toSave = { ...settings, port, cols: Number(settings.cols), rows: Number(settings.rows) };
     const result = await saveSettings(toSave);
+    // Save SSO credentials separately (encrypted)
+    await saveSsoCredentials(ssoUsername, ssoPassword);
     setSaved(true);
     if (result?.needsRestart) {
       setNeedsRestart(true);
@@ -163,6 +175,43 @@ export default function SettingsView() {
               <input type="checkbox" checked={settings.startMinimized} onChange={(e) => update('startMinimized', e.target.checked)} />
               <span className="toggle-slider" />
             </label>
+          </div>
+        </div>
+      </div>
+
+      {/* SSO Auto-Login Credentials */}
+      <div className="card">
+        <div className="card-header">
+          <span className="card-header-icon"><IconSettings /></span> {t('ssoCredentials')}
+        </div>
+        <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', marginBottom: '0.85rem', lineHeight: 1.5 }}>
+          {locale === 'zh'
+            ? '保存凭据后，登录时会自动填充账号密码并跳转。密码使用系统级加密存储。'
+            : 'After saving, login will auto-fill credentials and proceed. Password is encrypted with OS-level security.'}
+        </p>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+          <div>
+            <label className="form-label" htmlFor="setting-ssoUsername">{t('ssoUsernameLabel')}</label>
+            <input
+              id="setting-ssoUsername"
+              className="form-input"
+              value={ssoUsername}
+              onChange={(e) => setSsoUsername(e.target.value)}
+              placeholder={locale === 'zh' ? '例如: SA25012345' : 'e.g. SA25012345'}
+              autoComplete="off"
+            />
+          </div>
+          <div>
+            <label className="form-label" htmlFor="setting-ssoPassword">{t('ssoPasswordLabel')}</label>
+            <input
+              id="setting-ssoPassword"
+              className="form-input"
+              type="password"
+              value={ssoPassword}
+              onChange={(e) => setSsoPassword(e.target.value)}
+              placeholder={locale === 'zh' ? '留空则不清除已保存的密码' : 'Leave empty to keep saved password'}
+              autoComplete="off"
+            />
           </div>
         </div>
       </div>

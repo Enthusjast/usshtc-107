@@ -13,6 +13,8 @@ const DEFAULTS = {
   startMinimized: false,
   theme: 'dark',
   savedCookie: '',
+  ssoUsername: '',
+  ssoPassword: '',
 };
 
 const PLATFORM = {

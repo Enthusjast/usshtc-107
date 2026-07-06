@@ -1,4 +1,4 @@
-const { app, BrowserWindow, session, ipcMain, clipboard, Tray, Menu, nativeImage, Notification } = require('electron');
+const { app, BrowserWindow, session, ipcMain, clipboard, Tray, Menu, nativeImage, Notification, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -364,10 +364,116 @@ async function createLoginWindow() {
 
   loginWindow.loadURL(PLATFORM.url);
 
+  function autoClickAuthButton() {
+    loginWindow.webContents.executeJavaScript(`
+      new Promise((resolve) => {
+        function tryClick() {
+          const btn = document.getElementById('authButton');
+          if (btn) { btn.click(); resolve(true); return; }
+          let tries = 0;
+          const timer = setInterval(() => {
+            const b = document.getElementById('authButton');
+            if (b) { b.click(); clearInterval(timer); resolve(true); }
+            else if (++tries > 15) { clearInterval(timer); resolve(false); }
+          }, 200);
+        }
+        tryClick();
+      })
+    `).then((found) => {
+      if (found) addLog('info', 'login', 'auto-clicked authButton');
+    }).catch(() => {});
+  }
+
+  // Auto-click SSO button on 107 platform + auto-fill on CAS page
+  loginWindow.webContents.on('did-finish-load', () => {
+    const url = loginWindow.webContents.getURL();
+    // On 107 platform: auto-click SSO button or redirect to shell page
+    const hostname = (() => { try { return new URL(url).hostname; } catch (_) { return ''; } })();
+    if (hostname === PLATFORM.domain || hostname.endsWith('.' + PLATFORM.domain)) {
+      const shellUrl = 'https://107.ustc.edu.cn/shell/' + settings.cluster + '/' + settings.loginNode;
+      // After login, user lands on home/dashboard → auto-redirect to shell page
+      if (url !== shellUrl && !url.includes('/auth') && !url.includes('scowAuth')) {
+        // Check if we just came from CAS redirect (has SCOW_USER cookie = logged in)
+        session.defaultSession.cookies.get({ domain: PLATFORM.domain }).then((cookies) => {
+          const hasUserCookie = cookies.some((c) => c.name === 'SCOW_USER');
+          if (hasUserCookie) {
+            addLog('info', 'login', 'logged in, redirecting to shell: ' + shellUrl);
+            loginWindow.loadURL(shellUrl);
+          } else {
+            // Not logged in — show login page, auto-click auth button
+            autoClickAuthButton();
+          }
+        });
+        return;
+      }
+      // On auth page or shell page: auto-click auth button if present
+      autoClickAuthButton();
+    }
+    // On id.ustc.edu.cn: auto-fill credentials and submit
+    if (hostname === 'id.ustc.edu.cn') {
+      let password = '';
+      try {
+        if (settings.ssoPassword && settings.ssoPassword.startsWith('xor:')) {
+          const crypto = require('crypto');
+          const key = crypto.createHash('md5').update(app.getPath('userData')).digest();
+          const buf = Buffer.from(settings.ssoPassword.slice(4), 'base64');
+          for (let i = 0; i < buf.length; i++) buf[i] ^= key[i % key.length];
+          password = buf.toString('utf-8');
+        } else if (settings.ssoPassword) {
+          const buf = Buffer.from(settings.ssoPassword, 'base64');
+          password = safeStorage.decryptString(buf);
+        }
+      } catch (_) {}
+      if (!password) return;
+
+      const username = settings.ssoUsername;
+      loginWindow.webContents.executeJavaScript(`
+        (function() {
+          var nativeSetter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value'
+          ).set;
+
+          function setVal(el, val) {
+            el.focus();
+            nativeSetter.call(el, val);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+
+          function tryFill() {
+            var u = document.getElementById('nameInput');
+            var p = document.querySelector('input[type="password"][maxlength="200"]');
+            if (!u || !p) return false;
+            setVal(u, ${JSON.stringify(username)});
+            setVal(p, ${JSON.stringify(password)});
+            // Submit via button click (Angular handles the rest)
+            setTimeout(function() {
+              var btn = document.getElementById('submitBtn');
+              if (btn) btn.click();
+            }, 200);
+            return true;
+          }
+
+          if (tryFill()) return;
+          var obs = new MutationObserver(function() { if (tryFill()) obs.disconnect(); });
+          obs.observe(document, { childList: true, subtree: true });
+          setTimeout(function() { obs.disconnect(); }, 10000);
+        })();
+      `).catch(() => {});
+    }
+  });
+
   loginWindow.webContents.setWindowOpenHandler(({ url }) => {
     try {
       const parsed = new URL(url);
-      if (parsed.hostname === PLATFORM.domain || parsed.hostname.endsWith('.' + PLATFORM.domain)) {
+      const host = parsed.hostname;
+      // Allow 107 platform and USTC SSO domains
+      const allowed = host === PLATFORM.domain
+        || host.endsWith('.' + PLATFORM.domain)
+        || host === 'id.ustc.edu.cn'
+        || host.endsWith('.ustc.edu.cn');
+      console.log(`[login] host=${host} allowed=${allowed}`);
+      if (allowed) {
         loginWindow.loadURL(url);
       }
     } catch (_) { /* ignore unparseable URLs */ }
@@ -751,7 +857,7 @@ function setupIPCHandlers() {
   ipcMain.handle('settings:save', (_e, s) => {
     // Whitelist allowed keys to prevent injection of unexpected properties
     // savedCookie is managed internally, not user-editable
-    const ALLOWED = new Set(Object.keys(DEFAULTS).filter((k) => k !== 'savedCookie'));
+    const ALLOWED = new Set(Object.keys(DEFAULTS).filter((k) => k !== 'savedCookie' && k !== 'ssoPassword'));
     for (const key of Object.keys(s)) {
       if (!ALLOWED.has(key)) continue;
       settings[key] = s[key];
@@ -771,6 +877,47 @@ function setupIPCHandlers() {
       return { needsRestart: true };
     }
     return { needsRestart: false };
+  });
+
+  // ---- SSO Credentials (encrypted with safeStorage) ----
+  ipcMain.handle('sso:save-credentials', (_e, username, password) => {
+    addLog('info', 'settings', 'sso:save-credentials called: username=' + (username || 'none') + ' password=' + (password ? password.length + ' chars' : 'EMPTY'));
+    settings.ssoUsername = username || '';
+    if (password) {
+      try {
+        if (safeStorage.isEncryptionAvailable()) {
+          const encrypted = safeStorage.encryptString(password);
+          settings.ssoPassword = encrypted.toString('base64');
+          addLog('info', 'settings', 'ssoPassword encrypted via safeStorage: ' + settings.ssoPassword.length + ' chars');
+        } else {
+          // Fallback: XOR obfuscation with app path hash (dev mode)
+          const crypto = require('crypto');
+          const key = crypto.createHash('md5').update(app.getPath('userData')).digest();
+          const buf = Buffer.from(password, 'utf-8');
+          for (let i = 0; i < buf.length; i++) buf[i] ^= key[i % key.length];
+          settings.ssoPassword = 'xor:' + buf.toString('base64');
+          addLog('info', 'settings', 'ssoPassword obfuscated (dev mode): ' + settings.ssoPassword.length + ' chars');
+        }
+      } catch (e) {
+        addLog('error', 'settings', 'ssoPassword encrypt failed: ' + e.message);
+        settings.ssoPassword = '';
+      }
+    } else {
+      settings.ssoPassword = '';
+    }
+    persistSettings(settings);
+    return { ok: true };
+  });
+
+  ipcMain.handle('sso:get-credentials', () => {
+    let password = '';
+    if (settings.ssoPassword) {
+      try {
+        const buf = Buffer.from(settings.ssoPassword, 'base64');
+        password = safeStorage.decryptString(buf);
+      } catch (_) { /* corrupted or empty */ }
+    }
+    return { username: settings.ssoUsername || '', password };
   });
 
   // ---- Login ----

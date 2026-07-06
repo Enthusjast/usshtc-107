@@ -13,6 +13,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getSettings: () => ipcRenderer.invoke('settings:get'),
   saveSettings: (settings) => ipcRenderer.invoke('settings:save', settings),
 
+  // ---- SSO Credentials (encrypted) ----
+  saveSsoCredentials: (username, password) => ipcRenderer.invoke('sso:save-credentials', username, password),
+  getSsoCredentials: () => ipcRenderer.invoke('sso:get-credentials'),
+
   // ---- Login ----
   startLogin: () => ipcRenderer.invoke('login:start'),
 
