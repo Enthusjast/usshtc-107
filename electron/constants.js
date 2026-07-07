@@ -15,6 +15,8 @@ const DEFAULTS = {
   savedCookie: '',
   ssoUsername: '',
   ssoPassword: '',
+  sshPublicKey: '',
+  sshPublicKeyRaw: '',
 };
 
 const PLATFORM = {

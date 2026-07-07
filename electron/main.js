@@ -2,6 +2,7 @@ const { app, BrowserWindow, session, ipcMain, clipboard, Tray, Menu, nativeImage
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const crypto = require('crypto');
 const zlib = require('zlib');
 const log = require('electron-log');
 const { ProxyServer } = require('./proxy-server');
@@ -11,6 +12,78 @@ const {
   LOGIN_PAGE_PATTERNS,
   TERMINAL_PATTERNS,
 } = require('./constants');
+
+// =========================================================================
+// Ed25519 SSH key pair — generated once, used for proxy authentication
+// =========================================================================
+
+const SSH_KEY_NAME = 'usshtc107_ed25519';
+
+function ensureSshKeyPair() {
+  const sshDir = path.join(os.homedir(), '.ssh');
+  const privPath = path.join(sshDir, SSH_KEY_NAME);
+  const pubPath = privPath + '.pub';
+
+  // Key already exists on disk and public key stored in settings
+  if (fs.existsSync(privPath) && settings.sshPublicKey) {
+    // Migration: if raw bytes missing, extract from public key file
+    if (!settings.sshPublicKeyRaw && fs.existsSync(pubPath)) {
+      try {
+        const pubContent = fs.readFileSync(pubPath, 'utf-8').trim();
+        const parts = pubContent.split(' ');
+        if (parts.length >= 2 && parts[0] === 'ssh-ed25519') {
+          const keyBuf = Buffer.from(parts[1], 'base64');
+          // Extract raw 32 bytes: skip 4 len + "ssh-ed25519" + 4 len = 4+11+4 = 19
+          const rawBytes = keyBuf.subarray(19);
+          settings.sshPublicKeyRaw = rawBytes.toString('base64');
+          persistSettings(settings);
+          addLog('info', 'ssh-key', 'Migrated: extracted raw public key bytes');
+        }
+      } catch (_) {}
+    }
+    return { privPath, pubPath, publicKey: settings.sshPublicKey };
+  }
+
+  // Generate ed25519 key pair
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519', {
+    publicKeyEncoding: { type: 'spki', format: 'pem' },
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+  });
+
+  // Export public key as DER → extract raw 32 bytes (last 32 of SPKI wrapper)
+  const keyObj = crypto.createPublicKey(publicKey);
+  const spkiDer = keyObj.export({ type: 'spki', format: 'der' });
+  const rawPubBytes = spkiDer.subarray(spkiDer.length - 32);
+
+  // Build OpenSSH format for display: ssh-ed25519 <base64> comment
+  // OpenSSH format: [len("ssh-ed25519")]["ssh-ed25519"][len(raw)][raw]
+  const typeStr = 'ssh-ed25519';
+  const typeBuf = Buffer.from(typeStr);
+  const parts = Buffer.alloc(4 + typeBuf.length + 4 + rawPubBytes.length);
+  parts.writeUInt32BE(typeBuf.length, 0);
+  typeBuf.copy(parts, 4);
+  parts.writeUInt32BE(rawPubBytes.length, 4 + typeBuf.length);
+  rawPubBytes.copy(parts, 8 + typeBuf.length);
+  const openSshPub = `${typeStr} ${parts.toString('base64')} usshtc107`;
+
+  // Ensure ~/.ssh directory exists
+  if (!fs.existsSync(sshDir)) {
+    fs.mkdirSync(sshDir, { mode: 0o700 });
+  }
+
+  // Write private key (owner-only read)
+  fs.writeFileSync(privPath, privateKey, { mode: 0o600 });
+  // Write public key
+  fs.writeFileSync(pubPath, openSshPub + '\n', { mode: 0o644 });
+
+  // Store public key in settings (OpenSSH format for display + raw for auth)
+  settings.sshPublicKey = openSshPub;
+  settings.sshPublicKeyRaw = rawPubBytes.toString('base64');
+  persistSettings(settings);
+
+  addLog('info', 'ssh-key', `Generated ed25519 key pair: ${privPath}`);
+  return { privPath, pubPath, publicKey: openSshPub };
+}
 
 // =========================================================================
 // Tray icon generator — creates a 16×16 colored-circle PNG in memory
@@ -652,6 +725,12 @@ async function startProxyServer(cookieString) {
 
   state.wssUrl = buildWssUrl();
 
+  // Load authorized public key raw bytes for client authentication
+  let authorizedKey = null;
+  if (settings.sshPublicKeyRaw) {
+    authorizedKey = Buffer.from(settings.sshPublicKeyRaw, 'base64');
+  }
+
   proxyServer = new ProxyServer({
     port: state.port,
     host: state.host,
@@ -661,6 +740,7 @@ async function startProxyServer(cookieString) {
     cols: settings.cols,
     rows: settings.rows,
     useRoot: settings.useRoot,
+    authorizedKey,
   });
 
   // ---- Proxy events ----
@@ -857,7 +937,7 @@ function setupIPCHandlers() {
   ipcMain.handle('settings:save', (_e, s) => {
     // Whitelist allowed keys to prevent injection of unexpected properties
     // savedCookie is managed internally, not user-editable
-    const ALLOWED = new Set(Object.keys(DEFAULTS).filter((k) => k !== 'savedCookie' && k !== 'ssoPassword'));
+    const ALLOWED = new Set(Object.keys(DEFAULTS).filter((k) => k !== 'savedCookie' && k !== 'ssoPassword' && k !== 'sshPublicKeyRaw'));
     for (const key of Object.keys(s)) {
       if (!ALLOWED.has(key)) continue;
       settings[key] = s[key];
@@ -968,6 +1048,17 @@ function setupIPCHandlers() {
     };
   });
 
+  // ---- SSH Key Info ----
+  ipcMain.handle('ssh-key:get-info', () => {
+    const sshDir = path.join(os.homedir(), '.ssh');
+    const privPath = path.join(sshDir, SSH_KEY_NAME);
+    return {
+      publicKey: settings.sshPublicKey || '',
+      privateKeyPath: privPath,
+      exists: fs.existsSync(privPath),
+    };
+  });
+
   // ---- SSH Config ----
   ipcMain.handle('ssh-config:generate', async (_e, { host, port, alias } = {}) => {
     const h = host || state.host || '127.0.0.1';
@@ -978,11 +1069,13 @@ function setupIPCHandlers() {
     const configPath = path.join(sshDir, 'config');
     const marker = '# usshtc107-auto-generated';
 
+    const privKeyPath = path.join(os.homedir(), '.ssh', SSH_KEY_NAME);
     const block = `${marker}
 Host ${a}
   HostName ${h}
   Port ${p}
   User user
+  IdentityFile ${privKeyPath}
   StrictHostKeyChecking no
   UserKnownHostsFile /dev/null`;
 
@@ -1051,6 +1144,7 @@ app.whenReady().then(async () => {
   setupCookieMonitoring();
   createTray();
   createMainWindow();
+  ensureSshKeyPair();
   addLog('info', 'app', 'Application started');
 
   // Auto-connect after a short delay to let cookie store initialize

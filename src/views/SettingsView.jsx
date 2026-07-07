@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react';
-import { getSettings, saveSettings, getRuntimeInfo, generateSshConfig, saveSsoCredentials, getSsoCredentials } from '../lib/electron';
+import { getSettings, saveSettings, getRuntimeInfo, generateSshConfig, saveSsoCredentials, getSsoCredentials, getSshKeyInfo, copyToClipboard } from '../lib/electron';
 import { useToast } from '../components/Toast';
 import { useLocale } from '../i18n/LocaleContext';
-import { IconSettings, IconServer, IconFileEdit, IconInfo, IconGlobe } from '../components/Icons';
+import { IconSettings, IconServer, IconFileEdit, IconInfo, IconGlobe, IconKey, IconClipboard } from '../components/Icons';
 
 const DEFAULT_SETTINGS = {
   port: 3000,
@@ -30,10 +30,19 @@ export default function SettingsView() {
   const [ssoUsername, setSsoUsername] = useState('');
   const [ssoPassword, setSsoPassword] = useState('');
   const [ssoLoaded, setSsoLoaded] = useState(false);
+  const [sshPubKey, setSshPubKey] = useState('');
+  const [sshKeyPath, setSshKeyPath] = useState('');
+  const [keyCopied, setKeyCopied] = useState(false);
 
   useEffect(() => {
     getSettings().then((s) => { if (s) setSettings((prev) => ({ ...prev, ...s })); });
     getRuntimeInfo().then(setRuntime);
+    getSshKeyInfo().then((info) => {
+      if (info) {
+        setSshPubKey(info.publicKey || '');
+        setSshKeyPath(info.privateKeyPath || '');
+      }
+    });
     getSsoCredentials().then((c) => {
       if (c) {
         setSsoUsername(c.username || '');
@@ -89,6 +98,14 @@ export default function SettingsView() {
     } else {
       pushToast('error', t('failed'), t('errorPrefix', result.error));
     }
+  };
+
+  const handleCopyPubKey = async () => {
+    if (!sshPubKey) return;
+    await copyToClipboard(sshPubKey);
+    setKeyCopied(true);
+    pushToast('info', t('copied'), sshPubKey);
+    setTimeout(() => setKeyCopied(false), 2000);
   };
 
   return (
@@ -235,6 +252,38 @@ export default function SettingsView() {
             中文
           </button>
         </div>
+      </div>
+
+      {/* SSH Public Key */}
+      <div className="card">
+        <div className="card-header">
+          <span className="card-header-icon"><IconKey /></span> {t('sshPublicKeyTitle')}
+        </div>
+        <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', marginBottom: '0.85rem', lineHeight: 1.5 }}>
+          {t('sshPublicKeyHint')}
+        </p>
+        {sshPubKey ? (
+          <>
+            <div className="code-block" style={{ fontSize: '0.75rem', wordBreak: 'break-all', marginBottom: '0.5rem' }}>
+              {sshPubKey}
+            </div>
+            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+              <button className="btn" onClick={handleCopyPubKey}>
+                <IconClipboard size={15} />
+                {keyCopied ? t('copied') : t('copyPublicKey')}
+              </button>
+              {sshKeyPath && (
+                <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
+                  {t('privateKeyAt')} <span className="mono">{sshKeyPath}</span>
+                </span>
+              )}
+            </div>
+          </>
+        ) : (
+          <div style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>
+            {t('noSshKey')}
+          </div>
+        )}
       </div>
 
       {/* SSH Config */}

@@ -4,7 +4,7 @@ import {
   startLogin, startProxy, stopProxy,
   onLoginStatus, onProxyStatus, onCookieStatus, onLoginProgress,
   onStatsUpdate,
-  copyToClipboard,
+  copyToClipboard, getSshKeyInfo,
 } from '../lib/electron';
 import { useToast } from '../components/Toast';
 import { useLocale } from '../i18n/LocaleContext';
@@ -55,13 +55,17 @@ export default function DashboardView() {
 
   const [loaded, setLoaded] = useState(false);
   const [copied, setCopied] = useState(false);
-  const sshCommand = `ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p ${state.port} user@${state.host}`;
+  const [sshKeyPath, setSshKeyPath] = useState('');
+  const sshCommand = sshKeyPath
+    ? `ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ${sshKeyPath} -p ${state.port} user@${state.host}`
+    : `ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p ${state.port} user@${state.host}`;
 
   useEffect(() => {
-    Promise.all([getStatus(), getStats()])
-      .then(([s, st]) => {
+    Promise.all([getStatus(), getStats(), getSshKeyInfo()])
+      .then(([s, st, keyInfo]) => {
         if (s) setState((prev) => ({ ...prev, ...s }));
         if (st) setStats(st);
+        if (keyInfo?.privateKeyPath) setSshKeyPath(keyInfo.privateKeyPath);
       })
       .catch(() => {})
       .finally(() => setLoaded(true));

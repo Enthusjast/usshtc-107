@@ -110,6 +110,14 @@ export async function getStats() {
   return api?.getStats?.() ?? null;
 }
 
+// ---- SSH Key Info ----
+
+export async function getSshKeyInfo() {
+  if (!hasElectronRuntime()) return { publicKey: '', privateKeyPath: '', exists: false };
+  const api = getAPI();
+  return api?.getSshKeyInfo?.() ?? { publicKey: '', privateKeyPath: '', exists: false };
+}
+
 // ---- SSH Config ----
 
 export async function generateSshConfig(opts) {

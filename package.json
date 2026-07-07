@@ -1,6 +1,6 @@
 {
   "name": "usshtc107",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "USTC computing platform SSH proxy client",
   "author": "Enthusjast <enthusjast@outlook.com>",
   "main": "electron/main.js",

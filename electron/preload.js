@@ -35,6 +35,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // ---- Stats ----
   getStats: () => ipcRenderer.invoke('stats:get'),
 
+  // ---- SSH Key Info ----
+  getSshKeyInfo: () => ipcRenderer.invoke('ssh-key:get-info'),
+
   // ---- SSH Config ----
   generateSshConfig: (opts) => ipcRenderer.invoke('ssh-config:generate', opts),
 
