@@ -56,9 +56,20 @@ Main Process (Electron)              Renderer (React + Vite)
 
 ### 登录流程
 1. 打开 loginWindow → 加载 107.ustc.edu.cn
-2. `setWindowOpenHandler` 用 `new URL()` 做 hostname 精确匹配（非子串）
-3. 双阶段检测：SSO 认证完成 → `sso_done` → 用户导航到 Web SSH 终端 → `success`
-4. Cookie 提取后**先关闭登录窗口**，再 `await startProxyServer()`（避免卡窗口）
+2. `setWindowOpenHandler` 用 `new URL()` 做 hostname 精确匹配（非子串），允许所有 `*.ustc.edu.cn` 子域名
+3. `did-finish-load` 处理器根据 hostname 分支：
+   - `107.ustc.edu.cn`：检测 `SCOW_USER` cookie → 有则跳转 shell 页面，无则自动点击 `#authButton`
+   - `id.ustc.edu.cn`：等待 Angular 渲染表单 → 原生 setter 填充账号密码 → 点击 `#submitBtn`
+4. 双阶段检测：SSO 认证完成 → `sso_done` → 用户导航到 Web SSH 终端 → `success`
+5. Cookie 提取后**先关闭登录窗口**，再 `await startProxyServer()`（避免卡窗口）
+
+**hostname 检查**：`did-finish-load` 中用 `new URL(url).hostname` 而非 `url.includes()` 匹配域名。CAS 登录页 URL 的 query 参数（`redirect_uri`）包含 `107.ustc.edu.cn`，会导致 `includes` 误判。
+
+### SSO 凭据存储
+- `ssoUsername` 和 `ssoPassword` 在 `DEFAULTS` 中定义，通过 `sso:save-credentials` IPC handler 单独保存（不在 `settings:save` 白名单中）
+- 密码加密：生产模式用 `safeStorage`（OS 级密钥库），开发模式用 XOR 混淆（基于 `app.getPath('userData')` 的 MD5）
+- `safeStorage.isEncryptionAvailable()` 在开发模式返回 `false`，需降级处理
+- 前端通过 `saveSsoCredentials(username, password)` / `getSsoCredentials()` 访问
 
 ### 状态管理
 - 主进程维护全局 `state` 对象（**不含不可序列化的值**，如定时器句柄）
@@ -111,3 +122,5 @@ npm run dist:win      # 打包 Windows (NSIS)
 - 登录窗口 `sandbox: true`，无 preload
 - 主窗口 `contextIsolation: true`, `nodeIntegration: false`
 - `_statsTimer` 定时器句柄存在模块级变量，不在 `state` 对象中（避免 IPC 序列化失败）
+- CAS 登录页面的 `executeJavaScript` 受 Angular Zone.js 影响，Promise 返回值会被包装为 `{__zone_symbol__state, __zone_symbol__value}`，不能直接读取
+- Angular `nz-input` 的 `DefaultValueAccessor` 不响应直接的 `.value` 赋值，需用 `HTMLInputElement.prototype.value` 原生 setter + `input`/`change` 事件

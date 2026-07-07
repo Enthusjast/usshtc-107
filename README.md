@@ -8,7 +8,7 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 3000 user@127
 
 ## 功能
 
-- **SSO 自动登录** — 内嵌浏览器完成学校统一认证，自动提取鉴权 Cookie
+- **SSO 自动登录** — 内嵌浏览器自动完成学校统一认证（自动点击 SSO 按钮 → 自动填充账号密码 → 自动跳转提取 Cookie）
 - **TCP ↔ WebSocket 桥接** — 本地 SSH 服务器（ssh2）将标准 SSH 流量实时转发到平台 WSS
 - **Exec 命令支持** — 通过交互式 shell 模拟 exec 通道，支持 `ssh host 'command'` 远程执行
 - **实时仪表盘** — 连接数、Cookie 状态、流量统计（上行/下行字节数、运行时长）每秒刷新
@@ -76,10 +76,19 @@ npm run dist:win     # NSIS installer
 
 ## 使用
 
-1. 启动应用 → 点击 **Login** 打开 SSO 认证窗口
-2. 完成学校统一认证后，导航到 **Web SSH** 页面
-3. Cookie 自动提取 → 代理服务自动启动
-4. 在终端执行 SSH 命令连接：
+### 首次登录
+
+1. 启动应用 → 前往 **Settings → SSO 自动登录**，输入学号和密码并保存
+2. 点击 **Login** 打开 SSO 认证窗口
+3. 在弹出的浏览器中完成学校统一认证（CAS）
+4. 导航到 **Web SSH** 页面后，Cookie 自动提取 → 代理服务自动启动
+
+### 后续启动（自动登录）
+
+1. 启动应用 → 自动检测已保存的 Cookie → 代理服务自动启动
+2. 如需重新登录：点击 **Login** → 自动点击 SSO 按钮 → 自动填充账号密码 → 自动跳转提取 Cookie
+
+### SSH 连接
 
 ```bash
 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 3000 user@127.0.0.1
@@ -116,6 +125,8 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 3000 user@127
 | Cols / Rows | 80 / 24 | 终端行列数 |
 | Auto-connect | 开启 | 启动时自动连接 |
 | Start minimized | 关闭 | 启动时最小化到托盘 |
+| SSO Username | — | CAS 登录学号（自动填充） |
+| SSO Password | — | CAS 登录密码（加密存储） |
 
 > **Windows 用户注意**：如果启动代理时遇到 `EACCES: permission denied`，说明端口被 Hyper-V/WSL 预留了。
 > 在 PowerShell（管理员）中运行 `netsh interface ipv4 show excludedportrange protocol=tcp` 查看预留范围，
