@@ -1,6 +1,6 @@
 const crypto = require('crypto');
 const net = require('net');
-const { Server: SSHServer } = require('ssh2');
+const { Server: SSHServer, utils: sshUtils } = require('ssh2');
 const { WebSocket } = require('ws');
 const { EventEmitter } = require('events');
 const {
@@ -74,7 +74,15 @@ class ProxyServer extends EventEmitter {
       this.wssUrl = `${PLATFORM.wssBase}?${params.toString()}`;
     }
 
-    this.authorizedKey = options.authorizedKey || null; // DER bytes for pubkey auth
+    this.authorizedKey = options.authorizedKey || null; // raw 32-byte ed25519 key
+    this._parsedPubKey = null; // ssh2 Key object for signature verification
+    if (options.authorizedKeyOpenSSH) {
+      try {
+        this._parsedPubKey = sshUtils.parseKey(options.authorizedKeyOpenSSH);
+      } catch (e) {
+        console.error('[proxy] Failed to parse authorized key:', e.message);
+      }
+    }
 
     this._server = null;
     this._sshServer = null;
@@ -546,55 +554,71 @@ class ProxyServer extends EventEmitter {
     this.emit('proxy-log', 'info', 'ssh', `Client connected: ${addr}`);
 
     client.on('authentication', (ctx) => {
-      if (ctx.method === 'publickey' && this.authorizedKey) {
-        // ctx.key.data: for ed25519, raw 32-byte public key
-        const clientKey = ctx.key.data;
-        if (!clientKey.equals(this.authorizedKey)) {
-          console.log(`[proxy] SSH auth: publickey rejected (key mismatch)`);
-          this.emit('proxy-log', 'warn', 'ssh', `Auth publickey rejected — key mismatch`);
-          ctx.reject();
-          return;
-        }
-        // If no signature, client is probing whether this key is acceptable
+      if (ctx.method === 'publickey') {
+        // Step 1: No signature yet — client probing if key is acceptable
         if (!ctx.signature) {
+          if (!this.authorizedKey) {
+            // No key configured — accept any key
+            ctx.accept();
+            return;
+          }
+          // Check if client key matches authorized key
+          const clientKeyBlob = ctx.key.data;
+          let rawClientKey;
+          if (ctx.key.algo === 'ssh-ed25519' && clientKeyBlob.length > 32) {
+            rawClientKey = clientKeyBlob.subarray(clientKeyBlob.length - 32);
+          } else {
+            rawClientKey = clientKeyBlob;
+          }
+          if (rawClientKey.equals(this.authorizedKey)) {
+            ctx.accept(); // Key matches — tell client to sign
+          } else {
+            this.emit('proxy-log', 'warn', 'ssh', `Auth publickey rejected — key not authorized`);
+            ctx.reject();
+          }
+          return;
+        }
+        // Step 2: Signature present — verify the client owns the private key
+        if (!this._parsedPubKey) {
+          // No parsed key — accept (shouldn't happen)
           ctx.accept();
           return;
         }
-        // Verify signature — wrap raw ed25519 bytes in SPKI DER for Node.js
-        const OID = Buffer.from('300506032b6570', 'hex'); // Ed25519 OID
-        const spkiDer = Buffer.alloc(12 + 32);
-        // SEQUENCE { SEQUENCE { OID }, BIT STRING { 0x00 + key } }
-        spkiDer[0] = 0x30; spkiDer[1] = 0x2a; // outer SEQUENCE
-        OID.copy(spkiDer, 2);
-        spkiDer[9] = 0x03; spkiDer[10] = 0x21; // BIT STRING
-        spkiDer[11] = 0x00; // unused bits
-        this.authorizedKey.copy(spkiDer, 12);
-        const pubKeyObj = crypto.createPublicKey({ key: spkiDer, format: 'der', type: 'spki' });
-        const ok = crypto.verify(null, ctx.blob, pubKeyObj, ctx.signature);
-        if (ok) {
-          console.log(`[proxy] SSH auth: publickey accepted`);
-          this.emit('proxy-log', 'info', 'ssh', `Auth publickey accepted`);
-          ctx.accept();
-        } else {
-          console.log(`[proxy] SSH auth: publickey rejected (bad signature)`);
-          this.emit('proxy-log', 'warn', 'ssh', `Auth publickey rejected — bad signature`);
+        try {
+          // Try verifying with ctx.signature directly (may be raw or SSH wire format)
+          let ok = this._parsedPubKey.verify(ctx.blob, ctx.signature);
+          if (!ok) {
+            // Maybe ctx.signature is SSH wire format — try extracting raw sig
+            // SSH wire: [4 algoLen][algo][4 sigLen][rawSig]
+            const sigBuf = ctx.signature;
+            if (sigBuf.length > 64) {
+              try {
+                const algoLen = sigBuf.readUInt32BE(0);
+                const sigLen = sigBuf.readUInt32BE(4 + algoLen);
+                const rawSig = sigBuf.subarray(8 + algoLen, 8 + algoLen + sigLen);
+                ok = this._parsedPubKey.verify(ctx.blob, rawSig);
+              } catch (_) {}
+            }
+          }
+          if (ok) {
+            console.log(`[proxy] SSH auth: publickey accepted (signature verified)`);
+            this.emit('proxy-log', 'info', 'ssh', `Auth publickey accepted — signature verified`);
+            ctx.accept();
+          } else {
+            console.log(`[proxy] SSH auth: publickey rejected (bad signature)`);
+            this.emit('proxy-log', 'warn', 'ssh', `Auth publickey rejected — bad signature`);
+            ctx.reject();
+          }
+        } catch (err) {
+          console.log(`[proxy] SSH auth: verify error: ${err.message}`);
+          this.emit('proxy-log', 'error', 'ssh', `Auth verify error: ${err.message}`);
           ctx.reject();
         }
-      } else if (ctx.method === 'publickey' && !this.authorizedKey) {
-        // No authorized key configured — accept all (backward compat)
-        console.log(`[proxy] SSH auth: ${ctx.method} accepted (no key configured)`);
-        this.emit('proxy-log', 'info', 'ssh', `Auth (${ctx.method}) accepted — no key configured`);
-        ctx.accept();
-      } else if (this.authorizedKey) {
-        // Reject non-publickey methods when key is configured
-        console.log(`[proxy] SSH auth: ${ctx.method} rejected (publickey required)`);
-        this.emit('proxy-log', 'warn', 'ssh', `Auth ${ctx.method} rejected — publickey required`);
-        ctx.reject(['publickey']);
       } else {
-        // No key configured — accept all methods
-        console.log(`[proxy] SSH auth: ${ctx.method} accepted`);
-        this.emit('proxy-log', 'info', 'ssh', `Auth (${ctx.method}) accepted`);
-        ctx.accept();
+        // Reject non-publickey methods
+        console.log(`[proxy] SSH auth: ${ctx.method} rejected — publickey required`);
+        this.emit('proxy-log', 'info', 'ssh', `Auth ${ctx.method} rejected — publickey required`);
+        ctx.reject(['publickey']);
       }
     });
 

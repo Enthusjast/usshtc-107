@@ -202,6 +202,10 @@ export async function openExternal(url) {
 }
 
 export async function copyToClipboard(text) {
+  if (hasElectronRuntime()) {
+    const api = getAPI();
+    return api?.copyToClipboard?.(text);
+  }
   try {
     await navigator.clipboard.writeText(text);
     return true;

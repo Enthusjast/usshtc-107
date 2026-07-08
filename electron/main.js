@@ -85,6 +85,56 @@ function ensureSshKeyPair() {
   return { privPath, pubPath, publicKey: openSshPub };
 }
 
+function autoGenerateSshConfig() {
+  const sshDir = path.join(os.homedir(), '.ssh');
+  const configPath = path.join(sshDir, 'config');
+  const privPath = path.join(sshDir, SSH_KEY_NAME);
+  const alias = settings.sshAlias || 'ustc107';
+  const h = settings.host || '127.0.0.1';
+  const p = settings.port || 3000;
+  const marker = '# usshtc107-auto-generated';
+
+  const block = `${marker}
+Host ${alias}
+  HostName ${h}
+  Port ${p}
+  User user
+  IdentityFile ${privPath}
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null`;
+
+  try {
+    if (!fs.existsSync(sshDir)) {
+      fs.mkdirSync(sshDir, { mode: 0o700 });
+    }
+
+    let existing = '';
+    if (fs.existsSync(configPath)) {
+      existing = fs.readFileSync(configPath, 'utf-8');
+    }
+
+    // Remove old usshtc107 block
+    const escMarker = marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const escAlias = alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const NL = '(\\r?\\n)';
+    const regex = new RegExp(
+      `${NL}*${escMarker}${NL}` +
+      `Host ${escAlias}[\\s\\S]*?` +
+      `(?=${NL}Host |${escMarker}|$)`,
+      'g'
+    );
+    let newConfig = existing.replace(regex, '').trim();
+
+    if (newConfig) newConfig += '\n\n';
+    newConfig += block + '\n';
+
+    fs.writeFileSync(configPath, newConfig, { mode: 0o644 });
+    addLog('info', 'ssh-config', `Auto-generated SSH config for alias '${alias}'`);
+  } catch (err) {
+    addLog('warn', 'ssh-config', `Auto-generate failed: ${err.message}`);
+  }
+}
+
 // =========================================================================
 // Tray icon generator — creates a 16×16 colored-circle PNG in memory
 // =========================================================================
@@ -725,7 +775,7 @@ async function startProxyServer(cookieString) {
 
   state.wssUrl = buildWssUrl();
 
-  // Load authorized public key raw bytes for client authentication
+  // Load authorized public key for client authentication
   let authorizedKey = null;
   if (settings.sshPublicKeyRaw) {
     authorizedKey = Buffer.from(settings.sshPublicKeyRaw, 'base64');
@@ -741,6 +791,7 @@ async function startProxyServer(cookieString) {
     rows: settings.rows,
     useRoot: settings.useRoot,
     authorizedKey,
+    authorizedKeyOpenSSH: settings.sshPublicKey || '',
   });
 
   // ---- Proxy events ----
@@ -843,6 +894,7 @@ async function startProxyServer(cookieString) {
     await proxyServer.start();
   } catch (err) {
     state.proxyStatus = 'error';
+    if (_statsTimer) { clearInterval(_statsTimer); _statsTimer = null; }
     addLog('error', 'proxy', `Start failed: ${err.message}`);
     sendToMain('proxy-status', {
       proxyStatus: 'error',
@@ -993,8 +1045,16 @@ function setupIPCHandlers() {
     let password = '';
     if (settings.ssoPassword) {
       try {
-        const buf = Buffer.from(settings.ssoPassword, 'base64');
-        password = safeStorage.decryptString(buf);
+        if (settings.ssoPassword.startsWith('xor:')) {
+          // Dev mode: XOR obfuscated
+          const key = crypto.createHash('md5').update(app.getPath('userData')).digest();
+          const buf = Buffer.from(settings.ssoPassword.slice(4), 'base64');
+          for (let i = 0; i < buf.length; i++) buf[i] ^= key[i % key.length];
+          password = buf.toString('utf-8');
+        } else {
+          const buf = Buffer.from(settings.ssoPassword, 'base64');
+          password = safeStorage.decryptString(buf);
+        }
       } catch (_) { /* corrupted or empty */ }
     }
     return { username: settings.ssoUsername || '', password };
@@ -1093,11 +1153,11 @@ Host ${a}
       // Remove old usshtc107 block (handles both LF and CRLF line endings)
       const escMarker = marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const escAlias = a.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const NL = '\\r?\\n';
+      const NL = '(\\r?\\n)';
       const regex = new RegExp(
         `${NL}*${escMarker}${NL}` +
         `Host ${escAlias}[\\s\\S]*?` +
-        `(?=${NL}Host |${NL}# usshtc107|$)`,
+        `(?=${NL}Host |${escMarker}|$)`,
         'g'
       );
       let newConfig = existing.replace(regex, '').trim();
@@ -1145,6 +1205,7 @@ app.whenReady().then(async () => {
   createTray();
   createMainWindow();
   ensureSshKeyPair();
+  autoGenerateSshConfig();
   addLog('info', 'app', 'Application started');
 
   // Auto-connect after a short delay to let cookie store initialize

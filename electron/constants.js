@@ -17,6 +17,7 @@ const DEFAULTS = {
   ssoPassword: '',
   sshPublicKey: '',
   sshPublicKeyRaw: '',
+  sshAlias: 'ustc107',
 };
 
 const PLATFORM = {
