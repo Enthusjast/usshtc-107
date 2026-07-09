@@ -15,7 +15,7 @@ const DEFAULT_SETTINGS = {
   autoConnect: true,
   startMinimized: false,
   theme: 'dark',
-  sshAlias: 'ustc107',
+  sshAlias: 'usshtc107',
 };
 
 export default function SettingsView() {
@@ -89,12 +89,12 @@ export default function SettingsView() {
     const result = await generateSshConfig({
       host: settings.host,
       port: settings.port,
-      alias: settings.sshAlias || 'ustc107',
+      alias: settings.sshAlias || 'usshtc107',
     });
     setSshConfigResult(result);
     setGenerating(false);
     if (result.success) {
-      pushToast('success', t('sshConfigWritten'), t('sshNowUse', settings.sshAlias || 'ustc107'));
+      pushToast('success', t('sshConfigWritten'), t('sshNowUse', settings.sshAlias || 'usshtc107'));
     } else {
       pushToast('error', t('failed'), t('errorPrefix', result.error));
     }
@@ -292,12 +292,12 @@ export default function SettingsView() {
           <span className="card-header-icon"><IconFileEdit /></span> {t('sshConfig')}
         </div>
         <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', marginBottom: '0.85rem', lineHeight: 1.5 }}>
-          <>{t('sshConfigHint', settings.sshAlias || 'ustc107')}</>
+          <>{t('sshConfigHint', settings.sshAlias || 'usshtc107')}</>
         </p>
         <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.85rem', alignItems: 'end' }}>
           <div style={{ flex: '0 0 180px' }}>
             <label className="form-label" htmlFor="setting-sshAlias">{t('sshAlias')}</label>
-            <input id="setting-sshAlias" className="form-input" value={settings.sshAlias || 'ustc107'} onChange={(e) => update('sshAlias', e.target.value)} placeholder="ustc107" />
+            <input id="setting-sshAlias" className="form-input" value={settings.sshAlias || 'usshtc107'} onChange={(e) => update('sshAlias', e.target.value)} placeholder="usshtc107" />
           </div>
           <button className="btn btn-primary" onClick={handleGenerateSshConfig} disabled={generating}>
             {generating ? t('writing') : t('generateSshConfig')}

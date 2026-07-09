@@ -89,7 +89,7 @@ function autoGenerateSshConfig() {
   const sshDir = path.join(os.homedir(), '.ssh');
   const configPath = path.join(sshDir, 'config');
   const privPath = path.join(sshDir, SSH_KEY_NAME);
-  const alias = settings.sshAlias || 'ustc107';
+  const alias = settings.sshAlias || 'usshtc107';
   const h = settings.host || '127.0.0.1';
   const p = settings.port || 3000;
   const marker = '# usshtc107-auto-generated';
@@ -1123,7 +1123,7 @@ function setupIPCHandlers() {
   ipcMain.handle('ssh-config:generate', async (_e, { host, port, alias } = {}) => {
     const h = host || state.host || '127.0.0.1';
     const p = port || state.port || 3000;
-    const a = alias || 'ustc107';
+    const a = alias || 'usshtc107';
 
     const sshDir = path.join(os.homedir(), '.ssh');
     const configPath = path.join(sshDir, 'config');
