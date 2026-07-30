@@ -1,34 +1,48 @@
-import { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import { getTheme, setTheme as persistTheme, onThemeChanged } from '../lib/electron';
 
 const ThemeContext = createContext(null);
+const VALID_THEMES = new Set(['dark', 'light']);
 
 export function ThemeProvider({ children }) {
   const [theme, setThemeState] = useState('dark');
+  const themeVersionRef = useRef(0);
 
-  useEffect(() => {
-    getTheme().then((t) => {
-      if (t) {
-        setThemeState(t);
-        document.documentElement.setAttribute('data-theme', t);
-      }
-    });
+  const applyTheme = useCallback((nextTheme) => {
+    if (!VALID_THEMES.has(nextTheme)) return false;
+    themeVersionRef.current += 1;
+    setThemeState(nextTheme);
+    document.documentElement.setAttribute('data-theme', nextTheme);
+    return true;
   }, []);
 
   useEffect(() => {
-    const unsub = onThemeChanged((t) => {
-      setThemeState(t);
-      document.documentElement.setAttribute('data-theme', t);
-    });
+    let active = true;
+    const themeVersionAtStart = themeVersionRef.current;
+    document.documentElement.setAttribute('data-theme', 'dark');
+    getTheme()
+      .then((storedTheme) => {
+        if (active && themeVersionRef.current === themeVersionAtStart) applyTheme(storedTheme);
+      })
+      .catch(() => {});
+    return () => { active = false; };
+  }, [applyTheme]);
+
+  useEffect(() => {
+    const unsub = onThemeChanged(applyTheme);
     return () => unsub?.();
-  }, []);
+  }, [applyTheme]);
 
-  const toggleTheme = useCallback(() => {
+  const toggleTheme = useCallback(async () => {
     const next = theme === 'dark' ? 'light' : 'dark';
-    setThemeState(next);
-    document.documentElement.setAttribute('data-theme', next);
-    persistTheme(next);
-  }, [theme]);
+    try {
+      const result = await persistTheme(next);
+      if (result?.ok === false) return false;
+      return applyTheme(next);
+    } catch {
+      return false;
+    }
+  }, [applyTheme, theme]);
 
   return (
     <ThemeContext.Provider value={{ theme, toggleTheme }}>

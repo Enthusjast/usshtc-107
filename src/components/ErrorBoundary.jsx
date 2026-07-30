@@ -1,6 +1,7 @@
 import { Component } from 'react';
+import { useLocale } from '../i18n/LocaleContext';
 
-export default class ErrorBoundary extends Component {
+class ErrorBoundaryCore extends Component {
   constructor(props) {
     super(props);
     this.state = { hasError: false, error: null };
@@ -29,25 +30,38 @@ export default class ErrorBoundary extends Component {
           color: 'var(--text-color)',
           textAlign: 'center',
         }}>
-          <div style={{ fontSize: '3rem', marginBottom: '1rem', opacity: 0.3 }}>⚠</div>
           <h1 style={{ fontSize: '1.4rem', fontWeight: 600, marginBottom: '0.5rem' }}>
-            Something went wrong
+            {this.props.title}
           </h1>
           <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', marginBottom: '1.5rem', maxWidth: '400px' }}>
-            {this.state.error?.message || 'An unexpected error occurred'}
+            {this.state.error?.message || this.props.fallbackMessage}
           </p>
           <button
+            type="button"
             className="btn btn-primary"
             onClick={() => {
               this.setState({ hasError: false, error: null });
               window.location.reload();
             }}
           >
-            Reload
+            {this.props.reloadLabel}
           </button>
         </div>
       );
     }
     return this.props.children;
   }
+}
+
+export default function ErrorBoundary({ children }) {
+  const { t } = useLocale();
+  return (
+    <ErrorBoundaryCore
+      title={t('unexpectedErrorTitle')}
+      fallbackMessage={t('unknownError')}
+      reloadLabel={t('reload')}
+    >
+      {children}
+    </ErrorBoundaryCore>
+  );
 }

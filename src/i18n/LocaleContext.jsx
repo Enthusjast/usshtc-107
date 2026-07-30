@@ -1,6 +1,7 @@
-import { createContext, useContext, useState, useCallback } from 'react';
+import { createContext, useContext, useState, useCallback, useEffect } from 'react';
 import en from './en';
 import zh from './zh';
+import { setAppLocale } from '../lib/electron';
 
 const LOCALES = { en, zh };
 const FALLBACK = 'en';
@@ -38,6 +39,11 @@ export function LocaleProvider({ children }) {
       try { localStorage.setItem('usshtc107-locale', l); } catch (_) {}
     }
   }, []);
+
+  useEffect(() => {
+    document.documentElement.lang = locale === 'zh' ? 'zh-CN' : 'en';
+    setAppLocale(locale).catch(() => {});
+  }, [locale]);
 
   /**
    * Translation function. Usage:

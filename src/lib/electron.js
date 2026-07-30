@@ -47,9 +47,26 @@ export async function saveSsoCredentials(username, password) {
 }
 
 export async function getSsoCredentials() {
-  if (!hasElectronRuntime()) return { username: '', password: '' };
+  if (!hasElectronRuntime()) return { username: '', hasPassword: false, storageAvailable: false };
   const api = getAPI();
-  return api?.getSsoCredentials?.() ?? { username: '', password: '' };
+  const credentials = await api?.getSsoCredentials?.();
+  if (!credentials) return { username: '', hasPassword: false, storageAvailable: false };
+  return {
+    username: credentials.username || '',
+    // Backward compatible during the main-process API migration without
+    // exposing the legacy plaintext password to view components.
+    hasPassword: Boolean(credentials.hasPassword ?? credentials.password),
+    storageAvailable: credentials.storageAvailable !== false,
+  };
+}
+
+export function supportsClearSsoCredentials() {
+  return hasElectronRuntime() && typeof getAPI()?.clearSsoCredentials === 'function';
+}
+
+export async function clearSsoCredentials() {
+  if (!supportsClearSsoCredentials()) return { ok: false, unavailable: true };
+  return getAPI().clearSsoCredentials();
 }
 
 // ---- Login ----
@@ -140,6 +157,11 @@ export async function setTheme(theme) {
   return api?.setTheme?.(theme);
 }
 
+export async function setAppLocale(locale) {
+  if (!hasElectronRuntime()) return;
+  return getAPI()?.setLocale?.(locale);
+}
+
 // ---- Event subscriptions ----
 
 export function onLoginStatus(cb) {
@@ -202,15 +224,24 @@ export async function openExternal(url) {
 }
 
 export async function copyToClipboard(text) {
-  if (hasElectronRuntime()) {
-    const api = getAPI();
-    return api?.copyToClipboard?.(text);
-  }
   try {
+    if (hasElectronRuntime()) {
+      const result = await getAPI()?.copyToClipboard?.(text);
+      return result === true || result?.ok === true;
+    }
     await navigator.clipboard.writeText(text);
     return true;
   } catch {
     return false;
+  }
+}
+
+export async function setAppDirty(dirty) {
+  if (!hasElectronRuntime()) return;
+  try {
+    return await getAPI()?.setAppDirty?.(Boolean(dirty));
+  } catch (error) {
+    return { ok: false, error: error?.message || 'Unable to update application state' };
   }
 }
 

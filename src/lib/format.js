@@ -3,7 +3,7 @@
  */
 
 export function formatBytes(bytes) {
-  if (typeof bytes !== 'number' || isNaN(bytes) || bytes < 0) return '0 B';
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) return '0 B';
   if (bytes === 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB'];
   const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
@@ -12,7 +12,7 @@ export function formatBytes(bytes) {
 }
 
 export function formatUptime(ms) {
-  if (typeof ms !== 'number' || isNaN(ms) || ms < 0) return '0s';
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return '0s';
   if (ms < 1000) return '0s';
   const sec = Math.floor(ms / 1000);
   const h = Math.floor(sec / 3600);
@@ -24,7 +24,7 @@ export function formatUptime(ms) {
 }
 
 export function formatDuration(ms) {
-  if (typeof ms !== 'number' || isNaN(ms) || ms < 0) return '--';
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return '--';
   if (ms < 1000) return `${ms}ms`;
   const sec = Math.floor(ms / 1000);
   const h = Math.floor(sec / 3600);
@@ -38,7 +38,9 @@ export function formatDuration(ms) {
 export function formatTime(iso) {
   if (!iso) return '--';
   try {
-    return new Date(iso).toLocaleTimeString();
+    const date = new Date(iso);
+    if (!Number.isFinite(date.getTime())) return '--';
+    return date.toLocaleTimeString();
   } catch {
     return '--';
   }
