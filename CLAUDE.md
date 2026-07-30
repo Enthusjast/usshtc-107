@@ -2,125 +2,111 @@
 
 ## 项目概述
 
-usshtc107 是一个 Electron 桌面客户端，用于将本地 SSH 工具桥接到中国科学技术大学 107 算力平台。
-用户通过 SSO 登录后，本机启动 TCP 代理（默认 127.0.0.1:3000），将 SSH 流量经 WebSocket 转发到算力平台。
-
-**核心目标**: `ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 3000 user@127.0.0.1` 直连算力平台运行 Claude Code 等工具。
-
-## 架构
-
-```
-Main Process (Electron)              Renderer (React + Vite)
-├── main.js                           ├── App.jsx
-│   ├── 窗口管理 (mainWindow + loginWindow)   │   ├── Sidebar
-│   ├── Cookie 提取与监控               │   ├── DashboardView
-│   ├── IPC handlers (settings/sessions/stats/ssh-config/theme)  │   ├── SessionsView
-│   ├── 系统托盘 (Tray)                 │   ├── LogsView
-│   └── 自动连接 (tryAutoConnect)        │   └── SettingsView
-├── proxy-server.js                   ├── components/
-│   ├── SSH Server (ssh2)              │   ├── ErrorBoundary
-│   ├── WebSocket Client (ws)          │   ├── Icons (SVG, Lucide-style)
-│   ├── 双向桥接 (TCP ↔ WSS)           │   ├── Sidebar
-│   ├── 会话追踪 (Session)             │   └── Toast
-│   └── 流量统计                        ├── contexts/ThemeContext.jsx
-├── preload.js (contextBridge)        ├── i18n/LocaleContext.jsx + en.js/zh.js
-└── constants.js                       └── lib/electron.js + format.js
-```
-
-## 关键技术细节
-
-### 代理服务器 (proxy-server.js)
-- 使用 ssh2 的 `Server.injectSocket()` 将 TCP socket 注入 SSH 服务器
-- RSA 2048 主机密钥在模块级别缓存（`ProxyServer._hostKey`），避免重启时密钥变化
-- JSON WebSocket 协议：消息格式为 `{ "$case": "data", "data": { "data": "<text>" } }`
-- `session_ended` 检测：`exit` / `close` / `logout`
-- Ctrl+D（0x04 字节）检测：仅当数据长度为 1 且值为 0x04 时触发
-- Session 类追踪：id, remoteAddress, connectedAt, bytesSent, bytesReceived, _sshClient
-- `disconnectSession()` 通过 session._sshClient 精准关闭，不误杀其他连接
-- `_starting` 标志防并发
-- `AUTH_CLOSE_CODES = [1008, 1011]`（不含 1006 异常断开，避免网络抖动误判）
-
-### Exec 通道
-- 平台 WSS 仅支持交互式 shell，不支持原生 exec
-- Exec 请求通过交互式 shell 模拟：先发命令，再发 DONE 标记
-- `DONE_ID` 唯一标记：`echo DONE_<id> $?` 作为独立命令发送（延迟 2s）
-- `outputMessages[]` 数组存储 WSS 消息，按序号查找 DONE 标记
-- 完成后提取输出：截断到 DONE 标记 → 剥离 ANSI → `lastIndexOf(command + '\r\n')` 定位终端回显 → 剥离尾部 prompt
-- Prompt 正则支持 `~` 路径：`/[\w.\-]+@[\w.\-]+:[\w.\/~\- ]*[\$#]\s*$/`
-- 安全超时 60s 强制结束
-
-### 交互式会话
-- 数据流中检测 `logout` 关键字 → 2s 后主动关闭 WSS
-- cleanup 时先 `channel.exit(0)` 再 `channel.close()`，确保 SSH 客户端正确退出
-- `ws._socket?.destroy()` 处理 CONNECTING 状态的 WSS（避免 ws 库抛不可捕获异常）
-
-### 登录流程
-1. 打开 loginWindow → 加载 107.ustc.edu.cn
-2. `setWindowOpenHandler` 用 `new URL()` 做 hostname 精确匹配（非子串），允许所有 `*.ustc.edu.cn` 子域名
-3. `did-finish-load` 处理器根据 hostname 分支：
-   - `107.ustc.edu.cn`：检测 `SCOW_USER` cookie → 有则跳转 shell 页面，无则自动点击 `#authButton`
-   - `id.ustc.edu.cn`：等待 Angular 渲染表单 → 原生 setter 填充账号密码 → 点击 `#submitBtn`
-4. 双阶段检测：SSO 认证完成 → `sso_done` → 用户导航到 Web SSH 终端 → `success`
-5. Cookie 提取后**先关闭登录窗口**，再 `await startProxyServer()`（避免卡窗口）
-
-**hostname 检查**：`did-finish-load` 中用 `new URL(url).hostname` 而非 `url.includes()` 匹配域名。CAS 登录页 URL 的 query 参数（`redirect_uri`）包含 `107.ustc.edu.cn`，会导致 `includes` 误判。
-
-### SSO 凭据存储
-- `ssoUsername` 和 `ssoPassword` 在 `DEFAULTS` 中定义，通过 `sso:save-credentials` IPC handler 单独保存（不在 `settings:save` 白名单中）
-- 密码加密：生产模式用 `safeStorage`（OS 级密钥库），开发模式用 XOR 混淆（基于 `app.getPath('userData')` 的 MD5）
-- `safeStorage.isEncryptionAvailable()` 在开发模式返回 `false`，需降级处理
-- 前端通过 `saveSsoCredentials(username, password)` / `getSsoCredentials()` 访问
-
-### 状态管理
-- 主进程维护全局 `state` 对象（**不含不可序列化的值**，如定时器句柄）
-- 渲染进程通过 IPC 事件接收状态更新（`login-status`, `proxy-status`, `cookie-status`, `stats-update`, `session-update`, `theme-changed`）
-- `stats-update` 每秒定时推送（uptime 实时刷新）+ 流量触发节流（500ms）
-- 所有事件订阅返回 unsubscribe 函数
-- 所有视图初始加载用 `.catch().finally()` 防止 IPC 失败卡在 skeleton
-
-### 设置持久化
-- `app.getPath('userData')/settings.json`
-- 默认值定义在 `electron/constants.js` 的 `DEFAULTS`
-- IPC `settings:save` 使用白名单过滤（`ALLOWED` keys from DEFAULTS）
-- `useRoot` 在前端 select 发字符串，主进程归一化为 boolean
-
-### 国际化
-- `src/i18n/LocaleContext.jsx` — React Context，`t(key, ...args)` 翻译函数
-- 支持点路径（`parent.child`）和函数参数（`t('nCookies', 3) → "3 个 Cookie"`）
-- 优先级：当前语言 → 英文回退 → key 本身
-- 语言持久化在 localStorage
-
-## 开发命令
+usshtc107 是 Electron 桌面客户端：本机启动仅受公钥保护的 SSH 服务，将 shell/exec 流量桥接到 USTC 107 平台 WSS。默认连接方式为：
 
 ```bash
-npm run dev           # Vite :5173 + Electron 同步启动
-npm run build         # 构建前端到 dist/
-npm start             # 生产模式启动 Electron
-npm run dist:linux    # 打包 Linux (AppImage + deb)
-npm run dist:mac      # 打包 macOS (dmg)
-npm run dist:win      # 打包 Windows (NSIS)
+ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/usshtc107_ed25519 -p 3000 user@127.0.0.1
 ```
 
-## 代码规范
+不要在代码、界面或文档中加入 `StrictHostKeyChecking=no`、`UserKnownHostsFile=/dev/null`、TLS 校验关闭或密码认证降级。
 
-- **不要用 emoji 作图标** — 全部使用 `src/components/Icons.jsx` 中的 SVG 组件
-- **所有用户可见字符串必须走 i18n** — `t('key')`，禁止硬编码
-- **表单 label 必须有 htmlFor** — 对应 input/select 的 id
-- **可点击的非 button 元素必须有** `role="button" tabIndex="0" onKeyDown`
-- **useEffect 依赖数组必须完整** — 包含所有引用的外部变量
-- **新的格式化函数放到 `src/lib/format.js`** — 不要在视图文件中重复定义
-- **主进程 event handler 用 `event.preventDefault()` 模式** — Electron 不等待 async handler
-- **IPC 设置 key 必须在 `DEFAULTS` 白名单中**
-- **`state` 对象中不要放不可序列化的值** — 如定时器句柄、函数引用等，会破坏 IPC 传递
+## 模块边界
 
-## 已知注意事项
+```text
+electron/main.js                 Electron 生命周期、窗口、IPC、托盘、状态整合
+electron/proxy-server.js         TCP/SSH/WSS 生命周期、认证、桥接与资源上限
+electron/settings-store.js       设置 schema、公开 DTO、原子 JSON 写入
+electron/credential-store.js     safeStorage、只写密码 API、旧凭据迁移
+electron/ssh-key-service.js      稳定客户端 key 和 OpenSSH proxy host key
+electron/ssh-config-service.js   受管 SSH 配置块、校验、备份和原子写入
+electron/preload.js              contextBridge 白名单
+src/                             React 界面、i18n 和 Electron API wrapper
+tests/                           Node 核心测试与 Vitest/jsdom 交互测试
+```
 
-- `before-quit` 用 `event.preventDefault()` + `stopProxyServer().finally(() => app.exit(0))` 模式
-- Tray 图标通过纯 JS PNG 生成器创建（`createTrayIcon`），依赖 zlib 和自实现 CRC32
-- 前端 `useRoot` 默认值是 boolean `false`，但 `<select>` 发字符串 `'true'/'false'`，主进程 `settings:save` 中归一化
-- `exitApp` 通过 preload 暴露但当前无组件调用（保留以备将来 UI 退出按钮使用）
-- 登录窗口 `sandbox: true`，无 preload
-- 主窗口 `contextIsolation: true`, `nodeIntegration: false`
-- `_statsTimer` 定时器句柄存在模块级变量，不在 `state` 对象中（避免 IPC 序列化失败）
-- CAS 登录页面的 `executeJavaScript` 受 Angular Zone.js 影响，Promise 返回值会被包装为 `{__zone_symbol__state, __zone_symbol__value}`，不能直接读取
-- Angular `nz-input` 的 `DefaultValueAccessor` 不响应直接的 `.value` 赋值，需用 `HTMLInputElement.prototype.value` 原生 setter + `input`/`change` 事件
+新增逻辑应放在其所有权模块，避免继续扩大 `main.js`。结构化设置、密钥和 SSH 配置必须走现有 service，不要复制解析或持久化代码。
+
+## 安全不变量
+
+- 主窗口保持 `contextIsolation: true`、`nodeIntegration: false`、`sandbox: true`。
+- 所有 IPC handler 必须经过 `assertTrustedIpc`，只接受主窗口 main frame 和本地应用 URL。
+- 主窗口禁止未知导航、弹窗和 webview；外部 URL 只能通过主进程验证后的 HTTPS IPC 打开。
+- 登录窗口使用 `persist:usshtc107-auth` 专用分区，只允许 `107.ustc.edu.cn` 与 `id.ustc.edu.cn`，并拒绝权限请求。
+- WSS `rejectUnauthorized` 始终为 `true`；自定义 CA 只能追加信任，不能关闭验证。
+- 只有 WSS 握手 HTTP `401/403` 能使 Cookie 失效。WebSocket close code `1008/1011` 和网络错误不能推断认证失效。
+- SSH 只接受生成的 Ed25519 客户端公钥，并验证签名。认证配置解析失败时必须 fail closed。
+- 不记录 Cookie 值、密码、命令、远端输出或响应正文。所有进入日志 UI/文件的信息仍需经过 `redactLogMessage`。
+- 密码绝不返回 renderer。空密码表示保留已保存密码，清除必须使用显式 API。
+- 不允许明文或自制加密回退。MD5/XOR 代码仅为旧数据迁移，迁移后必须删除旧值。
+
+## 凭据与设置
+
+- `DEFAULTS` 同时包含公开设置和内部存储字段；renderer 只能收到 `publicSettings()` 的白名单 DTO。
+- `normalizePublicSettings()` 拒绝未知键、换行、控制字符、非法 host、越界端口和终端尺寸。
+- `CredentialStore` 在 Linux 上把 `basic_text`/`unknown` backend 视为不可用。此时 Cookie 仅驻留内存，密码保存失败并由 UI 提示。
+- `SettingsStore` 使用 0600 临时文件、fsync 和 rename；损坏 JSON 会备份后恢复默认值。
+- 修改公开设置时保留内部字段，不能用 renderer payload 覆盖整个持久化对象。
+
+## SSH 密钥与配置
+
+- 客户端私钥位于 `~/.ssh/usshtc107_ed25519`，公钥原始 32 字节用于本地代理授权。
+- proxy host key 位于 Electron userData，必须是 `ssh2` 可解析的 OpenSSH Ed25519 私钥并跨重启稳定。
+- 旧版 PKCS#8 proxy host key 只在确认为 Ed25519 时迁移；其他损坏或异类 key 必须拒绝。
+- SSH Config 值使用严格 token/host/integer 校验，路径需正确引用，禁止 `ProxyCommand` 或换行注入。
+- 只管理 `# BEGIN usshtc107 managed` 到 `# END usshtc107 managed`，保留其他用户配置，写前备份 `config.usshtc107.bak`。
+- 生成配置使用 `IdentitiesOnly yes` 和 `StrictHostKeyChecking accept-new`。
+
+## 代理生命周期
+
+- `ProxyServer.start()`/`stop()` 通过串行 lifecycle promise 协调；必须支持 start 中 stop、stop 中 restart 和幂等调用。
+- 原始 TCP socket 在 SSH 握手完成前受握手超时约束，之后使用 idle timeout；所有 socket/channel/timer 必须在 stop 时释放。
+- 连接、会话、WSS payload、pending input、exec output 和 `bufferedAmount` 都有常量上限。
+- TCP 到 WSS 与 WSS 到 SSH 两个方向都需背压。不得通过无界数组或字符串累积绕过限制。
+- 一个会话断开只能关闭自己的 channel/WSS，不能结束共享 SSH client 上的其他 channel。
+- exec 通过交互式 shell 和唯一 DONE marker 模拟；命令本身不进入日志。超时返回 124，输出超限返回 125，断连返回 255，未知失败不能返回 0。
+
+## 登录与状态
+
+1. 创建隔离登录窗口并加载平台 HTTPS URL。
+2. 平台页可自动点击认证按钮；只有安全存储中有密码时才在 CAS 页自动填充。
+3. CAS 完成后进入平台 shell 页面，读取专用 session 的平台 Cookie。
+4. 先保存/缓存 Cookie 并关闭登录窗口，再启动代理。
+5. Cookie 删除时清理加密持久化并停止现有代理会话。
+
+`state` 只能包含可结构化克隆的数据。timer、socket、BrowserWindow、ProxyServer 等句柄保留在模块变量或类实例中。
+
+## 前端约定
+
+- 所有用户可见文案必须走 `t()`，新增 key 同时补 `en.js` 和 `zh.js`。
+- 图标使用 `src/components/Icons.jsx`；不要用 emoji 代替工具图标。
+- 表单 label 关联 `htmlFor/id`，按钮有明确 type，异步动作提供 pending/error/retry 状态。
+- destructive action 需要确认，设置脏数据离开前需要提醒。
+- 订阅 Electron event 的 effect 必须返回 unsubscribe，定时器也必须清理。
+- renderer 日志最多保留 500 条，动态内容不能造成布局跳动或文本覆盖。
+- 密码输入始终为空；已有密码只显示布尔状态，不得写回 DOM 或组件 state。
+
+## 验证与发布
+
+```bash
+npm run check:electron
+npm test
+npm run test:coverage
+npm run build
+npm run package:smoke
+npm audit
+```
+
+CI 使用 Node 22 LTS（最低 22.12）和 npm 11.18.0，执行语法检查、覆盖率、生产依赖审计和 Linux 打包冒烟。依赖安装脚本通过 `allowScripts` 明确批准或拒绝，并在 CI/发布中启用严格模式；修改相关版本时同步审核该列表。
+
+electron-builder 的 `npmRebuild` 保持关闭，避免打包阶段绕过 `allowScripts` 重编译被拒绝的可选原生依赖。若新增必需的 Electron 原生运行时依赖，必须同时重新评估此设置、脚本白名单和各平台产物测试。
+
+macOS 和 Windows 在 electron-builder 中启用 `forceCodeSigning`；发布工作流还验证签名、公证、tag/version 一致性，生成产物 checksum 和 provenance attestation，并为实际生产依赖生成 CycloneDX SBOM。不得为了让 CI 通过而关闭签名或公证。
+
+## 代码修改检查表
+
+- 是否新增了秘密、远端内容或用户输入日志？
+- 是否扩大了 renderer、登录窗口、IPC 或 shell 的权限边界？
+- 是否为并发 start/stop、失败和资源上限添加了测试？
+- 是否保持设置与 SSH config 的原子写入及用户数据备份？
+- 是否在中英文、键盘操作、加载/空/错误状态中行为一致？
+- 是否运行了与改动风险相匹配的测试、构建和打包验证？

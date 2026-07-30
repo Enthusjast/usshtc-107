@@ -1,161 +1,146 @@
 # usshtc107
 
-USTC 算力平台 SSH 代理客户端 — 将本地 SSH 工具通过 WebSocket 桥接到中国科学技术大学 107 算力平台。
+USTC 算力平台 SSH 代理客户端，将本地 SSH 工具通过加密 WebSocket 桥接到中国科学技术大学 107 算力平台。
 
 ```bash
-ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 3000 user@127.0.0.1
+ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/usshtc107_ed25519 -p 3000 user@127.0.0.1
 ```
 
 ## 功能
 
-- **SSO 自动登录** — 内嵌浏览器自动完成学校统一认证（自动点击 SSO 按钮 → 自动填充账号密码 → 自动跳转提取 Cookie）
-- **TCP ↔ WebSocket 桥接** — 本地 SSH 服务器（ssh2）将标准 SSH 流量实时转发到平台 WSS
-- **Exec 命令支持** — 通过交互式 shell 模拟 exec 通道，支持 `ssh host 'command'` 远程执行
-- **实时仪表盘** — 连接数、Cookie 状态、流量统计（上行/下行字节数、运行时长）每秒刷新
-- **会话管理** — 查看所有活跃 SSH 会话，支持逐会话强制断开
-- **系统托盘** — 关闭窗口时最小化到托盘，代理持续在后台运行
-- **自启动连接** — 启动时自动检测有效 Cookie 并启动代理（可配置）
-- **SSH Config 生成** — 一键写入 `~/.ssh/config`，随后只需 `ssh ustc107`
-- **中英文切换** — 完整 i18n 覆盖，支持中/英一键切换
-- **暗色/亮色主题** — OLED 暗色主题默认，可切换亮色
-- **设置持久化** — 端口、集群、终端行列数等配置重启不丢失
+- **SSO 登录**：在隔离的登录窗口中完成学校统一认证，可选安全凭据自动填充。
+- **TCP 到 WSS 桥接**：本地 SSH 服务通过验证 TLS 证书的 WSS 连接访问平台。
+- **SSH 公钥认证**：首次启动生成独立客户端密钥，代理拒绝密码和未知公钥。
+- **Exec 命令支持**：支持 `ssh host 'command'`，并对超时与输出大小设限。
+- **实时仪表盘**：显示代理、Cookie、流量、运行时间和连接数量。
+- **会话与日志管理**：可查看和断开单个会话；内存日志限制为最近 500 条。
+- **系统托盘与自动连接**：关闭主窗口后代理可继续运行，并可在启动时恢复连接。
+- **SSH Config 管理**：原子更新受管配置块，生成前备份现有配置。
+- **中英文与明暗主题**：界面、托盘菜单和状态提示支持中英文。
 
-## 架构
+## 安装与开发
 
-```
-┌───────────────── Electron ─────────────────┐
-│  ┌── Main Process ──────────────────────┐  │
-│  │  main.js      窗口管理 · Cookie 监听 · IPC · 托盘   │
-│  │  proxy-server.js  TCP(ssh2) ↔ WSS(ws) 桥接        │
-│  │  preload.js    contextBridge 安全 IPC 暴露  │
-│  │  constants.js  共享配置常量              │
-│  └───────────────────────────────────────┘  │
-│  ┌── Renderer (React + Vite) ───────────┐  │
-│  │  Dashboard  ·  Sessions  ·  Logs  ·  Settings │
-│  │  TailwindCSS v4 · Inter 字体 · SVG 图标  │
-│  └───────────────────────────────────────┘  │
-└────────────────────────────────────────────┘
-```
-
-## 技术栈
-
-| 层 | 技术 |
-|---|------|
-| 框架 | Electron 35 |
-| 前端 | React 19 + Vite 6 + TailwindCSS 4 |
-| SSH 服务端 | ssh2 |
-| WebSocket 客户端 | ws |
-| 构建 | electron-builder |
-| 日志 | electron-log |
-
-## 开发
+要求 Node.js 22.12 或更高版本、npm 11.18.0 或更高版本。
 
 ```bash
-# 安装依赖
-npm install
-
-# 开发模式（Vite HMR + Electron 热重载）
+npm ci
 npm run dev
-
-# 仅构建前端
-npm run build
-
-# 启动 Electron（需先 build）
-npm start
 ```
 
-## 打包
+常用检查：
 
 ```bash
-npm run dist:linux   # AppImage + deb
-npm run dist:mac     # dmg
-npm run dist:win     # NSIS installer
+npm test                 # Node 核心测试 + React 交互测试
+npm run test:coverage    # 带覆盖率门槛
+npm run check            # 语法、测试和生产构建
+npm run package:smoke    # Linux unpacked 打包冒烟
 ```
-
-构建产物在 `release/` 目录。
 
 ## 使用
 
 ### 首次登录
 
-1. 启动应用 → 前往 **Settings → SSO 自动登录**，输入学号和密码并保存
-2. 点击 **Login** 打开 SSO 认证窗口
-3. 在弹出的浏览器中完成学校统一认证（CAS）
-4. 导航到 **Web SSH** 页面后，Cookie 自动提取 → 代理服务自动启动
+1. 打开 **Settings -> SSO Auto Login**。
+2. 如果系统安全存储可用，可保存学号和密码用于自动填充；也可以留空并在登录窗口手动输入。
+3. 点击 **Login**，完成统一认证并进入 Web SSH 页面。
+4. 应用取得当前会话 Cookie 后启动本地代理。
 
-### 后续启动（自动登录）
-
-1. 启动应用 → 自动检测已保存的 Cookie → 代理服务自动启动
-2. 如需重新登录：点击 **Login** → 自动点击 SSO 按钮 → 自动填充账号密码 → 自动跳转提取 Cookie
+Linux 上若 Electron 只能使用 `basic_text` 后端，应用会把它视为不安全：不会持久化密码，Cookie 仅在本次运行中保留。配置系统密钥环后可恢复安全持久化。
 
 ### SSH 连接
 
-```bash
-ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 3000 user@127.0.0.1
-```
-
-也可在 Settings → SSH Config 中生成 `~/.ssh/config` 条目，之后直接：
+推荐在 **Settings -> SSH Config** 生成配置，然后使用：
 
 ```bash
-ssh ustc107
+ssh usshtc107
 ```
 
-### 远程命令执行
-
-通过 exec 通道可以在远程服务器执行命令并获取输出：
+也可直接连接：
 
 ```bash
-# 执行单条命令
-ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 3000 user@127.0.0.1 'ls -la'
-
-# 执行多条命令
-ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 3000 user@127.0.0.1 'cd /path && make build'
-
-# 配合 Claude Code 等 AI 工具使用
+ssh -o StrictHostKeyChecking=accept-new \
+  -i ~/.ssh/usshtc107_ed25519 \
+  -p 3000 user@127.0.0.1
 ```
 
-## 配置
+`accept-new` 会在首次连接时记录代理主机密钥，后续密钥变化将触发 SSH 警告。不要删除 `known_hosts` 条目来绕过意外变化；先确认 Electron 用户数据目录中的代理主机密钥是否被重置。
+
+### 远程命令
+
+```bash
+ssh usshtc107 'ls -la'
+ssh usshtc107 'cd /path && make build'
+```
+
+## 配置与数据安全
 
 | 设置 | 默认值 | 说明 |
-|------|--------|------|
-| Host | 127.0.0.1 | 代理监听地址 |
-| Port | 3000 | 代理监听端口 |
-| Cluster | training | 算力平台集群 |
-| Login Node | 11.11.10.202 | 登录节点 IP |
-| Cols / Rows | 80 / 24 | 终端行列数 |
-| Auto-connect | 开启 | 启动时自动连接 |
-| Start minimized | 关闭 | 启动时最小化到托盘 |
-| SSO Username | — | CAS 登录学号（自动填充） |
-| SSO Password | — | CAS 登录密码（加密存储） |
+|---|---:|---|
+| Host | `127.0.0.1` | 本地代理监听地址 |
+| Port | `3000` | 本地代理监听端口 |
+| Cluster | `training` | 平台集群 |
+| Login Node | `11.11.10.202` | 登录节点 |
+| Cols / Rows | `80 / 24` | 远程终端尺寸 |
+| Auto-connect | 开启 | 启动时尝试恢复代理 |
+| Start minimized | 关闭 | 启动后只显示托盘图标 |
+| SSH Alias | `usshtc107` | 生成的 SSH Host 别名 |
 
-> **Windows 用户注意**：如果启动代理时遇到 `EACCES: permission denied`，说明端口被 Hyper-V/WSL 预留了。
-> 在 PowerShell（管理员）中运行 `netsh interface ipv4 show excludedportrange protocol=tcp` 查看预留范围，
-> 然后在 Settings 中改用一个不在预留范围内的端口（如 4000、6000）。
+- 设置文件使用私有权限和原子替换写入。
+- SSO 密码和 Cookie 只通过 Electron `safeStorage` 加密持久化，不存在明文或 XOR 降级。
+- 旧版明文 Cookie 和 XOR 密码只用于一次性迁移；无法安全迁移时会被删除。
+- 密码不会返回渲染进程，日志也不会记录 Cookie 值、命令或远端输出。
+- 登录窗口使用专用持久分区，只允许平台和 USTC CAS 的 HTTPS 导航，并拒绝权限请求。
+- WSS 始终验证服务端证书；代理对连接数、会话数、缓冲区、负载和超时设置上限。
+- `~/.ssh/config` 只替换 `# BEGIN/END usshtc107 managed` 区块，写入前备份到 `~/.ssh/config.usshtc107.bak`。
 
-## 目录结构
+Windows 若端口被 Hyper-V/WSL 预留，可在管理员 PowerShell 中运行：
 
+```powershell
+netsh interface ipv4 show excludedportrange protocol=tcp
 ```
-usshtc107/
-├── electron/
-│   ├── main.js            # Electron 主进程
-│   ├── proxy-server.js    # TCP ↔ WSS 代理核心
-│   ├── preload.js         # contextBridge 安全桥接
-│   └── constants.js       # 共享常量与默认配置
-├── src/
-│   ├── App.jsx            # 根组件 + 路由
-│   ├── main.jsx           # React 入口
-│   ├── index.css          # 全局样式 + 主题变量
-│   ├── components/        # ErrorBoundary, Icons, Sidebar, Toast
-│   ├── contexts/          # ThemeContext
-│   ├── i18n/              # LocaleContext + en/zh 翻译字典
-│   ├── lib/               # electron API 封装 + format 工具
-│   └── views/             # Dashboard, Sessions, Logs, Settings
-├── build/                 # 应用图标
-├── index.html             # Vite HTML 入口
-├── vite.config.js
-├── electron-builder.yml   # 打包配置
-└── package.json
+
+然后在 Settings 中选择未被预留的端口。
+
+## 打包与发布
+
+```bash
+npm run dist:linux
+npm run dist:mac
+npm run dist:win
 ```
+
+Linux 可直接本地打包。项目使用 npm 11.18.0 的依赖安装脚本白名单；发布和 CI 会固定该版本并在严格模式下安装。macOS 和 Windows 配置了强制代码签名，缺少证书时会失败，以避免发布未签名安装包。
+
+GitHub Actions 发布需要以下仓库 Secrets：
+
+| 平台 | Secrets |
+|---|---|
+| macOS | `MAC_CSC_LINK`, `MAC_CSC_KEY_PASSWORD`, `APPLE_API_KEY_BASE64`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER` |
+| Windows | `WIN_CSC_LINK`, `WIN_CSC_KEY_PASSWORD` |
+
+`MAC_CSC_LINK` 和 `WIN_CSC_LINK` 可使用 electron-builder 支持的 base64 证书值。`APPLE_API_KEY_BASE64` 是 App Store Connect `.p8` 私钥的 base64 内容。用于签名或发布的标签必须严格等于 `v<package.json version>`，例如当前版本使用 `v1.2.1`，且标签提交必须属于默认分支历史。应在仓库设置中保护 `v*` 标签。
+
+发布流水线会验证签名和 macOS 公证，生成产物 SHA-256 校验文件和 GitHub 构建来源证明，并为实际生产依赖生成 CycloneDX SBOM。普通手动构建可以选择单个平台；Linux 可从功能分支构建，使用证书的 macOS/Windows 构建只能从默认分支或匹配版本的标签发起。创建 GitHub Release 时必须构建全部平台。
+
+## 架构
+
+```text
+electron/
+  main.js                 窗口、登录、IPC、托盘与生命周期
+  proxy-server.js         SSH 到 WSS 桥接、会话和资源限制
+  credential-store.js     safeStorage 凭据与旧数据迁移
+  settings-store.js       设置校验和原子持久化
+  ssh-key-service.js      客户端与代理主机密钥
+  ssh-config-service.js   受管 SSH Config 写入与备份
+  preload.js              最小化 IPC API
+src/
+  components/             通用界面组件
+  views/                  Dashboard、Sessions、Logs、Settings
+  i18n/                   中英文资源和 Locale Context
+tests/                    核心代理、安全服务和前端交互测试
+```
+
+技术栈为 Electron 43、React 19、Vite 6、Tailwind CSS 4、ssh2、ws 和 electron-builder。
 
 ## License
 
