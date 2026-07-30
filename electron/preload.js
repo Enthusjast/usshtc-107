@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer, shell } = require('electron');
+const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
   isElectron: true,
@@ -16,6 +16,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // ---- SSO Credentials (encrypted) ----
   saveSsoCredentials: (username, password) => ipcRenderer.invoke('sso:save-credentials', username, password),
   getSsoCredentials: () => ipcRenderer.invoke('sso:get-credentials'),
+  clearSsoCredentials: () => ipcRenderer.invoke('sso:clear-credentials'),
 
   // ---- Login ----
   startLogin: () => ipcRenderer.invoke('login:start'),
@@ -44,17 +45,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // ---- Theme ----
   getTheme: () => ipcRenderer.invoke('theme:get'),
   setTheme: (theme) => ipcRenderer.invoke('theme:set', theme),
+  setLocale: (locale) => ipcRenderer.invoke('locale:set', locale),
 
   // ---- External ----
-  openExternal: (url) => {
-    try {
-      const u = new URL(url);
-      if (u.protocol === 'https:' || u.protocol === 'http:') {
-        shell.openExternal(url);
-      }
-    } catch (_) { /* ignore invalid URLs */ }
-  },
+  openExternal: (url) => ipcRenderer.invoke('external:open', url),
   copyToClipboard: (text) => ipcRenderer.invoke('clipboard:write', text),
+  setAppDirty: (dirty) => ipcRenderer.invoke('app:set-dirty', dirty),
   exitApp: () => ipcRenderer.invoke('app:exit'),
 
   // ---- Event subscriptions (each returns an unsubscribe function) ----

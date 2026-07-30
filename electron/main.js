@@ -1,11 +1,27 @@
-const { app, BrowserWindow, session, ipcMain, clipboard, Tray, Menu, nativeImage, Notification, safeStorage } = require('electron');
+const { app, BrowserWindow, session, ipcMain, clipboard, dialog, shell, Tray, Menu, nativeImage, Notification, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const crypto = require('crypto');
 const zlib = require('zlib');
+const { fileURLToPath } = require('url');
 const log = require('electron-log');
 const { ProxyServer } = require('./proxy-server');
+const { CredentialStore, validateCookie } = require('./credential-store');
+const {
+  SettingsStore,
+  normalizePublicSettings,
+  publicSettings,
+} = require('./settings-store');
+const { SshConfigService } = require('./ssh-config-service');
+const { ensureClientKeyPair, ensureProxyHostKey } = require('./ssh-key-service');
+const { redactLogMessage } = require('./log-redaction');
+const { createAuthStateController } = require('./auth-state');
+const { createShutdownCoordinator } = require('./shutdown-coordinator');
+const {
+  isAllowedLoginUrl,
+  loadOwnedWindowUrl,
+  parseHttpsUrl,
+} = require('./login-navigation');
 const {
   DEFAULTS,
   PLATFORM,
@@ -13,126 +29,47 @@ const {
   TERMINAL_PATTERNS,
 } = require('./constants');
 
+const IS_DEV = !app.isPackaged && process.env.ELECTRON_DEV === 'true';
+
 // =========================================================================
 // Ed25519 SSH key pair — generated once, used for proxy authentication
 // =========================================================================
 
 const SSH_KEY_NAME = 'usshtc107_ed25519';
+const SSH_HOST_KEY_NAME = 'proxy_host_ed25519';
+const startupWarnings = [];
+const settingsPath = path.join(app.getPath('userData'), 'settings.json');
+const settingsStore = new SettingsStore({
+  filePath: settingsPath,
+  defaults: DEFAULTS,
+  onWarning: (message) => startupWarnings.push(message),
+});
+const settings = settingsStore.load();
+
+function persistSettings(value) {
+  settingsStore.save(value);
+}
+
+const credentialStore = new CredentialStore({
+  safeStorage,
+  settings,
+  persist: persistSettings,
+  userDataPath: app.getPath('userData'),
+  onWarning: (message) => startupWarnings.push(message),
+});
 
 function ensureSshKeyPair() {
   const sshDir = path.join(os.homedir(), '.ssh');
-  const privPath = path.join(sshDir, SSH_KEY_NAME);
-  const pubPath = privPath + '.pub';
-
-  // Key already exists on disk and public key stored in settings
-  if (fs.existsSync(privPath) && settings.sshPublicKey) {
-    // Migration: if raw bytes missing, extract from public key file
-    if (!settings.sshPublicKeyRaw && fs.existsSync(pubPath)) {
-      try {
-        const pubContent = fs.readFileSync(pubPath, 'utf-8').trim();
-        const parts = pubContent.split(' ');
-        if (parts.length >= 2 && parts[0] === 'ssh-ed25519') {
-          const keyBuf = Buffer.from(parts[1], 'base64');
-          // Extract raw 32 bytes: skip 4 len + "ssh-ed25519" + 4 len = 4+11+4 = 19
-          const rawBytes = keyBuf.subarray(19);
-          settings.sshPublicKeyRaw = rawBytes.toString('base64');
-          persistSettings(settings);
-          addLog('info', 'ssh-key', 'Migrated: extracted raw public key bytes');
-        }
-      } catch (_) {}
-    }
-    return { privPath, pubPath, publicKey: settings.sshPublicKey };
+  const result = ensureClientKeyPair({ sshDirectory: sshDir, keyName: SSH_KEY_NAME });
+  const changed = settings.sshPublicKey !== result.publicKey
+    || settings.sshPublicKeyRaw !== result.publicKeyRaw;
+  if (changed) {
+    settings.sshPublicKey = result.publicKey;
+    settings.sshPublicKeyRaw = result.publicKeyRaw;
+    persistSettings(settings);
   }
-
-  // Generate ed25519 key pair
-  const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519', {
-    publicKeyEncoding: { type: 'spki', format: 'pem' },
-    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
-  });
-
-  // Export public key as DER → extract raw 32 bytes (last 32 of SPKI wrapper)
-  const keyObj = crypto.createPublicKey(publicKey);
-  const spkiDer = keyObj.export({ type: 'spki', format: 'der' });
-  const rawPubBytes = spkiDer.subarray(spkiDer.length - 32);
-
-  // Build OpenSSH format for display: ssh-ed25519 <base64> comment
-  // OpenSSH format: [len("ssh-ed25519")]["ssh-ed25519"][len(raw)][raw]
-  const typeStr = 'ssh-ed25519';
-  const typeBuf = Buffer.from(typeStr);
-  const parts = Buffer.alloc(4 + typeBuf.length + 4 + rawPubBytes.length);
-  parts.writeUInt32BE(typeBuf.length, 0);
-  typeBuf.copy(parts, 4);
-  parts.writeUInt32BE(rawPubBytes.length, 4 + typeBuf.length);
-  rawPubBytes.copy(parts, 8 + typeBuf.length);
-  const openSshPub = `${typeStr} ${parts.toString('base64')} usshtc107`;
-
-  // Ensure ~/.ssh directory exists
-  if (!fs.existsSync(sshDir)) {
-    fs.mkdirSync(sshDir, { mode: 0o700 });
-  }
-
-  // Write private key (owner-only read)
-  fs.writeFileSync(privPath, privateKey, { mode: 0o600 });
-  // Write public key
-  fs.writeFileSync(pubPath, openSshPub + '\n', { mode: 0o644 });
-
-  // Store public key in settings (OpenSSH format for display + raw for auth)
-  settings.sshPublicKey = openSshPub;
-  settings.sshPublicKeyRaw = rawPubBytes.toString('base64');
-  persistSettings(settings);
-
-  addLog('info', 'ssh-key', `Generated ed25519 key pair: ${privPath}`);
-  return { privPath, pubPath, publicKey: openSshPub };
-}
-
-function autoGenerateSshConfig() {
-  const sshDir = path.join(os.homedir(), '.ssh');
-  const configPath = path.join(sshDir, 'config');
-  const privPath = path.join(sshDir, SSH_KEY_NAME);
-  const alias = settings.sshAlias || 'usshtc107';
-  const h = settings.host || '127.0.0.1';
-  const p = settings.port || 3000;
-  const marker = '# usshtc107-auto-generated';
-
-  const block = `${marker}
-Host ${alias}
-  HostName ${h}
-  Port ${p}
-  User user
-  IdentityFile ${privPath}
-  StrictHostKeyChecking no
-  UserKnownHostsFile /dev/null`;
-
-  try {
-    if (!fs.existsSync(sshDir)) {
-      fs.mkdirSync(sshDir, { mode: 0o700 });
-    }
-
-    let existing = '';
-    if (fs.existsSync(configPath)) {
-      existing = fs.readFileSync(configPath, 'utf-8');
-    }
-
-    // Remove old usshtc107 block
-    const escMarker = marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const escAlias = alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const NL = '(\\r?\\n)';
-    const regex = new RegExp(
-      `${NL}*${escMarker}${NL}` +
-      `Host ${escAlias}[\\s\\S]*?` +
-      `(?=${NL}Host |${escMarker}|$)`,
-      'g'
-    );
-    let newConfig = existing.replace(regex, '').trim();
-
-    if (newConfig) newConfig += '\n\n';
-    newConfig += block + '\n';
-
-    fs.writeFileSync(configPath, newConfig, { mode: 0o644 });
-    addLog('info', 'ssh-config', `Auto-generated SSH config for alias '${alias}'`);
-  } catch (err) {
-    addLog('warn', 'ssh-config', `Auto-generate failed: ${err.message}`);
-  }
+  addLog('info', 'ssh-key', `SSH client key ready: ${result.privateKeyPath}`);
+  return result;
 }
 
 // =========================================================================
@@ -223,30 +160,6 @@ function getTrayIcons() {
 }
 
 // =========================================================================
-// Persistent settings
-// =========================================================================
-
-let settingsPath = '';
-
-function loadSettings() {
-  try {
-    settingsPath = path.join(app.getPath('userData'), 'settings.json');
-    if (fs.existsSync(settingsPath)) {
-      const raw = fs.readFileSync(settingsPath, 'utf-8');
-      return { ...DEFAULTS, ...JSON.parse(raw) };
-    }
-  } catch (_) { /* use defaults */ }
-  return { ...DEFAULTS };
-}
-
-function persistSettings(s) {
-  try {
-    if (!settingsPath) settingsPath = path.join(app.getPath('userData'), 'settings.json');
-    fs.writeFileSync(settingsPath, JSON.stringify(s, null, 2));
-  } catch (_) { /* best-effort */ }
-}
-
-// =========================================================================
 // Persistent logging
 // =========================================================================
 
@@ -264,11 +177,44 @@ try {
 let mainWindow = null;
 let loginWindow = null;
 let proxyServer = null;
+let proxyLifecycle = Promise.resolve();
+const proxyStopRequests = new WeakSet();
+const proxySilentStops = new WeakSet();
 let allowAppQuit = false;
 let tray = null;
+let authSession = null;
+let cookieChangeTimer = null;
+let authCookieResetPromise = null;
+let autoConnectTimer = null;
+let cookieStateGeneration = 0;
+let cookieQueryRevision = 0;
+let shutdownCoordinator = null;
+let rendererHasUnsavedChanges = false;
 
-// Settings loaded from disk on startup
-const settings = loadSettings();
+function getAuthSession() {
+  if (!authSession) {
+    authSession = session.fromPartition('persist:usshtc107-auth');
+    authSession.setPermissionCheckHandler(() => false);
+    authSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
+    authSession.on('will-download', (event) => {
+      event.preventDefault();
+      addLog('warn', 'security', 'Blocked download from login session');
+    });
+  }
+  return authSession;
+}
+
+function clearAuthSessionCookies() {
+  if (authCookieResetPromise) return authCookieResetPromise;
+  const operation = Promise.resolve()
+    .then(() => getAuthSession().clearStorageData({ storages: ['cookies'] }));
+  const tracked = operation.finally(() => {
+    if (authCookieResetPromise === tracked) authCookieResetPromise = null;
+  });
+  authCookieResetPromise = tracked;
+  tracked.catch(() => {});
+  return tracked;
+}
 
 const state = {
   loginStatus: 'idle',
@@ -279,6 +225,7 @@ const state = {
   host: settings.host,
   port: settings.port,
   wssUrl: '',
+  error: null,
 };
 
 // Log buffer
@@ -287,17 +234,19 @@ const logs = [];
 let logId = 0;
 
 function addLog(level, source, message) {
+  const safeMessage = redactLogMessage(message);
   const entry = {
     id: ++logId,
     time: new Date().toISOString(),
     level,
     source,
-    message,
+    message: safeMessage,
   };
   logs.push(entry);
   if (logs.length > MAX_LOGS) logs.shift();
   sendToMain('new-log', entry);
-  log[level]?.(`[${source}] ${message}`) ?? log.info(`[${source}] ${message}`);
+  if (typeof log[level] === 'function') log[level](`[${source}] ${safeMessage}`);
+  else log.info(`[${source}] ${safeMessage}`);
 }
 
 // =========================================================================
@@ -307,6 +256,31 @@ function addLog(level, source, message) {
 function isLoginPage(url) {
   const lower = url.toLowerCase();
   return LOGIN_PAGE_PATTERNS.some((p) => lower.includes(p));
+}
+
+function isTrustedMainUrl(url) {
+  try {
+    const parsed = new URL(url);
+    if (IS_DEV) {
+      return parsed.origin === 'http://localhost:5173';
+    }
+    if (parsed.protocol !== 'file:') return false;
+    const expected = path.resolve(path.join(__dirname, '..', 'dist', 'index.html'));
+    return path.resolve(fileURLToPath(parsed)) === expected;
+  } catch (_) {
+    return false;
+  }
+}
+
+function assertTrustedIpc(event) {
+  const senderFrame = event.senderFrame;
+  if (!mainWindow || mainWindow.isDestroyed()
+    || event.sender !== mainWindow.webContents
+    || !senderFrame
+    || senderFrame !== event.sender.mainFrame
+    || !isTrustedMainUrl(senderFrame.url)) {
+    throw new Error('IPC request rejected from an untrusted renderer');
+  }
 }
 
 function isTerminalPage(url) {
@@ -324,6 +298,41 @@ function buildWssUrl() {
     useRoot: settings.useRoot ? 'true' : 'false',
   });
   return `${PLATFORM.wssBase}?${params.toString()}`;
+}
+
+function countCookiePairs(cookieString) {
+  return String(cookieString || '').split(';').filter((part) => part.trim().includes('=')).length;
+}
+
+function isShuttingDown() {
+  return shutdownCoordinator?.isStarted() === true;
+}
+
+function invalidateCookieQueries() {
+  cookieStateGeneration += 1;
+  cookieQueryRevision += 1;
+}
+
+function beginCookieQuery() {
+  return {
+    generation: cookieStateGeneration,
+    revision: ++cookieQueryRevision,
+  };
+}
+
+function isCurrentCookieQuery(query) {
+  return !isShuttingDown()
+    && query.generation === cookieStateGeneration
+    && query.revision === cookieQueryRevision;
+}
+
+function isCurrentCookieGeneration(generation) {
+  return !isShuttingDown() && generation === cookieStateGeneration;
+}
+
+function buildCookieHeader(cookies) {
+  const cookie = cookies.map((item) => `${item.name}=${item.value}`).join('; ');
+  return validateCookie(cookie);
 }
 
 function sendToMain(channel, data) {
@@ -348,14 +357,36 @@ function updateTrayIcon() {
   tray.setImage(icon);
 }
 
+function mainText(key, ...args) {
+  const dictionary = settings.locale === 'zh' ? {
+    startProxy: '启动代理',
+    stopProxy: '停止代理',
+    connections: (count) => `连接数: ${count}`,
+    showWindow: '显示窗口',
+    quit: '退出',
+    sshConnection: 'SSH 连接',
+    newSession: (address) => `来自 ${address} 的新会话`,
+  } : {
+    startProxy: 'Start Proxy',
+    stopProxy: 'Stop Proxy',
+    connections: (count) => `Connections: ${count}`,
+    showWindow: 'Show Window',
+    quit: 'Quit',
+    sshConnection: 'SSH Connection',
+    newSession: (address) => `New session from ${address}`,
+  };
+  const value = dictionary[key];
+  return typeof value === 'function' ? value(...args) : value;
+}
+
 function buildTrayMenu() {
   const proxyRunning = state.proxyStatus === 'started';
   const proxyStopped = state.proxyStatus === 'stopped';
 
   return Menu.buildFromTemplate([
     {
-      label: proxyRunning ? '⏹ Stop Proxy' : '▶ Start Proxy',
-      enabled: proxyRunning || (proxyStopped && state.loginStatus === 'success'),
+      label: proxyRunning ? mainText('stopProxy') : mainText('startProxy'),
+      enabled: proxyRunning || (proxyStopped && state.loginStatus === 'success' && state.cookieValid),
       click: () => {
         if (proxyRunning) stopProxyServer();
         else startProxyServer();
@@ -363,12 +394,12 @@ function buildTrayMenu() {
     },
     { type: 'separator' },
     {
-      label: `Connections: ${state.connectionCount}`,
+      label: mainText('connections', state.connectionCount),
       enabled: false,
     },
     { type: 'separator' },
     {
-      label: 'Show Window',
+      label: mainText('showWindow'),
       click: () => {
         if (mainWindow) {
           mainWindow.show();
@@ -378,11 +409,9 @@ function buildTrayMenu() {
     },
     { type: 'separator' },
     {
-      label: 'Quit',
-      click: async () => {
-        allowAppQuit = true;
-        await stopProxyServer();
-        app.quit();
+      label: mainText('quit'),
+      click: () => {
+        void requestShutdown(0);
       },
     },
   ]);
@@ -430,10 +459,14 @@ function createMainWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      spellcheck: false,
     },
   });
 
-  if (process.env.ELECTRON_DEV) {
+  if (IS_DEV) {
     mainWindow.loadURL('http://localhost:5173');
   } else {
     mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
@@ -457,6 +490,20 @@ function createMainWindow() {
   });
 
   mainWindow.on('page-title-updated', (e) => e.preventDefault());
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (!isTrustedMainUrl(url)) {
+      event.preventDefault();
+      addLog('warn', 'security', 'Blocked unexpected main-window navigation');
+    }
+  });
+  mainWindow.webContents.on('will-redirect', (event, url) => {
+    if (!isTrustedMainUrl(url)) {
+      event.preventDefault();
+      addLog('warn', 'security', 'Blocked unexpected main-window redirect');
+    }
+  });
+  mainWindow.webContents.on('will-attach-webview', (event) => event.preventDefault());
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 }
 
 // =========================================================================
@@ -464,12 +511,13 @@ function createMainWindow() {
 // =========================================================================
 
 async function createLoginWindow() {
+  if (isShuttingDown()) return shutdownStartResult();
   if (loginWindow && !loginWindow.isDestroyed()) {
     loginWindow.focus();
-    return;
+    return { ok: true, alreadyOpen: true };
   }
 
-  loginWindow = new BrowserWindow({
+  const authWindow = new BrowserWindow({
     width: 1180,
     height: 800,
     minWidth: 980,
@@ -482,13 +530,26 @@ async function createLoginWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      partition: 'persist:usshtc107-auth',
     },
   });
-
-  loginWindow.loadURL(PLATFORM.url);
+  loginWindow = authWindow;
+  const authWebContents = authWindow.webContents;
+  const isCurrentWindow = () => !isShuttingDown()
+    && loginWindow === authWindow
+    && !authWindow.isDestroyed();
+  const loadLoginUrl = (url, description) => loadOwnedWindowUrl({
+    window: authWindow,
+    url,
+    isCurrent: isCurrentWindow,
+    onError: (error) => addLog('error', 'login', `${description} failed to load: ${error.message}`),
+  });
 
   function autoClickAuthButton() {
-    loginWindow.webContents.executeJavaScript(`
+    if (!isCurrentWindow()) return;
+    authWebContents.executeJavaScript(`
       new Promise((resolve) => {
         function tryClick() {
           const btn = document.getElementById('authButton');
@@ -503,29 +564,33 @@ async function createLoginWindow() {
         tryClick();
       })
     `).then((found) => {
-      if (found) addLog('info', 'login', 'auto-clicked authButton');
+      if (found && isCurrentWindow()) addLog('info', 'login', 'auto-clicked authButton');
     }).catch(() => {});
   }
 
   // Auto-click SSO button on 107 platform + auto-fill on CAS page
-  loginWindow.webContents.on('did-finish-load', () => {
-    const url = loginWindow.webContents.getURL();
+  authWebContents.on('did-finish-load', () => {
+    if (!isCurrentWindow()) return;
+    const url = authWebContents.getURL();
     // On 107 platform: auto-click SSO button or redirect to shell page
     const hostname = (() => { try { return new URL(url).hostname; } catch (_) { return ''; } })();
-    if (hostname === PLATFORM.domain || hostname.endsWith('.' + PLATFORM.domain)) {
+    if (hostname === PLATFORM.domain) {
       const shellUrl = 'https://107.ustc.edu.cn/shell/' + settings.cluster + '/' + settings.loginNode;
       // After login, user lands on home/dashboard → auto-redirect to shell page
       if (url !== shellUrl && !url.includes('/auth') && !url.includes('scowAuth')) {
         // Check if we just came from CAS redirect (has SCOW_USER cookie = logged in)
-        session.defaultSession.cookies.get({ domain: PLATFORM.domain }).then((cookies) => {
+        getAuthSession().cookies.get({ domain: PLATFORM.domain }).then((cookies) => {
+          if (!isCurrentWindow()) return;
           const hasUserCookie = cookies.some((c) => c.name === 'SCOW_USER');
           if (hasUserCookie) {
             addLog('info', 'login', 'logged in, redirecting to shell: ' + shellUrl);
-            loginWindow.loadURL(shellUrl);
+            loadLoginUrl(shellUrl, 'Shell page');
           } else {
             // Not logged in — show login page, auto-click auth button
             autoClickAuthButton();
           }
+        }).catch((error) => {
+          if (isCurrentWindow()) addLog('error', 'login', `Cookie check failed: ${error.message}`);
         });
         return;
       }
@@ -534,23 +599,11 @@ async function createLoginWindow() {
     }
     // On id.ustc.edu.cn: auto-fill credentials and submit
     if (hostname === 'id.ustc.edu.cn') {
-      let password = '';
-      try {
-        if (settings.ssoPassword && settings.ssoPassword.startsWith('xor:')) {
-          const crypto = require('crypto');
-          const key = crypto.createHash('md5').update(app.getPath('userData')).digest();
-          const buf = Buffer.from(settings.ssoPassword.slice(4), 'base64');
-          for (let i = 0; i < buf.length; i++) buf[i] ^= key[i % key.length];
-          password = buf.toString('utf-8');
-        } else if (settings.ssoPassword) {
-          const buf = Buffer.from(settings.ssoPassword, 'base64');
-          password = safeStorage.decryptString(buf);
-        }
-      } catch (_) {}
+      const password = credentialStore.getSsoPassword();
       if (!password) return;
 
       const username = settings.ssoUsername;
-      loginWindow.webContents.executeJavaScript(`
+      authWebContents.executeJavaScript(`
         (function() {
           var nativeSetter = Object.getOwnPropertyDescriptor(
             window.HTMLInputElement.prototype, 'value'
@@ -586,27 +639,19 @@ async function createLoginWindow() {
     }
   });
 
-  loginWindow.webContents.setWindowOpenHandler(({ url }) => {
-    try {
-      const parsed = new URL(url);
-      const host = parsed.hostname;
-      // Allow 107 platform and USTC SSO domains
-      const allowed = host === PLATFORM.domain
-        || host.endsWith('.' + PLATFORM.domain)
-        || host === 'id.ustc.edu.cn'
-        || host.endsWith('.ustc.edu.cn');
-      console.log(`[login] host=${host} allowed=${allowed}`);
-      if (allowed) {
-        loginWindow.loadURL(url);
-      }
-    } catch (_) { /* ignore unparseable URLs */ }
+  authWebContents.setWindowOpenHandler(({ url }) => {
+    if (isAllowedLoginUrl(url) && isCurrentWindow()) {
+      loadLoginUrl(url, 'Login popup navigation');
+    }
+    else addLog('warn', 'security', 'Blocked unexpected login popup');
     return { action: 'deny' };
   });
 
   // Two-phase login detection
   const checkUrl = async (url) => {
-    if (state.loginStatus === 'success') return;
-    if (!url.includes(PLATFORM.domain)) return;
+    if (!isCurrentWindow() || state.loginStatus === 'success') return;
+    const parsed = parseHttpsUrl(url);
+    if (!parsed || parsed.origin !== PLATFORM.origin) return;
     if (isLoginPage(url)) {
       if (state.loginStatus === 'sso_done') {
         state.loginStatus = 'pending';
@@ -615,11 +660,15 @@ async function createLoginWindow() {
       return;
     }
 
-    const cookies = await session.defaultSession.cookies.get({ domain: PLATFORM.domain });
+    const cookies = await getAuthSession().cookies.get({ domain: PLATFORM.domain });
+    if (!isCurrentWindow()) return;
+    const currentUrl = authWebContents.getURL();
+    const currentParsed = parseHttpsUrl(currentUrl);
+    if (!currentParsed || currentParsed.origin !== PLATFORM.origin) return;
     if (cookies.length === 0) return;
 
-    if (isTerminalPage(url)) {
-      onLoginFinalized(cookies);
+    if (isTerminalPage(currentUrl)) {
+      onLoginFinalized(cookies, authWindow);
       return;
     }
 
@@ -629,82 +678,128 @@ async function createLoginWindow() {
       sendToMain('login-status', 'sso_done');
       sendToMain('login-progress', {
         status: 'sso_done',
-        message: 'SSO login complete. Please navigate to Web SSH page.',
       });
     }
   };
 
-  loginWindow.webContents.on('did-navigate', (_e, url) => checkUrl(url));
-  loginWindow.webContents.on('will-navigate', (_e, url) => checkUrl(url));
-  loginWindow.webContents.on('did-navigate-in-page', (_e, url) => checkUrl(url));
+  const guardNavigation = (event, url) => {
+    if (!isAllowedLoginUrl(url)) {
+      event.preventDefault();
+      addLog('warn', 'security', 'Blocked unexpected login navigation');
+    }
+  };
+  authWebContents.on('will-navigate', guardNavigation);
+  authWebContents.on('will-redirect', guardNavigation);
+  authWebContents.on('did-navigate-in-page', (_event, url) => {
+    checkUrl(url).catch((error) => {
+      if (isCurrentWindow()) addLog('error', 'login', `Login state check failed: ${error.message}`);
+    });
+  });
 
   let pollTimer = null;
-  loginWindow.webContents.on('did-navigate', () => {
+  authWebContents.on('did-navigate', (_event, url) => {
+    checkUrl(url).catch((error) => {
+      if (isCurrentWindow()) addLog('error', 'login', `Login state check failed: ${error.message}`);
+    });
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = setInterval(async () => {
-      if (!loginWindow || loginWindow.isDestroyed() || state.loginStatus === 'success') {
+      if (!isCurrentWindow() || state.loginStatus === 'success') {
         clearInterval(pollTimer);
+        pollTimer = null;
         return;
       }
       try {
-        const url = loginWindow.webContents.getURL();
-        if (!url.includes(PLATFORM.domain) || isLoginPage(url)) return;
-        const cookies = await session.defaultSession.cookies.get({ domain: PLATFORM.domain });
-        if (cookies.length > 0 && isTerminalPage(url)) {
-          onLoginFinalized(cookies);
+        const currentUrl = authWebContents.getURL();
+        const parsed = parseHttpsUrl(currentUrl);
+        if (!parsed || parsed.origin !== PLATFORM.origin || isLoginPage(currentUrl)) return;
+        const cookies = await getAuthSession().cookies.get({ domain: PLATFORM.domain });
+        if (isCurrentWindow() && cookies.length > 0 && isTerminalPage(authWebContents.getURL())) {
+          onLoginFinalized(cookies, authWindow);
           clearInterval(pollTimer);
+          pollTimer = null;
         }
       } catch (_) {}
     }, 2000);
   });
 
-  loginWindow.on('closed', () => {
+  authWindow.on('closed', () => {
     if (pollTimer) clearInterval(pollTimer);
-    loginWindow = null;
-    if (state.loginStatus !== 'success') {
+    const wasCurrentWindow = loginWindow === authWindow;
+    if (wasCurrentWindow) loginWindow = null;
+    if (wasCurrentWindow && !isShuttingDown()
+        && state.loginStatus !== 'success' && state.loginStatus !== 'failure') {
       state.loginStatus = 'idle';
       sendToMain('login-status', 'idle');
     }
   });
 
-  sendToMain('login-progress', { status: 'navigating', message: 'Opening login page...' });
+  sendToMain('login-progress', { status: 'navigating' });
+  loadOwnedWindowUrl({
+    window: authWindow,
+    url: PLATFORM.url,
+    isCurrent: isCurrentWindow,
+    onError: (error) => {
+      addLog('error', 'login', `Login page failed to load: ${error.message}`);
+      state.loginStatus = 'failure';
+      sendToMain('login-status', 'failure');
+      if (!authWindow.isDestroyed()) authWindow.destroy();
+    },
+  });
+  return { ok: true };
 }
-
-let loggedIn = false;
 
 // Store cookies captured during login so they survive window close
 let capturedCookieString = '';
+const authStateController = createAuthStateController({
+  state,
+  invalidateQueries: invalidateCookieQueries,
+  setCapturedCookie: (value) => { capturedCookieString = value; },
+  clearStoredCookie: () => credentialStore.clearCookie(),
+  publish: sendToMain,
+  onStateChanged: updateTrayMenu,
+  onClearError: (error) => addLog('error', 'cookie', `Cookie removal failed: ${error.message}`),
+});
 
-// Restore captured cookie from settings (persists across app restarts)
-if (settings.savedCookie) {
-  capturedCookieString = settings.savedCookie;
-}
+async function onLoginFinalized(cookies, sourceWindow) {
+  if (isShuttingDown()
+    || state.loginStatus === 'success'
+    || !sourceWindow
+    || sourceWindow.isDestroyed()
+    || loginWindow !== sourceWindow) return;
 
-async function onLoginFinalized(cookies) {
-  if (state.loginStatus === 'success') return;
+  let nextCookie;
+  try {
+    nextCookie = buildCookieHeader(cookies);
+  } catch (error) {
+    authStateController.invalidate('failure');
+    addLog('error', 'auth', `Cookie capture rejected: ${error.message}`);
+    return;
+  }
 
-  loggedIn = true;
+  invalidateCookieQueries();
   state.loginStatus = 'success';
   state.cookieValid = true;
   state.cookieCount = cookies.length;
   state.wssUrl = buildWssUrl();
 
   // Build cookie string BEFORE closing login window (session cookies get deleted on close)
-  capturedCookieString = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
+  capturedCookieString = nextCookie;
 
-  // Persist cookie to settings so it survives app restart
-  settings.savedCookie = capturedCookieString;
-  persistSettings(settings);
+  try {
+    const persisted = credentialStore.saveCookie(capturedCookieString);
+    if (!persisted) addLog('warn', 'auth', 'Cookie is available for this run only because OS encryption is unavailable');
+  } catch (error) {
+    addLog('error', 'auth', `Cookie persistence failed: ${error.message}`);
+  }
 
   addLog('info', 'auth', `Web SSH page reached — ${cookies.length} cookies read`);
-  addLog('info', 'auth', `Cookie names: ${cookies.map(c => c.name).join(', ')}`);
   sendToMain('login-status', 'success');
   sendToMain('cookie-status', { cookieValid: true, cookieCount: cookies.length });
-  sendToMain('login-progress', { status: 'done', message: 'Cookies captured — starting proxy' });
+  sendToMain('login-progress', { status: 'done' });
 
   // Close login window first so user isn't blocked if proxy start takes time
-  if (loginWindow && !loginWindow.isDestroyed()) {
-    loginWindow.close();
+  if (loginWindow === sourceWindow && !sourceWindow.isDestroyed()) {
+    sourceWindow.close();
   }
 
   await startProxyServer(capturedCookieString);
@@ -715,29 +810,52 @@ async function onLoginFinalized(cookies) {
 // =========================================================================
 
 function setupCookieMonitoring() {
-  session.defaultSession.cookies.on('changed', (_event, cookie, cause) => {
-    if (!cookie.domain?.includes(PLATFORM.domain)) return;
-    addLog('debug', 'cookie', `Changed: ${cookie.name} (${cause})`);
-    updateCookieState();
+  getAuthSession().cookies.on('changed', (_event, cookie, cause) => {
+    if (isShuttingDown() || cookie.domain?.replace(/^\./, '') !== PLATFORM.domain) return;
+    addLog('debug', 'cookie', `Session cookie state changed (${cause})`);
+    if (cookieChangeTimer) clearTimeout(cookieChangeTimer);
+    cookieChangeTimer = setTimeout(() => {
+      cookieChangeTimer = null;
+      if (!isShuttingDown()) void updateCookieState();
+    }, 250);
   });
 }
 
 async function updateCookieState() {
+  if (isShuttingDown()) return;
+  const query = beginCookieQuery();
   try {
-    const cookies = await session.defaultSession.cookies.get({ domain: PLATFORM.domain });
-    const cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
+    const cookies = await getAuthSession().cookies.get({ domain: PLATFORM.domain });
+    if (!isCurrentCookieQuery(query)) return;
+    let cookieStr;
+    try {
+      cookieStr = buildCookieHeader(cookies);
+    } catch (error) {
+      if (!isCurrentCookieQuery(query)) return;
+      authStateController.invalidate('failure');
+      addLog('error', 'cookie', `Cookie update rejected: ${error.message}`);
+      await stopProxyServer();
+      return;
+    }
+    if (!isCurrentCookieQuery(query)) return;
     if (cookies.length > 0) {
       state.cookieValid = true;
       state.cookieCount = cookies.length;
       capturedCookieString = cookieStr; // keep captured cookies in sync
-      if (proxyServer) proxyServer.updateCookie(cookieStr);
+      try {
+        const persisted = credentialStore.saveCookie(cookieStr);
+        if (!persisted) addLog('warn', 'cookie', 'Cookie update was not persisted because OS encryption is unavailable');
+      } catch (error) {
+        addLog('error', 'cookie', `Cookie persistence failed: ${error.message}`);
+      }
+      if (proxyServer && !proxySilentStops.has(proxyServer)) proxyServer.updateCookie(cookieStr);
       sendToMain('cookie-status', { cookieValid: true, cookieCount: cookies.length });
     } else {
-      state.cookieValid = false;
-      state.cookieCount = 0;
-      sendToMain('cookie-status', { cookieValid: false, cookieCount: 0 });
+      authStateController.expireCookie();
+      await stopProxyServer();
     }
   } catch (err) {
+    if (!isCurrentCookieQuery(query)) return;
     addLog('error', 'cookie', `Error: ${err.message}`);
   }
 }
@@ -746,93 +864,242 @@ async function updateCookieState() {
 // Proxy Server
 // =========================================================================
 
-async function startProxyServer(cookieString) {
-  if (state.proxyStatus === 'started' || state.proxyStatus === 'starting') return;
+let _statsTimer = null;
+let _statsThrottleTimer = null;
+
+function clearProxyStatsTimers() {
+  if (_statsTimer) clearInterval(_statsTimer);
+  if (_statsThrottleTimer) clearTimeout(_statsThrottleTimer);
+  _statsTimer = null;
+  _statsThrottleTimer = null;
+}
+
+function publishProxyStopped(force = false) {
+  const changed = state.proxyStatus !== 'stopped'
+    || state.connectionCount !== 0
+    || state.error !== null;
+  state.proxyStatus = 'stopped';
+  state.connectionCount = 0;
+  state.error = null;
+  if (changed || force) {
+    sendToMain('proxy-status', { proxyStatus: 'stopped', connectionCount: 0, error: null });
+    updateTrayIcon();
+    updateTrayMenu();
+  }
+}
+
+function enqueueProxyLifecycle(operation) {
+  const result = proxyLifecycle.then(operation, operation);
+  proxyLifecycle = result.catch(() => {});
+  return result;
+}
+
+function shutdownStartResult() {
+  return { ok: false, shuttingDown: true, error: 'Application is shutting down' };
+}
+
+function isActiveProxyInstance(instance) {
+  return !isShuttingDown()
+    && proxyServer === instance
+    && !proxySilentStops.has(instance);
+}
+
+function startProxyServer(cookieString) {
+  if (isShuttingDown()) return Promise.resolve(shutdownStartResult());
+  if (!authStateController.canStartProxy()) {
+    return Promise.resolve({ ok: false, error: 'Login is required before starting the proxy' });
+  }
+  return enqueueProxyLifecycle(() => startProxyServerNow(cookieString));
+}
+
+async function startProxyServerNow(cookieString) {
+  if (isShuttingDown()) return shutdownStartResult();
+  if (!authStateController.canStartProxy()) {
+    return { ok: false, error: 'Login is required before starting the proxy' };
+  }
+  if (state.proxyStatus === 'started' && proxyServer) {
+    return { ok: true, alreadyRunning: true };
+  }
 
   state.proxyStatus = 'starting';
-  sendToMain('proxy-status', { proxyStatus: 'starting', connectionCount: 0 });
+  state.connectionCount = 0;
+  state.error = null;
+  sendToMain('proxy-status', { proxyStatus: 'starting', connectionCount: 0, error: null });
   updateTrayIcon();
   updateTrayMenu();
 
-  // Properly stop old proxy to release port and TCP/SSH server resources
+  clearProxyStatsTimers();
   if (proxyServer) {
-    await proxyServer.stop();
-    proxyServer.removeAllListeners();
-    proxyServer = null;
-  }
-
-  // Use provided cookie string (from login capture) or query from session (auto-connect)
-  let currentCookie = cookieString || '';
-  if (!currentCookie) {
-    let cookies;
+    const previous = proxyServer;
+    proxySilentStops.add(previous);
     try {
-      cookies = await session.defaultSession.cookies.get({ domain: PLATFORM.domain });
-    } catch (_) {
-      cookies = [];
+      await previous.stop();
+    } catch (error) {
+      proxySilentStops.delete(previous);
+      state.proxyStatus = 'error';
+      state.error = error.message;
+      addLog('error', 'proxy', `Previous instance cleanup failed: ${error.message}`);
+      sendToMain('proxy-status', {
+        proxyStatus: 'error',
+        connectionCount: 0,
+        error: error.message,
+      });
+      updateTrayIcon();
+      updateTrayMenu();
+      return { ok: false, error: error.message };
     }
-    currentCookie = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
+    proxySilentStops.delete(previous);
+    previous.removeAllListeners();
+    if (proxyServer === previous) proxyServer = null;
+    if (isShuttingDown()) return shutdownStartResult();
+    if (!authStateController.canStartProxy()) {
+      return { ok: false, error: 'Login is required before starting the proxy' };
+    }
   }
 
+  // A captured login cookie survives the dedicated login window closing.
+  let currentCookie;
+  try {
+    const cookieGeneration = cookieStateGeneration;
+    if (authCookieResetPromise) await authCookieResetPromise;
+    if (isShuttingDown()) return shutdownStartResult();
+    if (cookieGeneration !== cookieStateGeneration) {
+      throw new Error('Authentication state changed while starting the proxy');
+    }
+    const cookieCandidate = cookieString === undefined ? capturedCookieString : cookieString;
+    currentCookie = validateCookie(cookieCandidate);
+    if (!currentCookie) {
+      const cookies = await getAuthSession().cookies.get({ domain: PLATFORM.domain });
+      if (isShuttingDown()) return shutdownStartResult();
+      if (!isCurrentCookieGeneration(cookieGeneration)) {
+        throw new Error('Authentication state changed while starting the proxy');
+      }
+      currentCookie = buildCookieHeader(cookies);
+    }
+  } catch (error) {
+    state.proxyStatus = 'error';
+    state.error = error.message;
+    addLog('error', 'proxy', `Cookie initialization failed: ${error.message}`);
+    sendToMain('proxy-status', {
+      proxyStatus: 'error',
+      connectionCount: 0,
+      error: error.message,
+    });
+    updateTrayIcon();
+    updateTrayMenu();
+    return { ok: false, error: error.message };
+  }
+
+  if (isShuttingDown()) return shutdownStartResult();
   state.wssUrl = buildWssUrl();
 
-  // Load authorized public key for client authentication
-  let authorizedKey = null;
-  if (settings.sshPublicKeyRaw) {
-    authorizedKey = Buffer.from(settings.sshPublicKeyRaw, 'base64');
+  if (!currentCookie) {
+    const error = new Error('Login is required before starting the proxy');
+    state.proxyStatus = 'error';
+    state.error = error.message;
+    addLog('error', 'proxy', error.message);
+    sendToMain('proxy-status', { proxyStatus: 'error', connectionCount: 0, error: error.message });
+    updateTrayIcon();
+    updateTrayMenu();
+    return { ok: false, error: error.message };
   }
 
-  proxyServer = new ProxyServer({
-    port: state.port,
-    host: state.host,
-    cookie: currentCookie,
-    cluster: settings.cluster,
-    loginNode: settings.loginNode,
-    cols: settings.cols,
-    rows: settings.rows,
-    useRoot: settings.useRoot,
-    authorizedKey,
-    authorizedKeyOpenSSH: settings.sshPublicKey || '',
-  });
+  let keyInfo;
+  let hostKey;
+  let authorizedKey;
+  try {
+    keyInfo = ensureSshKeyPair();
+    hostKey = ensureProxyHostKey(path.join(app.getPath('userData'), SSH_HOST_KEY_NAME));
+    authorizedKey = Buffer.from(keyInfo.publicKeyRaw, 'base64');
+    if (authorizedKey.length !== 32) throw new Error('SSH public key is invalid');
+  } catch (error) {
+    state.proxyStatus = 'error';
+    state.error = error.message;
+    addLog('error', 'ssh-key', error.message);
+    sendToMain('proxy-status', { proxyStatus: 'error', connectionCount: 0, error: error.message });
+    updateTrayIcon();
+    updateTrayMenu();
+    return { ok: false, error: error.message };
+  }
+
+  if (isShuttingDown()) return shutdownStartResult();
+
+  let instance;
+  try {
+    instance = new ProxyServer({
+      port: state.port,
+      host: state.host,
+      cookie: currentCookie,
+      cluster: settings.cluster,
+      loginNode: settings.loginNode,
+      cols: settings.cols,
+      rows: settings.rows,
+      useRoot: settings.useRoot,
+      authorizedKey,
+      authorizedKeyOpenSSH: keyInfo.publicKey,
+      hostKey,
+    });
+  } catch (error) {
+    state.proxyStatus = 'error';
+    state.error = error.message;
+    addLog('error', 'proxy', `Initialization failed: ${error.message}`);
+    sendToMain('proxy-status', {
+      proxyStatus: 'error',
+      connectionCount: 0,
+      error: error.message,
+    });
+    updateTrayIcon();
+    updateTrayMenu();
+    return { ok: false, error: error.message };
+  }
+  proxyServer = instance;
 
   // ---- Proxy events ----
 
   // Forward proxy-internal logs to app log UI
-  proxyServer.on('proxy-log', (level, source, message) => {
+  instance.on('proxy-log', (level, source, message) => {
+    if (!isActiveProxyInstance(instance)) return;
     addLog(level, source, message);
   });
 
-  proxyServer.on('started', ({ host, port }) => {
+  instance.on('started', ({ host, port }) => {
+    if (!isActiveProxyInstance(instance)) return;
     state.proxyStatus = 'started';
+    state.error = null;
     addLog('info', 'proxy', `Server started on ${host}:${port}`);
     sendToMain('proxy-status', {
       proxyStatus: 'started',
       connectionCount: 0,
       wssUrl: state.wssUrl,
+      error: null,
     });
-    sendToMain('stats-update', proxyServer.getStats());
+    sendToMain('stats-update', instance.getStats());
     updateTrayIcon();
     updateTrayMenu();
   });
 
-  proxyServer.on('connection', (count) => {
+  instance.on('connection', (count) => {
+    if (!isActiveProxyInstance(instance)) return;
     state.connectionCount = count;
     updateTrayMenu();
     sendToMain('proxy-status', {
       proxyStatus: 'started',
       connectionCount: count,
       wssUrl: state.wssUrl,
+      error: null,
     });
   });
 
-  proxyServer.on('stopped', () => {
-    state.proxyStatus = 'stopped';
-    sendToMain('proxy-status', { proxyStatus: 'stopped', connectionCount: 0 });
-    updateTrayIcon();
-    updateTrayMenu();
+  instance.on('stopped', () => {
+    if (!isActiveProxyInstance(instance)) return;
+    clearProxyStatsTimers();
+    publishProxyStopped();
   });
 
-  proxyServer.on('error', (err) => {
+  instance.on('error', (err) => {
+    if (!isActiveProxyInstance(instance)) return;
     state.proxyStatus = 'error';
+    state.error = err.message;
     addLog('error', 'proxy', err.message);
     sendToMain('proxy-status', {
       proxyStatus: 'error',
@@ -843,58 +1110,86 @@ async function startProxyServer(cookieString) {
     updateTrayMenu();
   });
 
-  proxyServer.on('auth-error', ({ statusCode }) => {
+  instance.on('auth-error', ({ statusCode }) => {
+    if (!isActiveProxyInstance(instance)) return;
     addLog('warn', 'auth', `Auth error (${statusCode}) — session may have expired`);
-    state.loginStatus = 'failure';
-    state.cookieValid = false;
-    loggedIn = false;
-    sendToMain('login-status', 'failure');
-    sendToMain('cookie-status', { cookieValid: false, cookieCount: 0 });
-    stopProxyServer();
+    authStateController.invalidate('failure');
+    const stopPromise = stopProxyServer();
+    void clearAuthSessionCookies()
+      .catch((error) => {
+        addLog('error', 'auth', `Login-session Cookie removal failed: ${error.message}`);
+      })
+      .then(() => stopPromise)
+      .catch((error) => {
+        addLog('error', 'proxy', `Auth-failure shutdown failed: ${error.message}`);
+      });
   });
 
   // Session events
-  proxyServer.on('session-open', (session) => {
+  instance.on('session-open', (session) => {
+    if (!isActiveProxyInstance(instance)) return;
     addLog('info', 'session', `Opened: ${session.remoteAddress} (#${session.id})`);
     sendToMain('session-update', {
       type: 'open',
       session,
-      all: proxyServer.getSessions(),
+      all: instance.getSessions(),
     });
     // System notification for new connection
-    showNotification('SSH Connection', `New session from ${session.remoteAddress}`);
+    showNotification(mainText('sshConnection'), mainText('newSession', session.remoteAddress));
   });
 
-  proxyServer.on('session-close', ({ sessionId }) => {
+  instance.on('session-close', ({ sessionId }) => {
+    if (!isActiveProxyInstance(instance)) return;
     addLog('info', 'session', `Closed: #${sessionId}`);
     sendToMain('session-update', {
       type: 'close',
       sessionId,
-      all: proxyServer.getSessions(),
+      all: instance.getSessions(),
     });
   });
 
   // Traffic / stats — throttle to ~2 Hz (500ms) to avoid flooding renderer
-  let statsThrottle = null;
-  proxyServer.on('traffic', () => {
-    if (!statsThrottle) {
-      statsThrottle = setTimeout(() => {
-        statsThrottle = null;
-        if (proxyServer) sendToMain('stats-update', proxyServer.getStats());
+  instance.on('traffic', () => {
+    if (!isActiveProxyInstance(instance)) return;
+    if (!_statsThrottleTimer) {
+      _statsThrottleTimer = setTimeout(() => {
+        _statsThrottleTimer = null;
+        if (isActiveProxyInstance(instance)) sendToMain('stats-update', instance.getStats());
       }, 500);
     }
   });
 
   // Periodic stats update (uptime ticks, session count changes)
   _statsTimer = setInterval(() => {
-    if (proxyServer) sendToMain('stats-update', proxyServer.getStats());
+    if (isActiveProxyInstance(instance)) sendToMain('stats-update', instance.getStats());
   }, 1000);
 
   try {
-    await proxyServer.start();
+    const started = await instance.start();
+    if (!started && proxyStopRequests.has(instance)) {
+      clearProxyStatsTimers();
+      return { ok: true, cancelled: true };
+    }
+    if (!started) throw new Error('Proxy start was cancelled');
+    if (isShuttingDown()) return { ok: true, cancelled: true };
+    return { ok: true };
   } catch (err) {
+    const cancelled = isShuttingDown() || proxyStopRequests.has(instance);
+    if (cancelled) {
+      clearProxyStatsTimers();
+      instance.removeAllListeners();
+      try { await instance.stop(); } catch (_) { /* queued shutdown reports cleanup failures */ }
+      if (proxyServer === instance) proxyServer = null;
+      return { ok: true, cancelled: true };
+    }
     state.proxyStatus = 'error';
-    if (_statsTimer) { clearInterval(_statsTimer); _statsTimer = null; }
+    state.error = err.message;
+    clearProxyStatsTimers();
+    instance.removeAllListeners();
+    try { await instance.stop(); } catch (stopError) {
+      addLog('warn', 'proxy', `Cleanup after failed start: ${stopError.message}`);
+    }
+    if (proxyServer === instance) proxyServer = null;
     addLog('error', 'proxy', `Start failed: ${err.message}`);
     sendToMain('proxy-status', {
       proxyStatus: 'error',
@@ -903,17 +1198,53 @@ async function startProxyServer(cookieString) {
     });
     updateTrayIcon();
     updateTrayMenu();
+    return { ok: false, error: err.message };
   }
 }
 
-let _statsTimer = null;
+function stopProxyServer() {
+  const instance = proxyServer;
+  if (instance && state.proxyStatus === 'starting') {
+    proxyStopRequests.add(instance);
+    try {
+      instance.stop().catch((error) => {
+        addLog('warn', 'proxy', `Start cancellation failed: ${error.message}`);
+      });
+    } catch (error) {
+      addLog('warn', 'proxy', `Start cancellation failed: ${error.message}`);
+    }
+  }
+  return enqueueProxyLifecycle(stopProxyServerNow);
+}
 
-async function stopProxyServer() {
-  if (!proxyServer || state.proxyStatus === 'stopped') return;
-  if (_statsTimer) { clearInterval(_statsTimer); _statsTimer = null; }
-  await proxyServer.stop();
-  proxyServer.removeAllListeners();
-  proxyServer = null;
+async function stopProxyServerNow() {
+  const instance = proxyServer;
+  if (!instance) {
+    clearProxyStatsTimers();
+    publishProxyStopped();
+    return { ok: true, alreadyStopped: true };
+  }
+
+  clearProxyStatsTimers();
+  try {
+    await instance.stop();
+    if (proxyServer === instance) publishProxyStopped();
+    instance.removeAllListeners();
+    if (proxyServer === instance) proxyServer = null;
+    return { ok: true };
+  } catch (error) {
+    state.proxyStatus = 'error';
+    state.error = error.message;
+    addLog('error', 'proxy', `Stop failed: ${error.message}`);
+    sendToMain('proxy-status', {
+      proxyStatus: 'error',
+      connectionCount: state.connectionCount,
+      error: error.message,
+    });
+    updateTrayIcon();
+    updateTrayMenu();
+    return { ok: false, error: error.message };
+  }
 }
 
 function showNotification(title, body) {
@@ -928,39 +1259,45 @@ function showNotification(title, body) {
 // =========================================================================
 
 async function tryAutoConnect() {
-  if (!settings.autoConnect) return;
+  if (isShuttingDown() || !settings.autoConnect) return;
   try {
     // Prefer saved cookie (captured at login time, guaranteed complete)
     // over Electron session cookies (session cookies like SCOW_USER may be lost)
     if (capturedCookieString) {
       addLog('info', 'app', 'Auto-connect: using saved cookie from previous session');
       state.cookieValid = true;
-      state.cookieCount = 2;
+      state.cookieCount = countCookiePairs(capturedCookieString);
       state.loginStatus = 'success';
       state.wssUrl = buildWssUrl();
-      loggedIn = true;
       sendToMain('login-status', 'success');
-      sendToMain('cookie-status', { cookieValid: true, cookieCount: 2 });
+      sendToMain('cookie-status', { cookieValid: true, cookieCount: state.cookieCount });
+      if (isShuttingDown()) return;
       await startProxyServer(capturedCookieString);
     } else {
       // No saved cookie — check Electron session for fresh login
-      const cookies = await session.defaultSession.cookies.get({ domain: PLATFORM.domain });
+      const cookieGeneration = cookieStateGeneration;
+      const cookies = await getAuthSession().cookies.get({ domain: PLATFORM.domain });
+      if (!isCurrentCookieGeneration(cookieGeneration)) return;
       if (cookies.length > 0) {
         addLog('info', 'app', `Auto-connect: ${cookies.length} cookies found`);
-        capturedCookieString = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
+        capturedCookieString = buildCookieHeader(cookies);
         state.cookieValid = true;
         state.cookieCount = cookies.length;
         state.loginStatus = 'success';
         state.wssUrl = buildWssUrl();
-        loggedIn = true;
+        try { credentialStore.saveCookie(capturedCookieString); } catch (error) {
+          addLog('error', 'cookie', `Cookie persistence failed: ${error.message}`);
+        }
         sendToMain('login-status', 'success');
         sendToMain('cookie-status', { cookieValid: true, cookieCount: cookies.length });
+        if (isShuttingDown()) return;
         await startProxyServer(capturedCookieString);
       } else {
         addLog('info', 'app', 'Auto-connect: no cookies found, waiting for manual login');
       }
     }
   } catch (err) {
+    if (isShuttingDown()) return;
     addLog('warn', 'app', `Auto-connect check failed: ${err.message}`);
   }
 }
@@ -973,126 +1310,100 @@ function setupIPCHandlers() {
   let logPath = '';
   try { logPath = log.transports.file.getFile().path; } catch (_) {}
 
-  ipcMain.handle('runtime:get-info', () => ({
+  const handle = (channel, handler) => {
+    ipcMain.handle(channel, (event, ...args) => {
+      assertTrustedIpc(event);
+      return handler(...args);
+    });
+  };
+
+  handle('runtime:get-info', () => ({
     isElectron: true,
     platform: process.platform,
     electronVersion: process.versions.electron,
     nodeVersion: process.versions.node,
-    devMode: !!process.env.ELECTRON_DEV,
+    devMode: IS_DEV,
     logPath,
   }));
 
-  ipcMain.handle('status:get', () => ({ ...state }));
+  handle('status:get', () => ({ ...state }));
 
   // ---- Settings ----
-  ipcMain.handle('settings:get', () => ({ ...settings }));
-  ipcMain.handle('settings:save', (_e, s) => {
-    // Whitelist allowed keys to prevent injection of unexpected properties
-    // savedCookie is managed internally, not user-editable
-    const ALLOWED = new Set(Object.keys(DEFAULTS).filter((k) => k !== 'savedCookie' && k !== 'ssoPassword' && k !== 'sshPublicKeyRaw'));
-    for (const key of Object.keys(s)) {
-      if (!ALLOWED.has(key)) continue;
-      settings[key] = s[key];
-    }
-    // Validate port
-    if (s.port !== undefined) {
-      const p = Number(s.port);
-      if (Number.isInteger(p) && p > 0 && p < 65536) state.port = p;
-    }
-    if (s.host !== undefined) state.host = s.host;
-    // Normalize useRoot: frontend sends strings, we store boolean
-    if (s.useRoot !== undefined) settings.useRoot = s.useRoot === true || s.useRoot === 'true';
+  handle('settings:get', () => publicSettings(settings));
+  handle('settings:save', (input) => {
+    const next = normalizePublicSettings(input, settings);
+    const needsRestart = state.proxyStatus !== 'stopped' && [
+      'port', 'host', 'cluster', 'loginNode', 'cols', 'rows', 'useRoot',
+    ].some((key) => next[key] !== settings[key]);
+    persistSettings(next);
+    Object.assign(settings, next);
+    state.port = settings.port;
+    state.host = settings.host;
     state.wssUrl = buildWssUrl();
-    persistSettings(settings);
     addLog('info', 'settings', 'Settings saved');
-    if (state.proxyStatus === 'started') {
-      return { needsRestart: true };
-    }
-    return { needsRestart: false };
+    return { ok: true, needsRestart };
   });
 
-  // ---- SSO Credentials (encrypted with safeStorage) ----
-  ipcMain.handle('sso:save-credentials', (_e, username, password) => {
-    addLog('info', 'settings', 'sso:save-credentials called: username=' + (username || 'none') + ' password=' + (password ? password.length + ' chars' : 'EMPTY'));
-    settings.ssoUsername = username || '';
-    if (password) {
-      try {
-        if (safeStorage.isEncryptionAvailable()) {
-          const encrypted = safeStorage.encryptString(password);
-          settings.ssoPassword = encrypted.toString('base64');
-          addLog('info', 'settings', 'ssoPassword encrypted via safeStorage: ' + settings.ssoPassword.length + ' chars');
-        } else {
-          // Fallback: XOR obfuscation with app path hash (dev mode)
-          const crypto = require('crypto');
-          const key = crypto.createHash('md5').update(app.getPath('userData')).digest();
-          const buf = Buffer.from(password, 'utf-8');
-          for (let i = 0; i < buf.length; i++) buf[i] ^= key[i % key.length];
-          settings.ssoPassword = 'xor:' + buf.toString('base64');
-          addLog('info', 'settings', 'ssoPassword obfuscated (dev mode): ' + settings.ssoPassword.length + ' chars');
-        }
-      } catch (e) {
-        addLog('error', 'settings', 'ssoPassword encrypt failed: ' + e.message);
-        settings.ssoPassword = '';
-      }
-    } else {
-      settings.ssoPassword = '';
-    }
-    persistSettings(settings);
-    return { ok: true };
+  // ---- SSO Credentials (write-only password) ----
+  handle('sso:save-credentials', (username, password) => {
+    const status = credentialStore.saveSso({ username: username ?? '', password });
+    addLog('info', 'settings', 'SSO credentials updated');
+    return { ok: true, ...status };
   });
-
-  ipcMain.handle('sso:get-credentials', () => {
-    let password = '';
-    if (settings.ssoPassword) {
-      try {
-        if (settings.ssoPassword.startsWith('xor:')) {
-          // Dev mode: XOR obfuscated
-          const key = crypto.createHash('md5').update(app.getPath('userData')).digest();
-          const buf = Buffer.from(settings.ssoPassword.slice(4), 'base64');
-          for (let i = 0; i < buf.length; i++) buf[i] ^= key[i % key.length];
-          password = buf.toString('utf-8');
-        } else {
-          const buf = Buffer.from(settings.ssoPassword, 'base64');
-          password = safeStorage.decryptString(buf);
-        }
-      } catch (_) { /* corrupted or empty */ }
-    }
-    return { username: settings.ssoUsername || '', password };
+  handle('sso:get-credentials', () => credentialStore.getSsoStatus());
+  handle('sso:clear-credentials', () => {
+    const status = credentialStore.clearSso();
+    addLog('info', 'settings', 'SSO credentials cleared');
+    return { ok: true, ...status };
   });
 
   // ---- Login ----
-  ipcMain.handle('login:start', () => {
-    // Allow re-login: reset state if already logged in
-    if (state.loginStatus === 'success') {
-      state.loginStatus = 'idle';
-      loggedIn = false;
-      capturedCookieString = '';
-      settings.savedCookie = '';
-      persistSettings(settings);
+  handle('login:start', async () => {
+    if (isShuttingDown()) return shutdownStartResult();
+    if (loginWindow && !loginWindow.isDestroyed()) {
+      return createLoginWindow();
     }
-    if (state.loginStatus === 'sso_done') return;
+
+    const stopResult = await stopProxyServer();
+    if (stopResult?.ok === false) return stopResult;
+    if (isShuttingDown()) return shutdownStartResult();
+    authStateController.invalidate('idle');
+
+    try {
+      await clearAuthSessionCookies();
+    } catch (error) {
+      if (isShuttingDown()) return shutdownStartResult();
+      state.loginStatus = 'failure';
+      addLog('error', 'auth', `Login-session Cookie removal failed: ${error.message}`);
+      sendToMain('login-status', 'failure');
+      throw error;
+    }
+
+    if (isShuttingDown()) return shutdownStartResult();
     state.loginStatus = 'pending';
     sendToMain('login-status', 'pending');
-    createLoginWindow();
+    return createLoginWindow();
   });
 
   // ---- Proxy ----
-  ipcMain.handle('proxy:start', () => startProxyServer());
-  ipcMain.handle('proxy:stop', () => stopProxyServer());
+  handle('proxy:start', () => startProxyServer());
+  handle('proxy:stop', () => stopProxyServer());
 
   // ---- Logs ----
-  ipcMain.handle('logs:get', () => [...logs]);
-  ipcMain.handle('logs:clear', () => {
+  handle('logs:get', () => [...logs]);
+  handle('logs:clear', () => {
+    const clearedThroughId = logId;
     logs.length = 0;
-    logId = 0;
+    return { ok: true, clearedThroughId };
   });
 
   // ---- Sessions ----
-  ipcMain.handle('sessions:get', () => {
+  handle('sessions:get', () => {
     return proxyServer ? proxyServer.getSessions() : [];
   });
 
-  ipcMain.handle('sessions:disconnect', (_e, sessionId) => {
+  handle('sessions:disconnect', (sessionId) => {
+    if (!Number.isSafeInteger(sessionId) || sessionId < 1) throw new TypeError('sessionId is invalid');
     if (proxyServer) {
       const ok = proxyServer.disconnectSession(sessionId);
       if (ok) addLog('info', 'session', `Force-disconnected #${sessionId}`);
@@ -1102,96 +1413,82 @@ function setupIPCHandlers() {
   });
 
   // ---- Stats ----
-  ipcMain.handle('stats:get', () => {
+  handle('stats:get', () => {
     return proxyServer ? proxyServer.getStats() : {
       uptimeMs: 0, totalBytesSent: 0, totalBytesReceived: 0, sessionCount: 0, sessions: [],
     };
   });
 
   // ---- SSH Key Info ----
-  ipcMain.handle('ssh-key:get-info', () => {
-    const sshDir = path.join(os.homedir(), '.ssh');
-    const privPath = path.join(sshDir, SSH_KEY_NAME);
+  handle('ssh-key:get-info', () => {
+    const keyInfo = ensureSshKeyPair();
     return {
-      publicKey: settings.sshPublicKey || '',
-      privateKeyPath: privPath,
-      exists: fs.existsSync(privPath),
+      publicKey: keyInfo.publicKey,
+      privateKeyPath: keyInfo.privateKeyPath,
+      exists: fs.existsSync(keyInfo.privateKeyPath),
     };
   });
 
   // ---- SSH Config ----
-  ipcMain.handle('ssh-config:generate', async (_e, { host, port, alias } = {}) => {
-    const h = host || state.host || '127.0.0.1';
-    const p = port || state.port || 3000;
-    const a = alias || 'usshtc107';
-
+  handle('ssh-config:generate', (options = {}) => {
     const sshDir = path.join(os.homedir(), '.ssh');
-    const configPath = path.join(sshDir, 'config');
-    const marker = '# usshtc107-auto-generated';
-
-    const privKeyPath = path.join(os.homedir(), '.ssh', SSH_KEY_NAME);
-    const block = `${marker}
-Host ${a}
-  HostName ${h}
-  Port ${p}
-  User user
-  IdentityFile ${privKeyPath}
-  StrictHostKeyChecking no
-  UserKnownHostsFile /dev/null`;
-
-    try {
-      // Ensure .ssh directory
-      if (!fs.existsSync(sshDir)) {
-        fs.mkdirSync(sshDir, { mode: 0o700 });
-      }
-
-      let existing = '';
-      if (fs.existsSync(configPath)) {
-        existing = fs.readFileSync(configPath, 'utf-8');
-      }
-
-      // Remove old usshtc107 block (handles both LF and CRLF line endings)
-      const escMarker = marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const escAlias = a.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const NL = '(\\r?\\n)';
-      const regex = new RegExp(
-        `${NL}*${escMarker}${NL}` +
-        `Host ${escAlias}[\\s\\S]*?` +
-        `(?=${NL}Host |${escMarker}|$)`,
-        'g'
-      );
-      let newConfig = existing.replace(regex, '').trim();
-
-      if (newConfig) newConfig += '\n\n';
-      newConfig += block + '\n';
-
-      fs.writeFileSync(configPath, newConfig, { mode: 0o644 });
-      addLog('info', 'ssh-config', `Written ${configPath}`);
-      return { success: true, path: configPath, content: block };
-    } catch (err) {
-      addLog('error', 'ssh-config', `Failed: ${err.message}`);
-      return { success: false, error: err.message };
-    }
+    const keyInfo = ensureSshKeyPair();
+    const service = new SshConfigService({
+      sshDirectory: sshDir,
+      privateKeyPath: keyInfo.privateKeyPath,
+    });
+    const result = service.write({
+      host: options.host ?? state.host,
+      port: options.port ?? state.port,
+      alias: options.alias ?? settings.sshAlias,
+    });
+    addLog('info', 'ssh-config', `Written ${result.path}`);
+    return { success: true, path: result.path, content: result.block, backupPath: result.backupPath };
   });
 
   // ---- Theme ----
-  ipcMain.handle('theme:get', () => settings.theme || 'dark');
-  ipcMain.handle('theme:set', (_e, theme) => {
-    settings.theme = theme;
-    persistSettings(settings);
+  handle('theme:get', () => settings.theme || 'dark');
+  handle('theme:set', (theme) => {
+    const next = normalizePublicSettings({ theme }, settings);
+    persistSettings(next);
+    Object.assign(settings, next);
     sendToMain('theme-changed', theme);
+    return { ok: true };
+  });
+
+  handle('locale:set', (locale) => {
+    const next = normalizePublicSettings({ locale }, settings);
+    persistSettings(next);
+    Object.assign(settings, next);
+    updateTrayMenu();
+    return { ok: true };
   });
 
   // ---- Clipboard ----
-  ipcMain.handle('clipboard:write', (_e, text) => {
+  handle('clipboard:write', (text) => {
+    if (typeof text !== 'string' || text.length > 1024 * 1024) throw new TypeError('clipboard text is invalid');
     clipboard.writeText(text);
+    return { ok: true };
+  });
+
+  handle('external:open', async (url) => {
+    if (typeof url !== 'string' || url.length > 2048) throw new TypeError('URL is invalid');
+    const parsed = parseHttpsUrl(url);
+    if (!parsed) throw new TypeError('Only HTTPS URLs can be opened');
+    await shell.openExternal(parsed.href);
+    return { ok: true };
+  });
+
+  handle('app:set-dirty', (dirty) => {
+    if (typeof dirty !== 'boolean') throw new TypeError('dirty state must be a boolean');
+    rendererHasUnsavedChanges = dirty;
+    return { ok: true };
   });
 
   // ---- App exit ----
-  ipcMain.handle('app:exit', async () => {
-    allowAppQuit = true;
-    await stopProxyServer();
-    app.quit();
+  handle('app:exit', () => {
+    void requestShutdown(0);
+    return { ok: true };
   });
 }
 
@@ -1199,57 +1496,148 @@ Host ${a}
 // App Lifecycle
 // =========================================================================
 
-app.whenReady().then(async () => {
-  setupIPCHandlers();
-  setupCookieMonitoring();
-  createTray();
-  createMainWindow();
-  ensureSshKeyPair();
-  autoGenerateSshConfig();
-  addLog('info', 'app', 'Application started');
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
 
-  // Auto-connect after a short delay to let cookie store initialize
-  setTimeout(() => tryAutoConnect(), 1000);
-});
-
-app.on('window-all-closed', () => {
-  // Don't quit — stay in tray
-  if (process.platform !== 'darwin') {
-    // On non-macOS, just hide. App stays alive via tray.
+function confirmDiscardUnsavedChanges() {
+  if (!rendererHasUnsavedChanges) return true;
+  const isChinese = settings.locale === 'zh';
+  const options = {
+    type: 'warning',
+    buttons: isChinese ? ['放弃更改并退出', '取消'] : ['Discard Changes and Quit', 'Cancel'],
+    defaultId: 1,
+    cancelId: 1,
+    noLink: true,
+    title: isChinese ? '未保存的设置' : 'Unsaved Settings',
+    message: isChinese ? '设置中有尚未保存的更改。' : 'You have unsaved settings changes.',
+    detail: isChinese ? '退出将放弃这些更改。' : 'Quitting will discard those changes.',
+  };
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.show();
+      mainWindow.focus();
+      return dialog.showMessageBoxSync(mainWindow, options) === 0;
+    }
+    return dialog.showMessageBoxSync(options) === 0;
+  } catch (error) {
+    log.error(`[app] Unsaved-changes confirmation failed: ${redactLogMessage(error?.message)}`);
+    return false;
   }
-});
+}
 
-app.on('before-quit', (event) => {
-  // Electron does not await async handlers on before-quit.
-  // We must prevent default, clean up, then explicitly exit.
-  event.preventDefault();
-  allowAppQuit = true;
-  if (tray) {
-    tray.destroy();
-    tray = null;
+function requestShutdown(exitCode) {
+  if (!(exitCode > 0) && !isShuttingDown() && !confirmDiscardUnsavedChanges()) {
+    return Promise.resolve({ ok: false, cancelled: true });
   }
-  stopProxyServer().finally(() => {
-    app.exit(0);
-  });
+  if (!shutdownCoordinator) {
+    app.exit(exitCode > 0 ? exitCode : 0);
+    return Promise.resolve();
+  }
+  return shutdownCoordinator.request(exitCode);
+}
+
+function beginFatalShutdown(context, error) {
+  const message = error?.message || String(error);
+  try {
+    addLog('error', 'app', `${context}: ${message}`);
+  } catch (_) {
+    log.error(`[app] ${context}: ${redactLogMessage(message)}`);
+  }
+  return requestShutdown(1);
+}
+
+shutdownCoordinator = createShutdownCoordinator({
+  stop: () => stopProxyServer(),
+  exit: (exitCode) => app.exit(exitCode),
+  onPrepare: () => {
+    allowAppQuit = true;
+    rendererHasUnsavedChanges = false;
+    invalidateCookieQueries();
+    const authWindow = loginWindow;
+    loginWindow = null;
+    if (authWindow && !authWindow.isDestroyed()) authWindow.destroy();
+    if (cookieChangeTimer) {
+      clearTimeout(cookieChangeTimer);
+      cookieChangeTimer = null;
+    }
+    if (autoConnectTimer) {
+      clearTimeout(autoConnectTimer);
+      autoConnectTimer = null;
+    }
+    if (tray) {
+      tray.destroy();
+      tray = null;
+    }
+  },
+  onCleanupError: (error) => {
+    log.error(`[app] Shutdown cleanup failed: ${redactLogMessage(error?.message)}`);
+  },
 });
 
-app.on('activate', () => {
-  if (mainWindow) {
+if (!hasSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (isShuttingDown()) return;
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.show();
     mainWindow.focus();
-  } else if (BrowserWindow.getAllWindows().length === 0) {
+  });
+
+  app.whenReady().then(async () => {
+    if (isShuttingDown()) return;
+    try {
+      credentialStore.migrateLegacySecrets();
+      capturedCookieString = credentialStore.getCookie();
+    } catch (error) {
+      startupWarnings.push(`Credential migration failed: ${error.message}`);
+      capturedCookieString = '';
+    }
+
+    setupIPCHandlers();
+    setupCookieMonitoring();
+    createTray();
     createMainWindow();
-  }
-});
+    try {
+      ensureSshKeyPair();
+      ensureProxyHostKey(path.join(app.getPath('userData'), SSH_HOST_KEY_NAME));
+    } catch (error) {
+      startupWarnings.push(error.message);
+    }
+    addLog('info', 'app', 'Application started');
+    for (const warning of startupWarnings.splice(0)) addLog('warn', 'startup', warning);
+
+    // Auto-connect after a short delay to let the cookie store initialize.
+    autoConnectTimer = setTimeout(() => {
+      autoConnectTimer = null;
+      if (!isShuttingDown()) void tryAutoConnect();
+    }, 1000);
+  }).catch((error) => beginFatalShutdown('Startup failed', error));
+
+  app.on('window-all-closed', () => {
+    // The tray owns the app lifetime on every platform.
+  });
+
+  app.on('before-quit', (event) => {
+    event.preventDefault();
+    void requestShutdown(0);
+  });
+
+  app.on('activate', () => {
+    if (isShuttingDown()) return;
+    if (mainWindow) {
+      mainWindow.show();
+      mainWindow.focus();
+    } else if (BrowserWindow.getAllWindows().length === 0) {
+      createMainWindow();
+    }
+  });
+}
 
 process.on('unhandledRejection', (reason) => {
-  const msg = reason?.message || String(reason);
-  log.error(`[app] Unhandled rejection: ${msg}`);
-  addLog('error', 'app', `Unhandled: ${msg}`);
+  void beginFatalShutdown('Unhandled rejection', reason);
 });
 
 process.on('uncaughtException', (err) => {
-  log.error(`[app] Uncaught exception: ${err.message}`);
-  addLog('error', 'app', `Uncaught: ${err.message}`);
-  // Don't crash the app — log and continue
+  void beginFatalShutdown('Uncaught exception', err);
 });

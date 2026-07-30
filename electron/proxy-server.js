@@ -3,6 +3,7 @@ const net = require('net');
 const { Server: SSHServer, utils: sshUtils } = require('ssh2');
 const { WebSocket } = require('ws');
 const { EventEmitter } = require('events');
+const { validateCookie } = require('./credential-store');
 const {
   PLATFORM,
   AUTH_CLOSE_CODES,
@@ -10,9 +11,26 @@ const {
   PING_INTERVAL,
   PING_TIMEOUT,
   CTRL_D_DRAIN_MS,
+  SSH_HANDSHAKE_TIMEOUT,
+  SSH_SOCKET_IDLE_TIMEOUT,
+  PROXY_SHUTDOWN_TIMEOUT,
+  EXEC_TIMEOUT,
+  WS_BACKPRESSURE_POLL_MS,
+  MAX_TCP_CONNECTIONS,
+  MAX_PROXY_SESSIONS,
+  MAX_WSS_PAYLOAD_BYTES,
+  MAX_PENDING_BYTES,
+  MAX_EXEC_OUTPUT_BYTES,
+  MAX_WS_BUFFERED_BYTES,
 } = require('./constants');
 
-// ---- JSON Protocol ----
+const WS_CONNECTING = 0;
+const WS_OPEN = 1;
+const EXEC_ERROR_EXIT_CODE = 1;
+const EXEC_TIMEOUT_EXIT_CODE = 124;
+const EXEC_OUTPUT_LIMIT_EXIT_CODE = 125;
+const EXEC_DISCONNECTED_EXIT_CODE = 255;
+const EXEC_WRITE_CHUNK_BYTES = 64 * 1024;
 
 function parseServerMessage(raw) {
   try {
@@ -20,10 +38,19 @@ function parseServerMessage(raw) {
     switch (msg.$case) {
       case 'exit':
       case 'close':
-      case 'logout':
-        return { type: 'session_ended' };
-      case 'data':
-        return { type: 'data', payload: msg.data?.data ?? '' };
+      case 'logout': {
+        const candidate = msg.exitCode ?? msg.code ?? msg.exit?.code;
+        const exitCode = Number.isInteger(candidate) && candidate >= 0 && candidate <= 255
+          ? candidate
+          : null;
+        return { type: 'session_ended', exitCode };
+      }
+      case 'data': {
+        const payload = msg.data?.data;
+        return typeof payload === 'string'
+          ? { type: 'data', payload }
+          : { type: 'unknown' };
+      }
       default:
         return { type: 'unknown' };
     }
@@ -33,33 +60,58 @@ function parseServerMessage(raw) {
 }
 
 function buildClientMessage(buf) {
-  const text = buf.toString('utf-8');
-  return JSON.stringify({ $case: 'data', data: { data: text } });
+  return JSON.stringify({ $case: 'data', data: { data: buf.toString('utf-8') } });
 }
 
-// ---- Session tracking ----
+function extractEd25519RawKey(data) {
+  if (!Buffer.isBuffer(data)) return null;
+  if (data.length === 32) return data;
 
-let _sessionIdCounter = 0;
+  let offset = 0;
+  const readField = () => {
+    if (offset + 4 > data.length) return null;
+    const length = data.readUInt32BE(offset);
+    offset += 4;
+    if (length > data.length - offset) return null;
+    const field = data.subarray(offset, offset + length);
+    offset += length;
+    return field;
+  };
+
+  const algorithm = readField();
+  const key = readField();
+  if (!algorithm || !key || offset !== data.length) return null;
+  if (algorithm.toString('ascii') !== 'ssh-ed25519' || key.length !== 32) return null;
+  return key;
+}
+
+function positiveInteger(value, fallback) {
+  return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+function nonNegativeInteger(value, fallback) {
+  return Number.isInteger(value) && value >= 0 ? value : fallback;
+}
+
+let sessionIdCounter = 0;
 
 class Session {
   constructor(id, remoteAddress) {
     this.id = id;
     this.remoteAddress = remoteAddress;
     this.connectedAt = Date.now();
-    this.bytesSent = 0;      // SSH → WSS
-    this.bytesReceived = 0;  // WSS → SSH
-    this._sshClient = null;  // stored for targeted disconnect
+    this.bytesSent = 0;
+    this.bytesReceived = 0;
+    this._close = null;
   }
 }
-
-// ---- ProxyServer ----
 
 class ProxyServer extends EventEmitter {
   constructor(options = {}) {
     super();
-    this.port = options.port || 3000;
-    this.host = options.host || '127.0.0.1';
-    this.cookie = options.cookie || '';
+    this.port = options.port ?? 3000;
+    this.host = typeof options.host === 'string' && options.host ? options.host : '127.0.0.1';
+    this.cookie = validateCookie(options.cookie === undefined ? '' : options.cookie);
     this.wssUrl = options.wssUrl;
 
     if (!this.wssUrl) {
@@ -74,30 +126,111 @@ class ProxyServer extends EventEmitter {
       this.wssUrl = `${PLATFORM.wssBase}?${params.toString()}`;
     }
 
-    this.authorizedKey = options.authorizedKey || null; // raw 32-byte ed25519 key
-    this._parsedPubKey = null; // ssh2 Key object for signature verification
+    this.tlsCa = options.tlsCa ?? options.ca;
+    this.authorizedKey = Buffer.isBuffer(options.authorizedKey)
+      ? Buffer.from(options.authorizedKey)
+      : null;
+    this._authorizedKeyBlob = null;
+    this._parsedPubKey = null;
+    this._authConfigValid = false;
+
+    this._net = options.netModule || net;
+    this._SSHServer = options.SSHServerClass || SSHServer;
+    this._parseKey = options.parseKey || sshUtils.parseKey;
+    this._webSocketFactory = options.webSocketFactory
+      || ((url, wsOptions) => new WebSocket(url, wsOptions));
+    this._hostKey = options.hostKey || null;
+
+    this.wssHandshakeTimeoutMs = positiveInteger(
+      options.wssHandshakeTimeoutMs,
+      WSS_HANDSHAKE_TIMEOUT
+    );
+    this.sshHandshakeTimeoutMs = positiveInteger(
+      options.sshHandshakeTimeoutMs,
+      SSH_HANDSHAKE_TIMEOUT
+    );
+    this.socketIdleTimeoutMs = positiveInteger(
+      options.socketIdleTimeoutMs,
+      SSH_SOCKET_IDLE_TIMEOUT
+    );
+    this.shutdownTimeoutMs = positiveInteger(
+      options.shutdownTimeoutMs,
+      PROXY_SHUTDOWN_TIMEOUT
+    );
+    this.execTimeoutMs = positiveInteger(options.execTimeoutMs, EXEC_TIMEOUT);
+    this.execInitialDelayMs = nonNegativeInteger(options.execInitialDelayMs, 1000);
+    this.pingIntervalMs = positiveInteger(options.pingIntervalMs, PING_INTERVAL);
+    this.pingTimeoutMs = positiveInteger(options.pingTimeoutMs, PING_TIMEOUT);
+    this.ctrlDDrainMs = nonNegativeInteger(options.ctrlDDrainMs, CTRL_D_DRAIN_MS);
+    this.backpressurePollMs = positiveInteger(
+      options.backpressurePollMs,
+      WS_BACKPRESSURE_POLL_MS
+    );
+
+    this.maxConnections = positiveInteger(options.maxConnections, MAX_TCP_CONNECTIONS);
+    this.maxSessions = positiveInteger(options.maxSessions, MAX_PROXY_SESSIONS);
+    this.maxWssPayloadBytes = positiveInteger(
+      options.maxWssPayloadBytes,
+      MAX_WSS_PAYLOAD_BYTES
+    );
+    this.maxPendingBytes = positiveInteger(options.maxPendingBytes, MAX_PENDING_BYTES);
+    this.maxExecOutputBytes = positiveInteger(
+      options.maxExecOutputBytes,
+      MAX_EXEC_OUTPUT_BYTES
+    );
+    this.maxWsBufferedBytes = positiveInteger(
+      options.maxWsBufferedBytes,
+      MAX_WS_BUFFERED_BYTES
+    );
+
     if (options.authorizedKeyOpenSSH) {
       try {
-        this._parsedPubKey = sshUtils.parseKey(options.authorizedKeyOpenSSH);
-      } catch (e) {
-        console.error('[proxy] Failed to parse authorized key:', e.message);
+        const parsed = this._parseKey(options.authorizedKeyOpenSSH);
+        const candidate = Array.isArray(parsed) ? parsed[0] : parsed;
+        const publicBlob = typeof candidate?.getPublicSSH === 'function'
+          ? candidate.getPublicSSH()
+          : null;
+        const parsedRawKey = extractEd25519RawKey(publicBlob);
+        const keyMatches = this.authorizedKey?.length === 32
+          && parsedRawKey?.length === this.authorizedKey.length
+          && crypto.timingSafeEqual(parsedRawKey, this.authorizedKey);
+        if (!(candidate instanceof Error)
+            && candidate?.type === 'ssh-ed25519'
+            && typeof candidate.verify === 'function'
+            && keyMatches) {
+          this._parsedPubKey = candidate;
+          this._authorizedKeyBlob = Buffer.from(publicBlob);
+        }
+      } catch (_) {
+        this._parsedPubKey = null;
+        this._authorizedKeyBlob = null;
       }
     }
+    this._authConfigValid = this.authorizedKey?.length === 32
+      && !!this._parsedPubKey
+      && !!this._authorizedKeyBlob;
 
     this._server = null;
     this._sshServer = null;
     this._started = false;
+    this._starting = false;
+    this._stopping = false;
     this._clients = new Set();
+    this._sockets = new Map();
+    this._sshChannels = new Set();
+    this._sessions = new Map();
 
-    // Session & stats tracking
-    this._sessions = new Map();        // sessionId → Session
     this._startTime = null;
     this._totalBytesSent = 0;
     this._totalBytesReceived = 0;
+
+    this._lifecycle = Promise.resolve();
+    this._startPromise = null;
+    this._stopPromise = null;
+    this._startRequest = null;
+    this._listenAbortController = null;
   }
 
-  // Host key generated once per module load (not per instance) to avoid
-  // SSH "HOST KEY CHANGED" warnings across proxy restarts.
   static _ensureHostKey() {
     if (!ProxyServer._hostKey) {
       const { privateKey } = crypto.generateKeyPairSync('rsa', {
@@ -110,341 +243,524 @@ class ProxyServer extends EventEmitter {
     return ProxyServer._hostKey;
   }
 
-  /**
-   * Bridge an exec request to WSS.
-   * Strategy: send command + echo marker, detect marker in output to know
-   * command is done, then send exit-status and close channel.
-   */
-  _bridgeExecToWss(channel, client, clientStr, command) {
-    const self = this;
-    const sessionId = ++_sessionIdCounter;
-    const session = new Session(sessionId, `${clientStr} [exec]`);
-    session._sshClient = client;
-    this._sessions.set(sessionId, session);
-    this.emit('session-open', this._sessionSnapshot(session));
-    this._emitStats();
-
-    // Unique done-marker — sent as a separate echo command after the user command.
-    // Uses a unique string that will NEVER appear in the user command's echo.
-    const DONE_ID = `D${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`;
-    // done-pattern to search for in output: "DONE_<id> <digits>\r?\n"
-    const DONE_RE = new RegExp(`DONE_${DONE_ID}\\s+(\\d+)\\r?\\n`);
-
-    self.emit('proxy-log', 'info', 'wss', `Connecting (exec): ${this.wssUrl}`);
-    self.emit('proxy-log', 'info', 'wss', `Exec command: ${command} (doneId=${DONE_ID})`);
-
-    const ws = new WebSocket(this.wssUrl, {
-      headers: {
-        Cookie: this.cookie,
-        Origin: PLATFORM.origin,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      },
-      rejectUnauthorized: false,
-      handshakeTimeout: WSS_HANDSHAKE_TIMEOUT,
-    });
-
-    let closed = false;
-    let commandSent = false;
-    let done = false;
-    let outputMessages = [];  // individual messages for extraction
-    let safetyTimer = null;
-
-    function safeCleanup() {
-      if (closed) return;
-      closed = true;
-      if (safetyTimer) { clearTimeout(safetyTimer); safetyTimer = null; }
-      if (self._sessions.has(sessionId)) {
-        self._sessions.delete(sessionId);
-        self.emit('session-close', { sessionId });
-        self._emitStats();
-      }
-      ws.removeAllListeners();
-      channel.removeAllListeners();
-      if (ws.readyState === WebSocket.OPEN) {
-        try { ws.close(1000); } catch (_) {}
-      }
-      try { if (!channel.closed) channel.close(); } catch (_) {}
-      try { client.end(); } catch (_) {}
-    }
-
-    function finishExec(exitCode) {
-      if (done) return;
-      done = true;
-
-      try {
-        self.emit('proxy-log', 'info', 'wss', `Exec finishing: exitCode=${exitCode}, ${outputMessages.length} msgs`);
-
-        // Combine messages EXCEPT done-marker related ones.
-        // Find the first message containing the done-marker command text
-        // and exclude it and everything after it.
-        const doneCmdText = `echo DONE_${DONE_ID}`;
-        let cutoffIdx = outputMessages.length;
-        for (let i = 0; i < outputMessages.length; i++) {
-          if (outputMessages[i].includes(doneCmdText) || outputMessages[i].includes(`DONE_${DONE_ID}`)) {
-            cutoffIdx = i;
-            break;
-          }
-        }
-        const outputText = outputMessages.slice(0, cutoffIdx).join('');
-        self.emit('proxy-log', 'info', 'wss', `Cutoff at msg #${cutoffIdx}, combined ${outputText.length} chars`);
-
-        // Strip ANSI
-        let stripped = outputText.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
-        stripped = stripped.replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, '');
-        stripped = stripped.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
-
-        self.emit('proxy-log', 'info', 'wss', `Output msgs combined (${stripped.length}): ${JSON.stringify(stripped).slice(0, 120)}`);
-
-        // Find the LAST command echo with \r\n — this is the terminal echo,
-        // right before the actual output.
-        const cmdWithNl = command + '\r\n';
-        const cmdIdx = stripped.lastIndexOf(cmdWithNl);
-        self.emit('proxy-log', 'info', 'wss', `lastIndexOf cmdWithNl at ${cmdIdx}`);
-
-        let cleanOutput = '';
-        if (cmdIdx !== -1) {
-          cleanOutput = stripped.substring(cmdIdx + cmdWithNl.length);
-        } else {
-          cleanOutput = stripped;
-        }
-        // Strip trailing prompt pattern: user@host:path$ or user@host:path#
-        // Path can contain: word chars, dots, /, ~, -, spaces
-        cleanOutput = cleanOutput.replace(/[\w.\-]+@[\w.\-]+:[\w.\/~\- ]*[\$#]\s*$/, '');
-        cleanOutput = cleanOutput.replace(/^\s+/, '').replace(/\s+$/, '');
-
-        self.emit('proxy-log', 'info', 'wss', `Exec output: ${JSON.stringify(cleanOutput).slice(0, 100)}`);
-
-        if (!channel.closed) {
-          if (cleanOutput) channel.write(Buffer.from(cleanOutput + '\n'));
-          channel.exit(exitCode);
-          channel.end();
-        }
-      } catch (err) {
-        self.emit('proxy-log', 'error', 'wss', `finishExec error: ${err.message}`);
-      } finally {
-        setTimeout(safeCleanup, 1000);
-      }
-    }
-
-    ws.on('message', (data) => {
-      if (done) return;
-      outputCount++;
-      try {
-        const raw = data.toString('utf-8');
-        const msg = JSON.parse(raw);
-        if (msg.$case === 'exit' || msg.$case === 'close' || msg.$case === 'logout') {
-          self.emit('proxy-log', 'info', 'wss', `Exec: session ended (${msg.$case})`);
-          finishExec(0);
-          return;
-        }
-        if (msg.$case === 'data' && msg.data?.data) {
-          const text = msg.data.data;
-          // Log first few messages for debugging
-          if (outputCount <= 8) {
-            self.emit('proxy-log', 'info', 'wss', `Exec recv msg #${outputCount}: ${JSON.stringify(text).slice(0, 120)}`);
-          }
-
-          session.bytesReceived += text.length;
-          self._totalBytesReceived += text.length;
-
-          // Store message individually
-          outputMessages.push(text);
-
-          // Check if this message contains the done-marker output.
-          // Pattern: "DONE_<id> <exitcode>" — $? is expanded to digit by shell.
-          if (commandSent) {
-            const donePattern = new RegExp(`DONE_${DONE_ID}\\s+(\\d+)`);
-            const doneMatch = text.match(donePattern);
-            if (doneMatch) {
-              const exitCode = parseInt(doneMatch[1], 10) || 0;
-              self.emit('proxy-log', 'info', 'wss', `Done in msg #${outputCount}, exitCode=${exitCode}`);
-              finishExec(exitCode);
-              return;
-            }
-          }
-        }
-      } catch (_) {}
-    });
-
-    // Track WSS output for debugging
-    let outputCount = 0;
-
-    ws.on('open', () => {
-      self.emit('proxy-log', 'info', 'wss', `WSS connected (exec): ${clientStr}`);
-      self.emit('proxy-log', 'info', 'wss', `Waiting 1s for shell init...`);
-      setTimeout(() => {
-        // Step 1: Send user command
-        ws.send(JSON.stringify({ $case: 'data', data: { data: command + '\n' } }));
-        commandSent = true;
-        self.emit('proxy-log', 'info', 'wss', `Command sent: ${command}`);
-
-        // Step 2: After command executes, send marker as separate command
-        setTimeout(() => {
-          if (!done && ws.readyState === WebSocket.OPEN) {
-            const doneCmd = `echo DONE_${DONE_ID} $?`;
-            ws.send(JSON.stringify({ $case: 'data', data: { data: doneCmd + '\n' } }));
-            self.emit('proxy-log', 'info', 'wss', `Done marker sent: ${doneCmd}`);
-          }
-        }, 2000);
-      }, 1000);
-
-      // Safety timeout
-      safetyTimer = setTimeout(() => {
-        if (!done) {
-          self.emit('proxy-log', 'warn', 'wss', `Exec safety timeout (60s): ${command}`);
-          finishExec(0);
-        }
-      }, 60000);
-    });
-
-    ws.on('unexpected-response', (_req, res) => {
-      self.emit('proxy-log', 'error', 'wss', `WSS HTTP ${res.statusCode} (exec)`);
-      if (res.statusCode === 401 || res.statusCode === 403) {
-        self.emit('auth-error', { statusCode: res.statusCode, clientStr });
-      }
-      finishExec(1);
-    });
-
-    ws.on('error', (err) => {
-      self.emit('proxy-log', 'error', 'wss', `WSS error (exec): ${err.message}`);
-      finishExec(1);
-    });
-
-    ws.on('close', (code) => {
-      self.emit('proxy-log', 'info', 'wss', `WSS closed (exec): code=${code}`);
-      if (AUTH_CLOSE_CODES.has(code)) {
-        self.emit('auth-error', { statusCode: code, clientStr });
-      }
-      finishExec(1);
-    });
-
-    channel.on('close', () => safeCleanup());
-    channel.on('end', () => safeCleanup());
+  _enqueueLifecycle(operation) {
+    const result = this._lifecycle.then(operation, operation);
+    this._lifecycle = result.catch(() => {});
+    return result;
   }
 
-  _bridgeSshToWss(channel, client, clientStr) {
-    const self = this;
-    console.log(`[proxy] Bridging for ${clientStr}`);
-    console.log(`[proxy] WSS URL: ${this.wssUrl}`);
-    console.log(`[proxy] Cookie: ${this.cookie?.slice(0, 80) || '(empty)'}...`);
-    self.emit('proxy-log', 'info', 'wss', `Connecting: ${this.wssUrl}`);
-    self.emit('proxy-log', 'info', 'wss', `Cookie: ${this.cookie?.slice(0, 80) || '(empty)'}`);
+  _emitError(err) {
+    if (this.listenerCount('error') > 0) this.emit('error', err);
+  }
 
+  _schedule(timerSet, fn, delay) {
+    const timer = setTimeout(() => {
+      timerSet.delete(timer);
+      fn();
+    }, delay);
+    timer.unref?.();
+    timerSet.add(timer);
+    return timer;
+  }
 
-    if (!this.cookie || this.cookie.length === 0) {
-      const msg = 'No cookie available — WSS will likely fail (401)';
-      console.error(`[proxy] ${msg}`);
-      self.emit('proxy-log', 'error', 'wss', msg);
-    }
+  _clearTimers(timerSet) {
+    for (const timer of timerSet) clearTimeout(timer);
+    timerSet.clear();
+  }
 
-    const ws = new WebSocket(this.wssUrl, {
+  _webSocketOptions() {
+    const wsOptions = {
       headers: {
         Cookie: this.cookie,
         Origin: PLATFORM.origin,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+          + 'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       },
-      rejectUnauthorized: false,
-      handshakeTimeout: WSS_HANDSHAKE_TIMEOUT,
-    });
+      rejectUnauthorized: true,
+      handshakeTimeout: this.wssHandshakeTimeoutMs,
+      maxPayload: this.maxWssPayloadBytes,
+    };
+    if (this.tlsCa !== undefined && this.tlsCa !== null) wsOptions.ca = this.tlsCa;
+    return wsOptions;
+  }
 
-    let closed = false;
-    let pingTimer = null;
-    let pongTimer = null;
-    let drainTimer = null;
+  _createWebSocket() {
+    return this._webSocketFactory(this.wssUrl, this._webSocketOptions());
+  }
 
-    // Create session record with client reference for targeted disconnect
-    const sessionId = ++_sessionIdCounter;
-    const session = new Session(sessionId, clientStr);
-    session._sshClient = client;
-    this._sessions.set(sessionId, session);
+  _closeWebSocket(ws) {
+    if (!ws) return;
+    if (ws.readyState === WS_CONNECTING) {
+      // terminate() aborts the HTTP/TLS handshake. Keep an error listener until
+      // the close event so the asynchronous abort error cannot become unhandled.
+      ws.once?.('error', () => {});
+      try {
+        ws.terminate();
+      } catch (_) {
+        try { ws.close(); } catch (_) {}
+      }
+      return;
+    }
+    if (ws.readyState === WS_OPEN) {
+      try { ws.close(1000); } catch (_) {}
+    }
+  }
+
+  _isAuthCloseCode(code) {
+    return AUTH_CLOSE_CODES.has(Number(code));
+  }
+
+  _openSession(remoteAddress, close) {
+    const session = new Session(++sessionIdCounter, remoteAddress);
+    session._close = close;
+    this._sessions.set(session.id, session);
     this.emit('session-open', this._sessionSnapshot(session));
     this._emitStats();
+    return session;
+  }
 
-    function startPingPong() {
-      pingTimer = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.ping();
-          pongTimer = setTimeout(() => {
-            console.log(`[proxy] Pong timeout for ${clientStr}`);
-            if (!closed) ws.terminate();
-          }, PING_TIMEOUT);
-        }
-      }, PING_INTERVAL);
+  _closeSessionRecord(session) {
+    if (!session || !this._sessions.has(session.id)) return;
+    this._sessions.delete(session.id);
+    this.emit('session-close', { sessionId: session.id });
+    this._emitStats();
+  }
+
+  _bridgeExecToWss(channel, _client, clientStr, command) {
+    const self = this;
+    const commandText = typeof command === 'string' ? command : '';
+    if (Buffer.byteLength(commandText, 'utf-8') > this.maxPendingBytes) {
+      try { channel.exit(EXEC_OUTPUT_LIMIT_EXIT_CODE); } catch (_) {}
+      try { channel.end(); } catch (_) {}
+      return;
     }
 
-    function stopTimers() {
-      if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
-      if (pongTimer) { clearTimeout(pongTimer); pongTimer = null; }
-      if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
+    let ws;
+    try {
+      ws = this._createWebSocket();
+    } catch (err) {
+      this.emit('proxy-log', 'error', 'wss', `WSS setup failed: ${err.message}`);
+      try { channel.exit(EXEC_ERROR_EXIT_CODE); } catch (_) {}
+      try { channel.end(); } catch (_) {}
+      return;
+    }
+
+    const timers = new Set();
+    const doneId = crypto.randomBytes(12).toString('hex');
+    const doneCommand = `echo DONE_${doneId} $?`;
+    const donePattern = new RegExp(`DONE_${doneId}\\s+(\\d{1,3})\\r?\\n`);
+    let outputText = '';
+    let outputBytes = 0;
+    let closed = false;
+    let done = false;
+    let drainListener = null;
+    let drainTimeout = null;
+    let session;
+
+    function cleanOutput() {
+      const doneCommandIndex = outputText.indexOf(doneCommand);
+      const doneOutputMatch = outputText.match(donePattern);
+      const doneOutputIndex = doneOutputMatch?.index ?? -1;
+      let cutoff = outputText.length;
+      if (doneCommandIndex >= 0) cutoff = Math.min(cutoff, doneCommandIndex);
+      if (doneOutputIndex >= 0) cutoff = Math.min(cutoff, doneOutputIndex);
+
+      let stripped = outputText.slice(0, cutoff);
+      stripped = stripped.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
+      stripped = stripped.replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, '');
+      stripped = stripped.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
+
+      const commandWithNewline = `${commandText}\r\n`;
+      const commandIndex = stripped.lastIndexOf(commandWithNewline);
+      if (commandIndex >= 0) {
+        stripped = stripped.slice(commandIndex + commandWithNewline.length);
+      }
+      stripped = stripped.replace(/[\w.\-]+@[\w.\-]+:[\w./~\- ]*[$#]\s*$/, '');
+      return stripped.replace(/^\s+/, '').replace(/\s+$/, '');
+    }
+
+    function detachChannelListeners() {
+      channel.removeListener('close', onChannelClose);
+      channel.removeListener('end', onChannelEnd);
+      if (drainListener) {
+        channel.removeListener('drain', drainListener);
+        drainListener = null;
+      }
+      if (drainTimeout) {
+        clearTimeout(drainTimeout);
+        drainTimeout = null;
+      }
     }
 
     function cleanup() {
       if (closed) return;
       closed = true;
+      self._clearTimers(timers);
+      detachChannelListeners();
+      self._closeSessionRecord(session);
+      self._closeWebSocket(ws);
+      try { if (!channel.closed) channel.close(); } catch (_) {}
+    }
+
+    function writeOutputAndClose(text, exitCode) {
+      const output = text ? Buffer.from(`${text}\n`) : Buffer.alloc(0);
+      let offset = 0;
+
+      function finishChannel() {
+        if (closed) return;
+        try { if (!channel.closed) channel.exit(exitCode); } catch (_) {}
+        try { if (!channel.closed) channel.end(); } catch (_) {}
+        self._schedule(timers, cleanup, 250);
+      }
+
+      function writeNext() {
+        if (closed) return;
+        while (offset < output.length) {
+          const end = Math.min(offset + EXEC_WRITE_CHUNK_BYTES, output.length);
+          const chunk = output.subarray(offset, end);
+          offset = end;
+          let writable = true;
+          try { writable = channel.write(chunk); } catch (_) { cleanup(); return; }
+          if (!writable) {
+            drainListener = () => {
+              drainListener = null;
+              if (drainTimeout) {
+                clearTimeout(drainTimeout);
+                drainTimeout = null;
+              }
+              writeNext();
+            };
+            channel.once('drain', drainListener);
+            drainTimeout = setTimeout(cleanup, self.shutdownTimeoutMs);
+            return;
+          }
+        }
+        finishChannel();
+      }
+
+      writeNext();
+    }
+
+    function finishExec(exitCode) {
+      if (done || closed) return;
+      done = true;
+      self._clearTimers(timers);
+      self._closeWebSocket(ws);
+      const normalizedExitCode = Number.isInteger(exitCode) && exitCode >= 0 && exitCode <= 255
+        ? exitCode
+        : EXEC_ERROR_EXIT_CODE;
+      self.emit('proxy-log', 'info', 'wss', `Exec completed with exit code ${normalizedExitCode}`);
+      writeOutputAndClose(cleanOutput(), normalizedExitCode);
+    }
+
+    function onChannelClose() { cleanup(); }
+    function onChannelEnd() { cleanup(); }
+
+    session = this._openSession(`${clientStr} [exec]`, () => {
+      if (!done && !closed) {
+        done = true;
+        try { if (!channel.closed) channel.exit(EXEC_DISCONNECTED_EXIT_CODE); } catch (_) {}
+      }
+      cleanup();
+    });
+
+    this.emit('proxy-log', 'info', 'wss', 'Connecting exec session');
+
+    ws.on('message', (data) => {
+      if (done || closed) return;
+      const result = parseServerMessage(data);
+      if (result.type === 'session_ended') {
+        finishExec(result.exitCode ?? EXEC_ERROR_EXIT_CODE);
+        return;
+      }
+      if (result.type !== 'data' || !result.payload) return;
+
+      const payloadBytes = Buffer.byteLength(result.payload, 'utf-8');
+      if (outputBytes + payloadBytes > self.maxExecOutputBytes) {
+        self.emit('proxy-log', 'warn', 'wss', 'Exec output limit exceeded');
+        finishExec(EXEC_OUTPUT_LIMIT_EXIT_CODE);
+        return;
+      }
+      outputBytes += payloadBytes;
+      outputText += result.payload;
+      session.bytesReceived += payloadBytes;
+      self._totalBytesReceived += payloadBytes;
+      self.emit('traffic', { sessionId: session.id, direction: 'received', bytes: payloadBytes });
+
+      const doneMatch = outputText.match(donePattern);
+      if (doneMatch) {
+        const parsedExitCode = Number.parseInt(doneMatch[1], 10);
+        finishExec(parsedExitCode <= 255 ? parsedExitCode : EXEC_ERROR_EXIT_CODE);
+      }
+    });
+
+    ws.on('open', () => {
+      if (closed || done) return;
+      self.emit('proxy-log', 'info', 'wss', 'WSS connected for exec session');
+      self._schedule(timers, () => finishExec(EXEC_TIMEOUT_EXIT_CODE), self.execTimeoutMs);
+      self._schedule(timers, () => {
+        if (closed || done || ws.readyState !== WS_OPEN) return;
+        const commandBuffer = Buffer.from(`${commandText}\n`, 'utf-8');
+        const markerBuffer = Buffer.from(`${doneCommand}\n`, 'utf-8');
+        const onSendError = (err) => { if (err) finishExec(EXEC_ERROR_EXIT_CODE); };
+        try {
+          ws.send(buildClientMessage(commandBuffer), onSendError);
+          ws.send(buildClientMessage(markerBuffer), onSendError);
+          session.bytesSent += commandBuffer.length;
+          self._totalBytesSent += commandBuffer.length;
+          self.emit('traffic', {
+            sessionId: session.id,
+            direction: 'sent',
+            bytes: commandBuffer.length,
+          });
+        } catch (_) {
+          finishExec(EXEC_ERROR_EXIT_CODE);
+        }
+      }, self.execInitialDelayMs);
+    });
+
+    ws.on('unexpected-response', (_req, res) => {
+      if (closed || done) return;
+      self.emit('proxy-log', 'error', 'wss', `WSS HTTP ${res.statusCode} for exec session`);
+      res.resume?.();
+      if (res.statusCode === 401 || res.statusCode === 403) {
+        self.emit('auth-error', { statusCode: res.statusCode, clientStr });
+      }
+      finishExec(EXEC_ERROR_EXIT_CODE);
+    });
+
+    ws.on('error', (err) => {
+      if (closed || done) return;
+      self.emit('proxy-log', 'error', 'wss', `WSS exec error: ${err.message}`);
+      finishExec(EXEC_ERROR_EXIT_CODE);
+    });
+
+    ws.on('close', (code) => {
+      if (closed || done) return;
+      if (self._isAuthCloseCode(code)) {
+        self.emit('auth-error', { statusCode: code, clientStr });
+      }
+      finishExec(EXEC_ERROR_EXIT_CODE);
+    });
+
+    channel.on('close', onChannelClose);
+    channel.on('end', onChannelEnd);
+  }
+
+  _bridgeSshToWss(channel, _client, clientStr) {
+    const self = this;
+    let ws;
+    try {
+      ws = this._createWebSocket();
+    } catch (err) {
+      this.emit('proxy-log', 'error', 'wss', `WSS setup failed: ${err.message}`);
+      try { channel.exit(EXEC_ERROR_EXIT_CODE); } catch (_) {}
+      try { channel.close(); } catch (_) {}
+      return;
+    }
+
+    const timers = new Set();
+    let pingTimer = null;
+    let pongTimer = null;
+    let ctrlDTimer = null;
+    let backpressureTimer = null;
+    let backpressureDeadlineTimer = null;
+    let channelDrainListener = null;
+    let closed = false;
+    let wssReady = false;
+    let channelPaused = false;
+    let pendingBytes = 0;
+    const pendingData = [];
+    let session;
+
+    function pauseChannel() {
+      if (channelPaused) return;
+      channelPaused = true;
+      try { channel.pause?.(); } catch (_) {}
+    }
+
+    function resumeChannel() {
+      if (!channelPaused || closed) return;
+      channelPaused = false;
+      try { channel.resume?.(); } catch (_) {}
+    }
+
+    function stopTimers() {
+      self._clearTimers(timers);
+      if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+      if (pongTimer) { clearTimeout(pongTimer); pongTimer = null; }
+      if (ctrlDTimer) { clearTimeout(ctrlDTimer); ctrlDTimer = null; }
+      if (backpressureTimer) { clearTimeout(backpressureTimer); backpressureTimer = null; }
+      if (backpressureDeadlineTimer) {
+        clearTimeout(backpressureDeadlineTimer);
+        backpressureDeadlineTimer = null;
+      }
+    }
+
+    function detachChannelListeners() {
+      channel.removeListener('data', onChannelData);
+      channel.removeListener('close', onChannelClose);
+      channel.removeListener('end', onChannelEnd);
+      if (channelDrainListener) {
+        channel.removeListener('drain', channelDrainListener);
+        channelDrainListener = null;
+      }
+    }
+
+    function cleanup(exitCode = 0) {
+      if (closed) return;
+      closed = true;
       stopTimers();
-
-      // Track traffic before cleanup
-      if (self._sessions.has(sessionId)) {
-        self._sessions.delete(sessionId);
-        self.emit('session-close', { sessionId });
-        self._emitStats();
-      }
-
-      // Clean up all listeners to prevent leaks
-      ws.removeAllListeners();
-      channel.removeAllListeners();
-
-      // Close WSS safely — skip entirely if still connecting to avoid
-      // ws library throwing async errors that bypass try-catch.
-      if (ws.readyState === WebSocket.OPEN) {
-        try { ws.close(1000); } catch (_) {}
-      }
-      // If still CONNECTING, just let the socket timeout naturally.
-      // Do NOT call ws._socket.destroy() or ws.terminate() — both
-      // throw uncatchable async errors during CONNECTING state.
-
-      // Send exit-status before closing channel so SSH client knows the session ended
+      detachChannelListeners();
+      pendingData.length = 0;
+      pendingBytes = 0;
+      self._closeSessionRecord(session);
+      self._closeWebSocket(ws);
       try {
         if (!channel.closed) {
-          channel.exit(0);
+          channel.exit(exitCode);
           channel.close();
         }
       } catch (_) {}
-      try { client.end(); } catch (_) {}
     }
 
-    // WebSocket → SSH channel
+    session = this._openSession(clientStr, () => cleanup(EXEC_DISCONNECTED_EXIT_CODE));
+    this.emit('proxy-log', 'info', 'wss', 'Connecting interactive session');
+
+    function startPingPong() {
+      pingTimer = setInterval(() => {
+        if (closed || ws.readyState !== WS_OPEN) return;
+        if (pongTimer) clearTimeout(pongTimer);
+        try { ws.ping(); } catch (_) { cleanup(EXEC_ERROR_EXIT_CODE); return; }
+        pongTimer = setTimeout(() => {
+          pongTimer = null;
+          if (!closed) {
+            try { ws.terminate(); } catch (_) {}
+          }
+        }, self.pingTimeoutMs);
+        pongTimer.unref?.();
+      }, self.pingIntervalMs);
+      pingTimer.unref?.();
+    }
+
+    function scheduleBackpressureFlush() {
+      if (backpressureTimer || closed) return;
+      if (!backpressureDeadlineTimer) {
+        backpressureDeadlineTimer = setTimeout(() => {
+          backpressureDeadlineTimer = null;
+          if (!closed) cleanup(EXEC_ERROR_EXIT_CODE);
+        }, self.wssHandshakeTimeoutMs);
+        backpressureDeadlineTimer.unref?.();
+      }
+      backpressureTimer = setTimeout(() => {
+        backpressureTimer = null;
+        flushPending();
+      }, self.backpressurePollMs);
+      backpressureTimer.unref?.();
+    }
+
+    function sendBuffer(buf) {
+      if (closed || ws.readyState !== WS_OPEN) return false;
+      let message;
+      try { message = buildClientMessage(buf); } catch (_) { cleanup(EXEC_ERROR_EXIT_CODE); return false; }
+      const messageBytes = Buffer.byteLength(message);
+      if (messageBytes > self.maxWsBufferedBytes) {
+        self.emit('proxy-log', 'warn', 'wss', 'SSH input frame exceeds WSS buffer limit');
+        cleanup(EXEC_ERROR_EXIT_CODE);
+        return false;
+      }
+      if ((ws.bufferedAmount || 0) + messageBytes > self.maxWsBufferedBytes) {
+        return false;
+      }
+      try {
+        ws.send(message, (err) => { if (err && !closed) cleanup(EXEC_ERROR_EXIT_CODE); });
+      } catch (_) {
+        cleanup(EXEC_ERROR_EXIT_CODE);
+        return false;
+      }
+      session.bytesSent += buf.length;
+      self._totalBytesSent += buf.length;
+      self.emit('traffic', { sessionId: session.id, direction: 'sent', bytes: buf.length });
+      return true;
+    }
+
+    function flushPending() {
+      if (closed || !wssReady || ws.readyState !== WS_OPEN) return;
+      while (pendingData.length > 0) {
+        const next = pendingData[0];
+        if (!sendBuffer(next)) {
+          pauseChannel();
+          scheduleBackpressureFlush();
+          return;
+        }
+        pendingData.shift();
+        pendingBytes -= next.length;
+      }
+      if (backpressureDeadlineTimer) {
+        clearTimeout(backpressureDeadlineTimer);
+        backpressureDeadlineTimer = null;
+      }
+      resumeChannel();
+    }
+
+    function enqueueData(data) {
+      const buf = Buffer.from(data);
+      if (pendingBytes + buf.length > self.maxPendingBytes) {
+        self.emit('proxy-log', 'warn', 'wss', 'SSH input buffer limit exceeded');
+        cleanup(EXEC_ERROR_EXIT_CODE);
+        return false;
+      }
+      pendingData.push(buf);
+      pendingBytes += buf.length;
+      return true;
+    }
+
+    function onChannelData(data) {
+      if (closed || !enqueueData(data)) return;
+      if (!wssReady) pauseChannel();
+      flushPending();
+
+      if (!closed && data.length === 1 && data[0] === 0x04) {
+        if (ctrlDTimer) clearTimeout(ctrlDTimer);
+        ctrlDTimer = setTimeout(() => {
+          ctrlDTimer = null;
+          if (!closed && ws.readyState === WS_OPEN) {
+            try { ws.close(1000); } catch (_) {}
+          }
+        }, self.ctrlDDrainMs);
+        ctrlDTimer.unref?.();
+      }
+    }
+
+    function onChannelClose() { cleanup(0); }
+    function onChannelEnd() { cleanup(0); }
+
     ws.on('message', (data) => {
+      if (closed) return;
       const result = parseServerMessage(data);
       if (result.type === 'session_ended') {
-        console.log(`[proxy] Session ended for ${clientStr}`);
-        cleanup();
+        cleanup(result.exitCode ?? 0);
         return;
       }
-      if ((result.type === 'data' || result.type === 'raw_text') && result.payload) {
-        if (!channel.closed) {
-          const buf = Buffer.from(result.payload);
-          channel.write(buf);
-          // Track bytes
-          session.bytesReceived += buf.length;
-          self._totalBytesReceived += buf.length;
-          self.emit('traffic', { sessionId, direction: 'received', bytes: buf.length });
+      if ((result.type !== 'data' && result.type !== 'raw_text') || !result.payload) return;
 
-          // Detect shell exit: "logout" followed by end of stream
-          // When user types `exit`, the shell sends `logout` then the WSS should close.
-          // If WSS doesn't close within 2s, force cleanup to unblock the SSH client.
-          if (/\blogout\b/.test(result.payload)) {
-            self.emit('proxy-log', 'info', 'wss', `Detected 'logout' for ${clientStr}`);
-            if (!closed) {
-              setTimeout(() => {
-                if (!closed && ws.readyState === WebSocket.OPEN) {
-                  self.emit('proxy-log', 'info', 'wss', `Closing WSS after logout for ${clientStr}`);
-                  ws.close(1000);
-                }
-              }, 2000);
-            }
+      const buf = Buffer.from(result.payload);
+      if (channel.closed) return;
+      let writable = true;
+      try { writable = channel.write(buf); } catch (_) { cleanup(EXEC_ERROR_EXIT_CODE); return; }
+      session.bytesReceived += buf.length;
+      self._totalBytesReceived += buf.length;
+      self.emit('traffic', { sessionId: session.id, direction: 'received', bytes: buf.length });
+
+      if (!writable && !channelDrainListener) {
+        try { ws.pause?.(); } catch (_) {}
+        channelDrainListener = () => {
+          channelDrainListener = null;
+          if (!closed) {
+            try { ws.resume?.(); } catch (_) {}
           }
-        }
+        };
+        channel.once('drain', channelDrainListener);
       }
     });
 
@@ -452,229 +768,225 @@ class ProxyServer extends EventEmitter {
       if (pongTimer) { clearTimeout(pongTimer); pongTimer = null; }
     });
 
-    // SSH channel → WebSocket
-    // Register data handler immediately (not inside ws.on('open')) so exec
-    // commands that arrive before WSS connects are not lost.
-    let wssReady = false;
-    const pendingData = [];
-
-    function sendToWss(data) {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(buildClientMessage(data));
-        session.bytesSent += data.length;
-        self._totalBytesSent += data.length;
-        self.emit('traffic', { sessionId, direction: 'sent', bytes: data.length });
-
-        // Only treat 0x04 as Ctrl+D when it's a lone byte
-        if (!closed && data.length === 1 && data[0] === 0x04) {
-          console.log(`[proxy] Ctrl+D detected for ${clientStr}`);
-          if (drainTimer) clearTimeout(drainTimer);
-          drainTimer = setTimeout(() => {
-            if (!closed && ws.readyState === WebSocket.OPEN) {
-              console.log(`[proxy] Proactively closing WSS for ${clientStr}`);
-              ws.close(1000);
-            }
-          }, CTRL_D_DRAIN_MS);
-        }
-      }
-    }
-
-    channel.on('data', (data) => {
-      if (wssReady) {
-        sendToWss(data);
-      } else {
-        pendingData.push(data);
-      }
-    });
-
     ws.on('open', () => {
-      const msg = `WSS connected for ${clientStr}`;
-      console.log(`[proxy] ${msg}`);
-      self.emit('proxy-log', 'info', 'wss', msg);
+      if (closed) return;
+      self.emit('proxy-log', 'info', 'wss', 'WSS connected for interactive session');
       wssReady = true;
       startPingPong();
-      // Flush any data that arrived before WSS was ready (e.g. exec command)
-      for (const buf of pendingData) {
-        sendToWss(buf);
-      }
-      pendingData.length = 0;
+      flushPending();
     });
 
     ws.on('unexpected-response', (_req, res) => {
-      const msg = `WSS HTTP ${res.statusCode} for ${clientStr}`;
-      console.error(`[proxy] ${msg}`);
-      self.emit('proxy-log', 'error', 'wss', msg);
-      // Log response headers for debugging
-      console.error(`[proxy] WSS response headers:`, JSON.stringify(res.headers));
-      self.emit('proxy-log', 'debug', 'wss', `Response headers: ${JSON.stringify(res.headers)}`);
-      let body = '';
-      res.on('data', (chunk) => { body += chunk.toString(); });
-      res.on('end', () => {
-        if (body) {
-          console.error(`[proxy] WSS response body: ${body.slice(0, 500)}`);
-          self.emit('proxy-log', 'error', 'wss', `Response body: ${body.slice(0, 300)}`);
-        }
-      });
+      if (closed) return;
+      self.emit('proxy-log', 'error', 'wss', `WSS HTTP ${res.statusCode} for interactive session`);
+      res.resume?.();
       if (res.statusCode === 401 || res.statusCode === 403) {
         self.emit('auth-error', { statusCode: res.statusCode, clientStr });
       }
-      cleanup();
+      cleanup(EXEC_ERROR_EXIT_CODE);
     });
 
     ws.on('error', (err) => {
-      const msg = `WSS error for ${clientStr}: ${err.message}`;
-      console.error(`[proxy] ${msg}`);
-      self.emit('proxy-log', 'error', 'wss', msg);
-      cleanup();
+      if (closed) return;
+      self.emit('proxy-log', 'error', 'wss', `WSS interactive error: ${err.message}`);
+      cleanup(EXEC_ERROR_EXIT_CODE);
     });
 
-    ws.on('close', (code, reason) => {
-      const msg = `WSS closed for ${clientStr}: code=${code} reason=${reason?.toString() || 'none'}`;
-      console.log(`[proxy] ${msg}`);
-      self.emit('proxy-log', 'info', 'wss', msg);
-      if (AUTH_CLOSE_CODES.has(code)) {
+    ws.on('close', (code) => {
+      if (closed) return;
+      if (self._isAuthCloseCode(code)) {
         self.emit('auth-error', { statusCode: code, clientStr });
       }
-      cleanup();
+      cleanup(code === 1000 ? 0 : EXEC_ERROR_EXIT_CODE);
     });
 
-    channel.on('close', () => {
-      console.log(`[proxy] SSH channel closed for ${clientStr}`);
-      cleanup();
-    });
+    channel.on('data', onChannelData);
+    channel.on('close', onChannelClose);
+    channel.on('end', onChannelEnd);
+  }
 
-    channel.on('end', () => cleanup());
+  _rawClientKey(ctx) {
+    if (ctx.key?.algo !== 'ssh-ed25519') return null;
+    return extractEd25519RawKey(ctx.key.data);
+  }
+
+  _verifyClientSignature(ctx) {
+    if (!Buffer.isBuffer(ctx.blob) || !Buffer.isBuffer(ctx.signature)) return false;
+    const verify = (signature) => (
+      this._parsedPubKey.verify(ctx.blob, signature, ctx.hashAlgo) === true
+    );
+
+    try {
+      if (verify(ctx.signature)) return true;
+      if (ctx.signature.length <= 64) return false;
+
+      const algorithmLength = ctx.signature.readUInt32BE(0);
+      const algorithmEnd = 4 + algorithmLength;
+      if (algorithmEnd + 4 > ctx.signature.length) return false;
+      const algorithm = ctx.signature.subarray(4, algorithmEnd).toString('ascii');
+      if (algorithm !== 'ssh-ed25519') return false;
+      const signatureLengthOffset = 4 + algorithmLength;
+      const signatureLength = ctx.signature.readUInt32BE(signatureLengthOffset);
+      const signatureStart = signatureLengthOffset + 4;
+      const signatureEnd = signatureStart + signatureLength;
+      if (signatureLength !== 64 || signatureEnd !== ctx.signature.length) return false;
+      return verify(ctx.signature.subarray(signatureStart, signatureEnd));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  _markSshHandshakeComplete(socket) {
+    const meta = socket && this._sockets.get(socket);
+    if (!meta?.handshakeTimer) return;
+    clearTimeout(meta.handshakeTimer);
+    meta.handshakeTimer = null;
   }
 
   _onSshClient(client) {
     this._clients.add(client);
+    const clientChannels = new Set();
+    const clientChannelCleanups = new Map();
     this.emit('connection', this._clients.size);
-    const addr = (client._sock && `${client._sock.remoteAddress}:${client._sock.remotePort}`) || 'unknown';
-    console.log(`[proxy] SSH client connected: ${addr}`);
+    const addr = (client._sock && `${client._sock.remoteAddress}:${client._sock.remotePort}`)
+      || 'unknown';
     this.emit('proxy-log', 'info', 'ssh', `Client connected: ${addr}`);
 
     client.on('authentication', (ctx) => {
-      if (ctx.method === 'publickey') {
-        // Step 1: No signature yet — client probing if key is acceptable
-        if (!ctx.signature) {
-          if (!this.authorizedKey) {
-            // No key configured — accept any key
-            ctx.accept();
-            return;
-          }
-          // Check if client key matches authorized key
-          const clientKeyBlob = ctx.key.data;
-          let rawClientKey;
-          if (ctx.key.algo === 'ssh-ed25519' && clientKeyBlob.length > 32) {
-            rawClientKey = clientKeyBlob.subarray(clientKeyBlob.length - 32);
-          } else {
-            rawClientKey = clientKeyBlob;
-          }
-          if (rawClientKey.equals(this.authorizedKey)) {
-            ctx.accept(); // Key matches — tell client to sign
-          } else {
-            this.emit('proxy-log', 'warn', 'ssh', `Auth publickey rejected — key not authorized`);
-            ctx.reject();
-          }
-          return;
-        }
-        // Step 2: Signature present — verify the client owns the private key
-        if (!this._parsedPubKey) {
-          // No parsed key — accept (shouldn't happen)
-          ctx.accept();
-          return;
-        }
-        try {
-          // Try verifying with ctx.signature directly (may be raw or SSH wire format)
-          let ok = this._parsedPubKey.verify(ctx.blob, ctx.signature);
-          if (!ok) {
-            // Maybe ctx.signature is SSH wire format — try extracting raw sig
-            // SSH wire: [4 algoLen][algo][4 sigLen][rawSig]
-            const sigBuf = ctx.signature;
-            if (sigBuf.length > 64) {
-              try {
-                const algoLen = sigBuf.readUInt32BE(0);
-                const sigLen = sigBuf.readUInt32BE(4 + algoLen);
-                const rawSig = sigBuf.subarray(8 + algoLen, 8 + algoLen + sigLen);
-                ok = this._parsedPubKey.verify(ctx.blob, rawSig);
-              } catch (_) {}
-            }
-          }
-          if (ok) {
-            console.log(`[proxy] SSH auth: publickey accepted (signature verified)`);
-            this.emit('proxy-log', 'info', 'ssh', `Auth publickey accepted — signature verified`);
-            ctx.accept();
-          } else {
-            console.log(`[proxy] SSH auth: publickey rejected (bad signature)`);
-            this.emit('proxy-log', 'warn', 'ssh', `Auth publickey rejected — bad signature`);
-            ctx.reject();
-          }
-        } catch (err) {
-          console.log(`[proxy] SSH auth: verify error: ${err.message}`);
-          this.emit('proxy-log', 'error', 'ssh', `Auth verify error: ${err.message}`);
-          ctx.reject();
-        }
-      } else {
-        // Reject non-publickey methods
-        console.log(`[proxy] SSH auth: ${ctx.method} rejected — publickey required`);
-        this.emit('proxy-log', 'info', 'ssh', `Auth ${ctx.method} rejected — publickey required`);
+      if (ctx.method !== 'publickey') {
         ctx.reject(['publickey']);
+        return;
+      }
+      if (!this._authConfigValid) {
+        ctx.reject();
+        return;
+      }
+
+      const clientKey = this._rawClientKey(ctx);
+      if (!clientKey || clientKey.length !== this.authorizedKey.length
+          || !crypto.timingSafeEqual(clientKey, this.authorizedKey)) {
+        ctx.reject();
+        return;
+      }
+
+      if (!ctx.signature) {
+        ctx.accept();
+        return;
+      }
+      if (this._verifyClientSignature(ctx)) {
+        this.emit('proxy-log', 'info', 'ssh', 'Public key authentication accepted');
+        ctx.accept();
+      } else {
+        ctx.reject();
       }
     });
 
     client.on('ready', () => {
-      console.log(`[proxy] SSH client ready: ${addr}`);
+      this._markSshHandshakeComplete(client._sock);
       this.emit('proxy-log', 'info', 'ssh', `Client ready: ${addr}`);
 
-      client.on('session', (acceptSession) => {
-        const session = acceptSession();
-        console.log(`[proxy] SSH session opened: ${addr}`);
-        this.emit('proxy-log', 'info', 'ssh', `Session opened: ${addr}`);
+      client.on('session', (acceptSession, rejectSession) => {
+        if (this._sshChannels.size >= this.maxSessions) {
+          rejectSession?.();
+          return;
+        }
 
-        session.on('pty', (acceptPty, _rejectPty, info) => {
-          console.log(`[proxy] PTY: ${info.term} ${info.cols}x${info.rows}`);
-          this.emit('proxy-log', 'info', 'ssh', `PTY: ${info.term} ${info.cols}x${info.rows}`);
-          if (acceptPty) acceptPty();
+        const sshSession = acceptSession();
+        let bridgeStarted = false;
+        this._sshChannels.add(sshSession);
+        clientChannels.add(sshSession);
+        const removeSshChannel = () => {
+          this._sshChannels.delete(sshSession);
+          clientChannels.delete(sshSession);
+          clientChannelCleanups.delete(sshSession);
+          sshSession.removeListener('close', removeSshChannel);
+          sshSession.removeListener('error', removeSshChannel);
+        };
+        clientChannelCleanups.set(sshSession, removeSshChannel);
+        sshSession.once('close', removeSshChannel);
+        sshSession.once('error', removeSshChannel);
+
+        sshSession.on('pty', (acceptPty) => {
+          this.emit('proxy-log', 'info', 'ssh', 'PTY requested');
+          acceptPty?.();
         });
 
-        session.on('shell', (acceptShell) => {
-          console.log(`[proxy] Shell requested: ${addr}`);
-          this.emit('proxy-log', 'info', 'ssh', `Shell requested: ${addr} — starting WSS bridge`);
+        sshSession.on('shell', (acceptShell, rejectShell) => {
+          if (bridgeStarted || this._sessions.size >= this.maxSessions) {
+            rejectShell?.();
+            return;
+          }
+          bridgeStarted = true;
           const channel = acceptShell();
           this._bridgeSshToWss(channel, client, addr);
         });
 
-        session.on('exec', (acceptExec, _rejectExec, info) => {
-          console.log(`[proxy] Exec: ${info.command}`);
-          this.emit('proxy-log', 'info', 'ssh', `Exec: ${info.command}`);
+        sshSession.on('exec', (acceptExec, rejectExec, info) => {
+          if (bridgeStarted || this._sessions.size >= this.maxSessions) {
+            rejectExec?.();
+            return;
+          }
+          bridgeStarted = true;
           const channel = acceptExec();
           this._bridgeExecToWss(channel, client, addr, info.command);
         });
 
-        session.on('env', (acceptEnv) => {
-          if (acceptEnv) acceptEnv();
-        });
-
-        session.on('window-change', (accept) => {
-          if (accept) accept();
-        });
+        sshSession.on('env', (acceptEnv) => acceptEnv?.());
+        sshSession.on('window-change', (accept) => accept?.());
       });
     });
 
     client.on('close', () => {
-      console.log(`[proxy] SSH client disconnected: ${addr}`);
-      this.emit('proxy-log', 'info', 'ssh', `Client disconnected: ${addr}`);
+      for (const cleanup of [...clientChannelCleanups.values()]) cleanup();
       this._clients.delete(client);
       this.emit('connection', this._clients.size);
+      this.emit('proxy-log', 'info', 'ssh', `Client disconnected: ${addr}`);
     });
 
     client.on('error', (err) => {
-      console.error(`[proxy] SSH client error: ${err.message}`);
       this.emit('proxy-log', 'error', 'ssh', `Client error: ${err.message}`);
     });
   }
 
-  // ---- Session management ----
+  _trackTcpSocket(socket) {
+    if (this._sockets.size >= this.maxConnections) {
+      socket.destroy();
+      return false;
+    }
+
+    const meta = { handshakeTimer: null, onTimeout: null };
+    this._sockets.set(socket, meta);
+
+    const cleanup = () => {
+      if (meta.handshakeTimer) clearTimeout(meta.handshakeTimer);
+      if (meta.onTimeout) socket.removeListener('timeout', meta.onTimeout);
+      this._sockets.delete(socket);
+    };
+    socket.once('close', cleanup);
+    socket.once('error', () => {});
+
+    meta.handshakeTimer = setTimeout(() => {
+      meta.handshakeTimer = null;
+      socket.destroy();
+    }, this.sshHandshakeTimeoutMs);
+    meta.handshakeTimer.unref?.();
+
+    meta.onTimeout = () => socket.destroy();
+    socket.setTimeout?.(this.socketIdleTimeoutMs);
+    socket.on('timeout', meta.onTimeout);
+    socket.setNoDelay?.(true);
+    return true;
+  }
+
+  _handleTcpSocket(socket) {
+    if (!this._trackTcpSocket(socket)) return;
+    try {
+      this._sshServer.injectSocket(socket);
+    } catch (err) {
+      this.emit('proxy-log', 'error', 'proxy', `SSH socket setup failed: ${err.message}`);
+      socket.destroy();
+    }
+  }
 
   _sessionSnapshot(session) {
     return {
@@ -691,11 +1003,7 @@ class ProxyServer extends EventEmitter {
   }
 
   getSessions() {
-    const sessions = [];
-    for (const s of this._sessions.values()) {
-      sessions.push(this._sessionSnapshot(s));
-    }
-    return sessions;
+    return Array.from(this._sessions.values(), (session) => this._sessionSnapshot(session));
   }
 
   getStats() {
@@ -710,102 +1018,245 @@ class ProxyServer extends EventEmitter {
 
   disconnectSession(sessionId) {
     const session = this._sessions.get(sessionId);
-    if (!session) return false;
-
-    // Target only the specific session's SSH client
-    if (session._sshClient) {
-      try { session._sshClient.end(); } catch (_) {}
-    }
+    if (!session || typeof session._close !== 'function') return false;
+    session._close();
     return true;
   }
 
-  // ---- Start / Stop ----
+  _cancelPendingStart() {
+    if (this._startRequest) this._startRequest.cancelled = true;
+    try { this._listenAbortController?.abort(); } catch (_) {}
+    if (this._server && !this._started) {
+      try { this._server.close(() => {}); } catch (_) {}
+    }
+  }
 
   start() {
-    // Prevent concurrent starts — _started is set async in listen callback
-    if (this._started || this._starting) return Promise.resolve();
+    if (this._started && !this._stopPromise) return Promise.resolve(true);
+    if (this._startPromise && !this._startRequest?.cancelled) return this._startPromise;
+
+    const request = { cancelled: false };
+    const pendingStop = this._stopPromise;
+    this._startRequest = request;
+    const operation = this._enqueueLifecycle(async () => {
+      if (pendingStop) await pendingStop;
+      return this._doStart(request);
+    });
+    const result = operation.finally(() => {
+      if (this._startRequest === request) this._startRequest = null;
+      if (this._startPromise === result) this._startPromise = null;
+    });
+    this._startPromise = result;
+    return result;
+  }
+
+  async _doStart(request) {
+    if (request.cancelled) return false;
+    if (this._started) return true;
+    if (this._server || this._sshServer) {
+      const error = new Error('Previous proxy server has not stopped cleanly');
+      error.code = 'ERR_PROXY_SERVER_NOT_STOPPED';
+      this.emit('proxy-log', 'error', 'proxy', error.message);
+      this._emitError(error);
+      throw error;
+    }
     this._starting = true;
 
-    return new Promise((resolve, reject) => {
-      if (this._started) { this._starting = false; return resolve(); }
+    if (!this._authConfigValid) {
+      this._starting = false;
+      const error = new Error('Authorized SSH key is unavailable or invalid');
+      this.emit('proxy-log', 'error', 'ssh', error.message);
+      this._emitError(error);
+      throw error;
+    }
 
-      const hostKey = ProxyServer._ensureHostKey();
-
-      this._sshServer = new SSHServer(
+    let sshServer;
+    let server;
+    try {
+      const hostKey = this._hostKey || ProxyServer._ensureHostKey();
+      sshServer = new this._SSHServer(
         { hostKeys: [hostKey] },
         (client) => this._onSshClient(client)
       );
+      sshServer.on?.('error', (err) => this._emitError(err));
+      sshServer.maxConnections = this.maxConnections;
+      server = this._net.createServer(
+        { allowHalfOpen: false },
+        (socket) => this._handleTcpSocket(socket)
+      );
+    } catch (err) {
+      this._starting = false;
+      this._emitError(err);
+      throw err;
+    }
+    this._sshServer = sshServer;
+    this._server = server;
+    this._listenAbortController = new AbortController();
 
-      this._server = net.createServer({ allowHalfOpen: false }, (socket) => {
+    let listening = false;
+    try {
+      listening = await new Promise((resolve, reject) => {
+        let settled = false;
+        const settle = (fn, value) => {
+          if (settled) return;
+          settled = true;
+          fn(value);
+        };
+
+        server.on('error', (err) => {
+          if (this._started) {
+            this._emitError(err);
+            return;
+          }
+          if (request.cancelled || err.name === 'AbortError' || err.code === 'ABORT_ERR') {
+            settle(resolve, false);
+            return;
+          }
+          this._emitError(err);
+          settle(reject, err);
+        });
+
+        server.once('close', () => {
+          if (this._server === server) this._started = false;
+          if (!settled) {
+            if (request.cancelled) settle(resolve, false);
+            else settle(reject, new Error('Server closed before listening'));
+          }
+        });
+
         try {
-          this._sshServer.injectSocket(socket);
-        } catch (e) {
-          console.error('[proxy] injectSocket failed:', e.message);
-          socket.destroy();
+          server.listen({
+            port: this.port,
+            host: this.host,
+            signal: this._listenAbortController.signal,
+          }, () => {
+            if (request.cancelled) {
+              try { server.close(() => {}); } catch (_) {}
+              return;
+            }
+            this._started = true;
+            this._startTime = Date.now();
+            this.emit('started', { host: this.host, port: this.port });
+            settle(resolve, true);
+          });
+        } catch (err) {
+          this._emitError(err);
+          settle(reject, err);
         }
       });
+    } catch (err) {
+      await this._closeTcpServer(server);
+      if (this._server === server) this._server = null;
+      if (this._sshServer === sshServer) this._sshServer = null;
+      throw err;
+    } finally {
+      this._starting = false;
+      this._listenAbortController = null;
+    }
 
-      this._server.on('error', (err) => {
-        console.error('[proxy] TCP server error:', err.message);
-        if (err.code === 'EADDRINUSE')
-          console.error(`[proxy] Port ${this.port} in use: lsof -i :${this.port}`);
-        this.emit('error', err);
-        if (!this._started) { this._starting = false; reject(err); }
-      });
-
-      // Reject if server closes before listening (e.g. stop() called during start)
-      this._server.once('close', () => {
-        if (!this._started) { this._starting = false; reject(new Error('Server closed before listening')); }
-      });
-
-      this._server.listen(this.port, this.host, () => {
-        this._started = true;
-        this._starting = false;
-        this._startTime = Date.now();
-        this._server.removeAllListeners('close'); // clean up the guard
-        console.log(`[proxy] Listening on ${this.host}:${this.port}`);
-        this.emit('started', { host: this.host, port: this.port });
-        resolve();
-      });
-    });
+    if (!listening) {
+      await this._closeTcpServer(server);
+      if (this._server === server) this._server = null;
+      if (this._sshServer === sshServer) this._sshServer = null;
+    }
+    return listening;
   }
 
   stop() {
-    return new Promise((resolve) => {
-      if (!this._started) return resolve();
+    this._cancelPendingStart();
+    if (this._stopPromise) return this._stopPromise;
 
+    const wasActive = this._started || this._starting || !!this._server || !!this._startPromise;
+    if (!wasActive) return Promise.resolve();
+
+    const operation = this._enqueueLifecycle(() => this._doStop(wasActive));
+    const result = operation.finally(() => {
+      if (this._stopPromise === result) this._stopPromise = null;
+    });
+    this._stopPromise = result;
+    return result;
+  }
+
+  async _closeTcpServer(server) {
+    if (!server) return;
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      let timeout;
+      const settle = (error) => {
+        if (settled) return;
+        settled = true;
+        if (timeout) clearTimeout(timeout);
+        server.removeListener('close', onClose);
+        if (error) reject(error);
+        else resolve();
+      };
+      const onClose = () => settle();
+
+      server.once('close', onClose);
+      try {
+        server.close((error) => {
+          if (error?.code === 'ERR_SERVER_NOT_RUNNING') settle();
+          else settle(error);
+        });
+      } catch (err) {
+        if (err.code === 'ERR_SERVER_NOT_RUNNING') settle();
+        else settle(err);
+      }
+      if (!settled) {
+        timeout = setTimeout(() => {
+          if (settled) return;
+          const error = new Error(
+            `TCP server did not close within ${this.shutdownTimeoutMs}ms`
+          );
+          error.code = 'ERR_PROXY_SERVER_CLOSE_TIMEOUT';
+
+          settled = true;
+          server.removeListener('close', onClose);
+          try { server.closeAllConnections?.(); } catch (_) {}
+          for (const socket of this._sockets.keys()) {
+            try { socket.destroy(); } catch (_) {}
+          }
+          this._emitError(error);
+          reject(error);
+        }, this.shutdownTimeoutMs);
+      }
+    });
+  }
+
+  async _doStop(emitStopped) {
+    this._stopping = true;
+    this._started = false;
+    this._startTime = null;
+    try {
+      for (const session of Array.from(this._sessions.values())) {
+        try { session._close?.(); } catch (_) {}
+      }
       for (const client of this._clients) {
         try { client.end(); } catch (_) {}
       }
       this._clients.clear();
-      // Emit session-close for each active session BEFORE clearing the map
-      for (const sessionId of this._sessions.keys()) {
-        this.emit('session-close', { sessionId });
+      for (const socket of this._sockets.keys()) {
+        try { socket.destroy(); } catch (_) {}
       }
+
+      const server = this._server;
+      await this._closeTcpServer(server);
+
       this._sessions.clear();
-      this._startTime = null;
+      this._sockets.clear();
+      this._sshChannels.clear();
+      this._server = null;
+      this._sshServer = null;
       this._totalBytesSent = 0;
       this._totalBytesReceived = 0;
-
-      if (this._server) {
-        this._server.close(() => {
-          this._started = false;
-          this._sshServer = null;
-          console.log('[proxy] Server stopped');
-          this.emit('stopped');
-          resolve();
-        });
-      } else {
-        this._started = false;
-        this.emit('stopped');
-        resolve();
-      }
-    });
+      if (emitStopped) this.emit('stopped');
+    } finally {
+      this._stopping = false;
+    }
   }
 
   updateCookie(cookieString) {
-    this.cookie = cookieString;
-    console.log('[proxy] Cookie updated');
+    this.cookie = validateCookie(cookieString);
   }
 }
 
