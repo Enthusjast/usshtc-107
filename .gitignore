@@ -4,6 +4,7 @@ node_modules/
 # Build output
 dist/
 release/
+coverage/
 
 # IDE / Editors
 .vscode/
@@ -46,3 +47,4 @@ build/icon.icns
 # Temporary files
 *.tmp
 *.temp
+.gstack/
