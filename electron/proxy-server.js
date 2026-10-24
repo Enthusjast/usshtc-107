@@ -1,5 +1,8 @@
 const crypto = require('crypto');
 const net = require('net');
+const os = require('node:os');
+const path = require('node:path');
+const { ensureProxyHostKey } = require('./ssh-key-service');
 const { Server: SSHServer, utils: sshUtils } = require('ssh2');
 const { WebSocket } = require('ws');
 const { EventEmitter } = require('events');
@@ -140,12 +143,20 @@ class ProxyServer extends EventEmitter {
     this._webSocketFactory = options.webSocketFactory
       || ((url, wsOptions) => new WebSocket(url, wsOptions));
     this._hostKey = options.hostKey || null;
+    const configHome = process.platform === 'win32'
+      ? (process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'))
+      : process.platform === 'darwin' ? path.join(os.homedir(), 'Library', 'Application Support')
+        : (process.env.XDG_CONFIG_HOME && path.isAbsolute(process.env.XDG_CONFIG_HOME)
+          ? process.env.XDG_CONFIG_HOME : path.join(os.homedir(), '.config'));
+    this._hostKeyPath = options.hostKeyPath || path.join(configHome, 'usshtc107', 'proxy_host_ed25519');
 
     this.wssHandshakeTimeoutMs = positiveInteger(
       options.wssHandshakeTimeoutMs,
       WSS_HANDSHAKE_TIMEOUT
     );
     this.remoteReadyTimeoutMs = positiveInteger(options.remoteReadyTimeoutMs, REMOTE_READY_TIMEOUT);
+    this.eofDrainTimeoutMs = positiveInteger(options.eofDrainTimeoutMs, 5000);
+    this.eofQuietMs = Math.min(positiveInteger(options.eofQuietMs, 250), this.eofDrainTimeoutMs);
     this.sshHandshakeTimeoutMs = positiveInteger(
       options.sshHandshakeTimeoutMs,
       SSH_HANDSHAKE_TIMEOUT
@@ -235,18 +246,6 @@ class ProxyServer extends EventEmitter {
     this._stopPromise = null;
     this._startRequest = null;
     this._listenAbortController = null;
-  }
-
-  static _ensureHostKey() {
-    if (!ProxyServer._hostKey) {
-      const { privateKey } = crypto.generateKeyPairSync('rsa', {
-        modulusLength: 2048,
-        publicKeyEncoding: { type: 'spki', format: 'pem' },
-        privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
-      });
-      ProxyServer._hostKey = privateKey;
-    }
-    return ProxyServer._hostKey;
   }
 
   _enqueueLifecycle(operation) {
@@ -371,6 +370,10 @@ class ProxyServer extends EventEmitter {
     let firstDataTimer = null;
     let inputEnded = false;
     let disconnectSent = false;
+    let eofDraining = false;
+    let eofDisconnectDue = false;
+    let eofQuietTimer = null;
+    let eofDeadline = null;
     let pendingResize = null;
     let pollTimer = null;
     let sendDeadline = null;
@@ -469,6 +472,8 @@ class ProxyServer extends EventEmitter {
       finishReason = reason;
       cancel(execTimer);
       cancel(firstDataTimer);
+      cancel(eofQuietTimer);
+      cancel(eofDeadline);
       cancel(sendDeadline);
       cancel(pollTimer);
       clearInterval(pingTimer);
@@ -508,6 +513,17 @@ class ProxyServer extends EventEmitter {
       catch (_) { complete(255, undefined, 'network_error'); return false; }
       return !closed && finishCode === null;
     }
+    function requestEofDisconnect() {
+      if (closed || finishCode !== null || disconnectSent) return;
+      cancel(eofQuietTimer);
+      cancel(eofDeadline);
+      eofDisconnectDue = true;
+      flushInput();
+    }
+    function resetEofQuiet() {
+      cancel(eofQuietTimer);
+      eofQuietTimer = self._schedule(timers, requestEofDisconnect, self.eofQuietMs);
+    }
     function flushInput() {
       if (closed || finishCode !== null || !ready || !remoteReady || ws.readyState !== WS_OPEN) return;
       while (pending.length) {
@@ -537,6 +553,12 @@ class ProxyServer extends EventEmitter {
       sendDeadline = null;
       resumeInput();
       if (!exec && inputEnded && !disconnectSent) {
+        if (!eofDraining) {
+          eofDraining = true;
+          eofDeadline = self._schedule(timers, requestEofDisconnect, self.eofDrainTimeoutMs);
+          resetEofQuiet();
+        }
+        if (!eofDisconnectDue) return;
         const message = JSON.stringify({ $case: 'disconnect' });
         const bytes = Buffer.byteLength(message);
         if (bytes > self.maxWsBufferedBytes) { complete(1, undefined, 'interrupted'); return; }
@@ -640,7 +662,10 @@ class ProxyServer extends EventEmitter {
           const limited = error?.code === 'EXEC_OUTPUT_LIMIT';
           complete(limited ? 125 : 1, 'Exec protocol failed.\n', limited ? 'output_limit' : 'interrupted');
         }
-      } else queueOutput(Buffer.from(result.payload, 'utf8'));
+      } else {
+        queueOutput(Buffer.from(result.payload, 'utf8'));
+        if (result.payload && eofDraining && !eofDisconnectDue && !disconnectSent && finishCode === null) resetEofQuiet();
+      }
     });
     ws.on('unexpected-response', (_request, response) => {
       if (closed || finishCode !== null) return;
@@ -968,7 +993,7 @@ class ProxyServer extends EventEmitter {
     let sshServer;
     let server;
     try {
-      const hostKey = this._hostKey || ProxyServer._ensureHostKey();
+      const hostKey = this._hostKey || ensureProxyHostKey(this._hostKeyPath);
       sshServer = new this._SSHServer(
         { hostKeys: [hostKey] },
         (client) => this._onSshClient(client)

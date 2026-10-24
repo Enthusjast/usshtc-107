@@ -824,8 +824,6 @@ test('all UTF8 byte splits survive connecting, backpressure, Unicode wire framin
         const text = JSON.parse(wire).data?.data;
         if (text) assert.doesNotMatch(text, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u);
       }
-      assert.equal(JSON.parse(ws.sent.at(-1)).$case, 'disconnect');
-      assert.equal(ws.sent.filter((wire) => JSON.parse(wire).$case === 'disconnect').length, 1);
       assert.equal(channel.endCalled, false, 'EOF still permits remote output');
       ws.message('after EOF');
       assert.equal(Buffer.concat(channel.writes).toString(), 'after EOF');
@@ -876,7 +874,6 @@ test('EOF waits for queued input and Ctrl-D is ordinary input', async () => {
   assert.equal(ws.sent.length, 0);
   ws.bufferedAmount = 0;
   await delay(5);
-  assert.deepEqual(ws.sent.map((wire) => JSON.parse(wire).$case), ['data', 'disconnect']);
   assert.equal(dataText(ws), '\x04');
   assert.equal(ws.readyState, 1);
   channel.close();
@@ -1251,4 +1248,34 @@ test('exec bootstrap and resize wait for valid terminal data including empty fra
   assert.deepEqual(channel.exitCodes, []);
   channel.close();
   await nextTurn();
+});
+
+test('EOF drains output until quiet without extending its absolute upper bound', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  for (const continuous of [false, true]) {
+    const ws = new FakeWebSocket();
+    const proxy = makeProxy({ webSocketFactory: () => ws, eofQuietMs: 100, eofDrainTimeoutMs: 300 });
+    const channel = new FakeChannel();
+    proxy._bridgeSshToWss(channel, 'fixture');
+    channel.emit('data', Buffer.from('command\n'));
+    channel.emit('end');
+    ws.open();
+    const disconnected = () => ws.sent.some(wire => JSON.parse(wire).$case === 'disconnect');
+    assert.equal(disconnected(), false);
+    t.mock.timers.tick(90);
+    ws.message('first output');
+    t.mock.timers.tick(90);
+    assert.equal(disconnected(), false);
+    if (continuous) {
+      ws.message('second output');
+      t.mock.timers.tick(90);
+      ws.message('last output');
+      t.mock.timers.tick(30);
+    } else t.mock.timers.tick(10);
+    assert.equal(disconnected(), true);
+    assert.equal(Buffer.concat(channel.writes).toString(), continuous ? 'first outputsecond outputlast output' : 'first output');
+    ws.emit('message', Buffer.from('{"$case":"exit","exit":{"code":0}}'));
+    assert.deepEqual(channel.exitCodes, [0]);
+    await nextTurn();
+  }
 });

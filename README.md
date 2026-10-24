@@ -113,6 +113,7 @@ Exec 需要远端提供 POSIX `sh`、`stty` 和 `base64 -d`；缺失工具或协
 | Port | `3000` | 本地代理监听端口 |
 | Cluster | `training` | 平台集群 |
 | Login Node | `11.11.10.202` | 登录节点 |
+| Starting directory | 空 | 档案的远端目录 `path`，按 URL 参数编码，不作为 shell 命令拼接 |
 | Cols / Rows | `80 / 24` | 远程终端尺寸 |
 | Auto-connect | 开启 | 启动时尝试恢复代理 |
 | Start minimized | 关闭 | 启动后只显示托盘图标 |
@@ -235,6 +236,15 @@ tests/                    核心代理、安全服务和前端交互测试
 代理只在收到首条有效终端 `data` 帧后发送输入（包括 exec bootstrap 和 resize），空字符串帧也视为就绪。WSS Upgrade 成功不代表远端 shell 可用；连接建立后 10 秒没有终端数据会以 `REMOTE_READY_TIMEOUT` 和退出码 255 结束该会话，保留 Cookie，并提示检查连接或重新登录。只有握手 HTTP 401/403 才会使 Cookie 失效。
 
 隔离运行可传 `--user-data-dir=<绝对路径>`，应用在访问设置、日志和登录 session 前创建私有目录并设置 userData/sessionData/logs；空值或相对路径被拒绝。主进程 fixture 可导入 `startApplication(deps)` 注入本地适配器，不提供 renderer 任意 URL 或凭据注入入口。
+
+## 交互与门户限制
+
+- 管道或 heredoc 到交互 shell 的 EOF：先排空已排队输入，再等待输出静默 250 毫秒；持续输出也不会把排空窗口延长到 5 秒之外，然后请求 disconnect，并受关闭超时约束。这是有界的交互排空，不证明远端命令已完成；较慢、多阶段脚本请用 `ssh alias 'command'` 的 exec 通道获取完整输出及退出码。
+- 门户的远端 `exit` 可能只打印 `logout`，不发送 exit 帧也不主动关闭 WSS。本地终端需要自行关闭或使用 SSH 的本地退出方式；应用不按输出中的 `logout` 字符串猜测退出。
+- 交互终端若由门户按字节块独立解码 UTF-8，可能已经产生不可逆的 `U+FFFD`；桥接不能还原丢失的字节。exec 的 ASCII/base64 线协议避免此类输出编码损失。
+- 非回环监听会把代理暴露到网络，Settings 明确警告；公钥认证和 TLS 校验仍不可关闭。`useRoot` 需要平台额外授权，普通账号仅开启选项不会获得权限。
+- 档案 `path` 默认为空，最多 1,024 字符，不接受控制字符，按字面保留空格并经 `URLSearchParams` 编码。已有 v2 设置在内存补齐缺省字段，不自动改写用户文件。
+- 单独构造 `ProxyServer` 而未传入 host key 时，也复用持久化 OpenSSH Ed25519 身份，不再按进程生成临时 RSA key；可用 `hostKeyPath` 指定隔离路径。默认路径与标准平台 userData 目录一致，自定义 Electron userData 仍由主进程显式提供身份。损坏或异类 key 拒绝启动，不删除旧文件。
 
 ## 真实门户验收
 
