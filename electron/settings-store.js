@@ -289,6 +289,16 @@ class SettingsStore {
         if (result.state !== 'committed' || !result.durable) throw codedError(result.errorCode || 'SETTINGS_MIGRATION_FAILED');
         this.migratedCookie = migration.ephemeralCookie;
       } else {
+        // Schema 2 profiles saved before these opt-ins retain their existing settings.
+        // Backfill only new optional fields; all other missing/unknown keys remain invalid.
+        if (raw.schemaVersion === 2 && Array.isArray(raw.profiles)) {
+          for (const profile of raw.profiles) {
+            if (!isPlainObject(profile?.settings)) continue;
+            for (const key of ['path', 'startupCommand', 'healthProbeEnabled']) {
+              if (!Object.hasOwn(profile.settings, key)) profile.settings[key] = PROFILE_DEFAULTS[key];
+            }
+          }
+        }
         validateRoot(raw);
         if (this.isLocked()) syncDirectory(path.dirname(this.filePath), { io: this.io, platform: this.platform });
         this.root = raw;

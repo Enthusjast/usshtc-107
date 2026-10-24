@@ -271,3 +271,12 @@ test('candidate gate rejects TCP until activated; concurrent start/stop leaves n
   assert.equal(f.proxy._server, null);
   assert.equal(f.proxy._sockets.size, 0);
 });
+
+test('fresh command proof executes through pinned SSH, WSS and a real remote PTY', { skip: process.platform === 'win32', timeout: 15000 }, async t => {
+  const f = await fixture(t, { mode: 'pty' });
+  const host = sshUtils.parseKey(fs.readFileSync(path.join(f.root, 'host-key'))).getPublicSSH();
+  const hostFingerprint = `SHA256:${crypto.createHash('sha256').update(host).digest('base64').replace(/=+$/, '')}`;
+  const { probeRemoteCommand } = require('../../electron/remote-command-probe');
+  assert.equal(await probeRemoteCommand({ config: f.address, identity: f.identity, hostFingerprint }), 'REMOTE_COMMAND_OK');
+  assert.equal(await probeRemoteCommand({ config: f.address, identity: f.identity, hostFingerprint, command: 'true' }), 'REMOTE_COMMAND_OK');
+});

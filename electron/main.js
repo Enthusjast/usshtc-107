@@ -599,6 +599,7 @@ function startApplication(deps = {}) {
         return { ...saved, wssUrl: buildWssUrl(saved) };
       },
       getRuntime: (scope) => { assertScope(scope); return controller.getSnapshot(); },
+      getAuthGeneration: () => controller.getAuthGeneration(),
       getKeys: (scope) => { assertScope(scope); return inspectKeys(); },
       getClientIdentity: (scope) => { assertScope(scope); return getSsh2ClientIdentity({ sshDirectory }); },
       inspectSshConfig: (scope, config) => new SshConfigService({ sshDirectory,

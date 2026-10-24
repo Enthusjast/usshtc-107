@@ -6,17 +6,19 @@ import { useLocale } from '../i18n/LocaleContext';
 import { useToast } from '../components/Toast';
 import { IconActivity, IconSettings, IconKey, IconFileEdit, IconInfo } from '../components/Icons';
 
-const CHECK_IDS = ['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'wss'];
+const CHECK_IDS = ['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'wss', 'remote-command'];
 const CHECK_STATUSES = new Set(['pending', 'running', 'passed', 'failed', 'skipped']);
 export const DIAGNOSTIC_CODES = new Set([
   'SETTINGS_OK', 'SETTINGS_INVALID', 'SETTINGS_LOCKED', 'KEYS_OK', 'SSH_KEY_MISSING', 'SSH_KEY_INVALID',
   'SSH_KEY_PERMISSIONS', 'SSH_KEY_FINGERPRINT_MISMATCH', 'SSH_CONFIG_OK', 'SSH_CONFIG_MISSING',
   'SSH_CONFIG_MISMATCH', 'SSH_ALIAS_CONFLICT', 'SSH_CONFIG_INVALID', 'LOCAL_SSH_OK', 'LOCAL_PORT_AVAILABLE',
-  'PORT_IN_USE', 'LOCAL_SSH_FAILED', 'DNS_OK', 'DNS_FAILED', 'TLS_OK', 'TLS_FAILED', 'WSS_HANDSHAKE_OK',
+  'PORT_IN_USE', 'LOCAL_SSH_FAILED', 'DNS_OK', 'DNS_FAILED', 'TLS_OK', 'TLS_FAILED', 'WSS_SHELL_READY',
   'AUTH_REQUIRED', 'WSS_FAILED', 'NETWORK_UNAVAILABLE', 'TIMEOUT', 'CANCELLED', 'DEPENDENCY_FAILED', 'DIAGNOSTIC_DEADLINE',
+  'REMOTE_READY_TIMEOUT', 'REMOTE_COMMAND_OK', 'REMOTE_COMMAND_FAILED',
 ]);
-const CONFIG_FIELDS = ['host', 'port', 'cluster', 'loginNode', 'cols', 'rows', 'useRoot', 'wssUrl', 'sshAlias'];
-export const diagnosticIdentity = (snapshot, scope) => JSON.stringify([scope?.profileId, scope?.epoch, ...CONFIG_FIELDS.map((key) => snapshot?.desiredConfig?.[key])]);
+const CONFIG_FIELDS = ['host', 'port', 'cluster', 'loginNode', 'cols', 'rows', 'useRoot', 'path', 'startupCommand', 'wssUrl', 'sshAlias'];
+export const diagnosticIdentity = (snapshot, scope) => JSON.stringify([scope?.profileId, scope?.epoch,
+  snapshot?.loginStatus, snapshot?.cookieValid, ...CONFIG_FIELDS.map((key) => snapshot?.desiredConfig?.[key])]);
 const isCancellation = (error) => error?.code === 'CANCELLED' || error?.code === 'OPERATION_CANCELLED';
 const statusRank = (status) => status === 'pending' ? 0 : status === 'running' ? 1 : 2;
 

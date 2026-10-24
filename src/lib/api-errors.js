@@ -9,10 +9,12 @@ for (const code of ['AUTOSTART_UNAVAILABLE', 'AUTOSTART_CONFLICT', 'AUTOSTART_FA
 ERROR_CODES.add('RECOVERY_EXHAUSTED');
 ERROR_CODES.add('ONBOARDING_NOT_READY');
 ERROR_CODES.add('SSH_KEY_PERMISSIONS');
+ERROR_CODES.add('REMOTE_READY_TIMEOUT');
+ERROR_CODES.add('REMOTE_COMMAND_FAILED');
 for (const code of ['UPDATE_NETWORK', 'UPDATE_NO_RELEASE', 'UPDATE_INVALID_METADATA', 'UPDATE_VERSION_REJECTED',
   'UPDATE_CHECKSUM_MISMATCH', 'UPDATE_SIGNATURE_INVALID', 'UPDATE_PERMISSION_DENIED', 'UPDATE_PREPARATION_FAILED',
   'UPDATE_INSTALL_FAILED', 'UPDATE_RESTART_REQUIRED', 'UPDATE_MANUAL_ONLY', 'AUTOSTART_UPDATE_FAILED']) ERROR_CODES.add(code);
-const VALIDATION_CODES = new Set(['required', 'invalid_host', 'invalid_token', 'integer_range', 'invalid_boolean', 'invalid_enum', 'unknown_key']);
+const VALIDATION_CODES = new Set(['required', 'invalid_host', 'invalid_token', 'invalid_path', 'invalid_startup_command', 'integer_range', 'invalid_boolean', 'invalid_enum', 'unknown_key']);
 
 export function formatValidationError(code, t) {
   return VALIDATION_CODES.has(code) ? t(`validation_${code}`) : t('unknownError');

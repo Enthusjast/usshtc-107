@@ -109,10 +109,12 @@ function fixture(t, options = {}) {
   running();
   const proof = (patch = {}) => ({ runId: randomUUID(), ...currentScope(),
     configFingerprint: fingerprintConfig(publicSettings(store.getRoot())),
+    authGeneration: app.getAuthGeneration(),
     startedAt: '2026-10-24T00:00:00.000Z', finishedAt: '2026-10-24T00:00:01.000Z',
     checks: [
       { id: 'local-listener', status: 'passed', code: 'LOCAL_SSH_OK', mode: 'ssh-auth', durationMs: 1 },
-      { id: 'wss', status: 'passed', code: 'WSS_HANDSHAKE_OK', durationMs: 1 },
+      { id: 'wss', status: 'passed', code: 'WSS_SHELL_READY', durationMs: 1 },
+      { id: 'remote-command', status: 'passed', code: 'REMOTE_COMMAND_OK', durationMs: 1 },
     ], ...patch });
   latest = proof();
   const save = (patch = {}) => app.run('save-onboarding', { scope: currentScope(), status: 'completed',
@@ -197,7 +199,11 @@ for (const scenario of [
   ['SSH code without auth mode', (f) => { const value = f.proof(); delete value.checks[0].mode; f.setLatest(value); }],
   ['failed local check', (f) => { const value = f.proof(); value.checks[0].status = 'failed'; f.setLatest(value); }],
   ['failed WSS check', (f) => { const value = f.proof(); value.checks[1].status = 'failed'; f.setLatest(value); }],
-  ['missing WSS check', (f) => { const value = f.proof(); value.checks.pop(); f.setLatest(value); }],
+  ['missing WSS check', (f) => { const value = f.proof(); value.checks = value.checks.filter((check) => check.id !== 'wss'); f.setLatest(value); }],
+  ['handshake-only WSS', (f) => { const value = f.proof(); value.checks[1].code = 'WSS_HANDSHAKE_OK'; f.setLatest(value); }],
+  ['missing remote command', (f) => { const value = f.proof(); value.checks.pop(); f.setLatest(value); }],
+  ['failed remote command', (f) => { const value = f.proof(); value.checks[2].status = 'failed'; f.setLatest(value); }],
+  ['stale authentication proof', (f) => { f.setLatest(f.proof({ authGeneration: 0 })); }],
 ]) {
   test(`completion rejects ${scenario[0]}`, async (t) => {
     const f = fixture(t);
@@ -374,3 +380,35 @@ test('failed completion persistence does not claim completed or invalidate a reu
   await f.save();
   assert.deepEqual(f.root().profiles[0].onboarding, { status: 'completed', step: 'verify' });
 });
+
+test('independent diagnostic failures also prevent onboarding completion', async (t) => {
+  const f = fixture(t);
+  const proof = f.proof();
+  proof.checks.push({ id: 'ssh-config', status: 'failed', code: 'SSH_CONFIG_MISMATCH', durationMs: 1 });
+  f.setLatest(proof);
+  await assert.rejects(f.save(), { code: 'ONBOARDING_NOT_READY' });
+  assert.equal(f.calls.includes('save'), false);
+});
+
+test('health preference does not require restart or invalidate connection proof', async (t) => {
+  const f = fixture(t);
+  const runId = f.latest().runId;
+  const before = f.app.getSnapshot().desiredConfig;
+  const result = await f.app.run('save-settings', { scope: f.scope(), patch: { healthProbeEnabled: true } });
+  assert.equal(result.needsRestart, false);
+  assert.deepEqual(f.app.getSnapshot().desiredConfig, before);
+  assert.equal(f.latest().runId, runId);
+  assert.equal(f.calls.includes('invalidate'), false);
+  await f.save();
+});
+
+for (const patch of [{ path: '/work with spaces' }, { startupCommand: 'tmux new -A -s usshtc' }]) {
+  test(`connection setting invalidates proof and requires restart: ${Object.keys(patch)[0]}`, async (t) => {
+    const f = fixture(t);
+    const runId = f.latest().runId;
+    const result = await f.app.run('save-settings', { scope: f.scope(), patch });
+    assert.equal(result.needsRestart, true);
+    assert.equal(f.latest(), null);
+    await assert.rejects(f.save({ runId }), { code: 'ONBOARDING_NOT_READY' });
+  });
+}

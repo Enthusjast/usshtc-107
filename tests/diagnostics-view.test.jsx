@@ -1,7 +1,7 @@
 import React from 'react';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import DiagnosticsView, { DIAGNOSTIC_CODES } from '../src/views/DiagnosticsView';
+import DiagnosticsView, { DIAGNOSTIC_CODES, diagnosticIdentity } from '../src/views/DiagnosticsView';
 import { LocaleProvider } from '../src/i18n/LocaleContext';
 import { ToastProvider } from '../src/components/Toast';
 import en from '../src/i18n/en';
@@ -16,7 +16,7 @@ const runtime = vi.hoisted(() => ({ scope: null, snapshot: null, runAction: vi.f
 vi.mock('../src/lib/electron', async (original) => ({ ...await original(), ...api }));
 vi.mock('../src/contexts/RuntimeContext', async (original) => ({ ...await original(), useRuntime: () => runtime }));
 
-const ids = ['settings','keys','ssh-config','local-listener','dns','tls','wss'];
+const ids = ['settings','keys','ssh-config','local-listener','dns','tls','wss','remote-command'];
 function diagnostic(overrides = {}) {
   return {
     runId: 'run-1', profileId: 'default', epoch: 1, configFingerprint: 'config-1',
@@ -88,14 +88,14 @@ describe('Connection diagnostics', () => {
     let run=checked(diagnostic(),'settings',{status:'passed',code:'SETTINGS_OK',durationMs:1});
     run=checked(run,'keys',{status:'running'});
     act(() => emit(run));
-    expect(screen.getByText('1 of 7 checks finished')).toBeInTheDocument();
+    expect(screen.getByText('1 of 8 checks finished')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', {name:'Open settings'}));
     expect(onNavigate).toHaveBeenCalledWith('settings');
-    const final=checked({...run,finishedAt:'2026-10-24T00:00:01.000Z'},'wss',{status:'passed',code:'WSS_HANDSHAKE_OK',durationMs:15});
+    const final=checked({...run,finishedAt:'2026-10-24T00:00:01.000Z'},'wss',{status:'passed',code:'WSS_SHELL_READY',durationMs:15});
     await act(async () => {emit(final);finish(final);});
     expect(screen.getByText('Diagnostics finished. Review each check below.')).toBeInTheDocument();
-    expect(screen.getByText('HTTP upgraded to WebSocket. Remote application authorization and execution are not verified.')).toBeInTheDocument();
-    expect(screen.getByText(/does not prove remote application authorization or command execution/)).toBeInTheDocument();
+    expect(screen.getByText(en.diagnostic_WSS_SHELL_READY)).toBeInTheDocument();
+    expect(screen.getByText(en.diagnosticsProofScope)).toBeInTheDocument();
     expect(screen.getByRole('button', {name:'Run again'})).toBeEnabled();
   });
 
@@ -214,7 +214,47 @@ describe('Connection diagnostics', () => {
     api.getSettings.mockResolvedValue({locale:'zh'});
     render(<App />);
     expect(await screen.findByRole('button', {name:'运行诊断'})).toBeInTheDocument();
-    expect(screen.getByText(/不证明远端应用已授权/)).toBeInTheDocument();
+    expect(screen.getByText(zh.diagnosticsProofScope)).toBeInTheDocument();
     expect(screen.getByRole('button', {name:'检查 SSH 配置'})).toBeInTheDocument();
   });
+  it('shows first-frame silence separately from authentication and keeps command evidence separate', async () => {
+    let run = checked(diagnostic({ finishedAt: '2026-10-24T00:00:01.000Z' }), 'wss', { status: 'failed', code: 'REMOTE_READY_TIMEOUT', durationMs: 10000 });
+    run = checked(run, 'remote-command', { status: 'skipped', code: 'DEPENDENCY_FAILED' });
+    api.getDiagnostics.mockResolvedValue(run);
+    render(<App />);
+    expect(await screen.findByText(en.diagnostic_REMOTE_READY_TIMEOUT)).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: en['diagnosticsCheck_remote-command'] })).toBeInTheDocument();
+    expect(screen.getByRole('progressbar')).toHaveAttribute('max', '8');
+    expect(api.startLogin).not.toHaveBeenCalled();
+    expect(screen.queryByText(en.diagnostic_AUTH_REQUIRED)).not.toBeInTheDocument();
+    expect(screen.queryByText(en.diagnostic_REMOTE_COMMAND_OK)).not.toBeInTheDocument();
+    const next = checked(diagnostic({ runId: 'run-2', startedAt: '2026-10-24T00:00:02.000Z', finishedAt: '2026-10-24T00:00:03.000Z' }), 'remote-command', { status: 'failed', code: 'REMOTE_COMMAND_FAILED', output: 'private-output', command: 'private-command' });
+    act(() => emit(checked(next, 'wss', { status: 'passed', code: 'WSS_SHELL_READY' })));
+    expect(screen.getByText(en.diagnostic_WSS_SHELL_READY)).toBeInTheDocument();
+    expect(screen.getByText(en.diagnostic_REMOTE_COMMAND_FAILED)).toBeInTheDocument();
+    expect(screen.queryByText(/private-output|private-command/)).not.toBeInTheDocument();
+  });
+
+  it('binds identity to path, startup command and visible authentication, but not health preference', () => {
+    const original = diagnosticIdentity(runtime.snapshot, runtime.scope);
+    for (const patch of [{ path: '/work with spaces' }, { startupCommand: 'tmux new -A -s usshtc' }]) {
+      expect(diagnosticIdentity({ ...runtime.snapshot, desiredConfig: { ...runtime.snapshot.desiredConfig, ...patch } }, runtime.scope)).not.toBe(original);
+    }
+    expect(diagnosticIdentity({ ...runtime.snapshot, loginStatus: 'pending' }, runtime.scope)).not.toBe(original);
+    expect(diagnosticIdentity({ ...runtime.snapshot, cookieValid: false }, runtime.scope)).not.toBe(original);
+    expect(diagnosticIdentity({ ...runtime.snapshot, desiredConfig: { ...runtime.snapshot.desiredConfig, healthProbeEnabled: true } }, runtime.scope)).toBe(original);
+  });
+
+  it.each([{ path: '/work with spaces' }, { startupCommand: 'tmux new -A -s usshtc' }])('rejects an old same-scope run after changing %j', async (patch) => {
+    const old = checked(diagnostic({ finishedAt: '2026-10-24T00:00:01.000Z' }), 'remote-command', { status: 'passed', code: 'REMOTE_COMMAND_OK' });
+    api.getDiagnostics.mockResolvedValueOnce(old).mockResolvedValue(null);
+    const view = render(<App />);
+    await screen.findByText(en.diagnostic_REMOTE_COMMAND_OK);
+    runtime.snapshot = { ...runtime.snapshot, desiredConfig: { ...runtime.snapshot.desiredConfig, ...patch } };
+    view.rerender(<App />);
+    await screen.findByText(en.diagnosticsEmpty);
+    act(() => emit(old));
+    expect(screen.queryByText(en.diagnostic_REMOTE_COMMAND_OK)).not.toBeInTheDocument();
+  });
+
 });

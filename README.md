@@ -130,7 +130,7 @@ Exec 需要远端提供 POSIX `sh`、`stty` 和 `base64 -d`；缺失工具或协
 
 会话历史保存在私有 `session-history.json`，仅记录运行唯一 ID、档案 ID、shell/exec 类型、起止时间、字节总数、退出码和固定原因；不保存命令、输出、用户名或远端地址。最多保留 1000 条、30 天且文件不超过 1 MiB，活动摘要合并写入、关闭立即写入，启动时未完成记录标为 interrupted。历史持久化失败只显示可重试错误，不中断健康 SSH。清空历史需要原生确认，并先停止、最终化当前档案会话；取消保留连接与草稿。删除档案也删除其历史。
 
-Diagnostics 每项最多 5 秒、整体最多 30 秒，可取消；保存相关配置（包括同值重存）、切档案和退出都会使旧结果失效。代理运行时仅使用应用实际客户端密钥和固定主机指纹完成本地 SSH 认证，不发命令；停止时的 bind-only 只证明端口可绑定。`WSS_HANDSHAKE_OK` 仅证明验证 TLS 后 HTTP 升级成功，不证明远端应用授权或命令可执行；只有握手 HTTP 401/403 会撤销当前 Cookie。
+Diagnostics 的本地、DNS/TLS 与握手检查各最多 5 秒，WSS Upgrade 后另给首条有效终端帧 10 秒，远端命令证明最多 15 秒，并受整体 30 秒上限约束，可取消。运行代理使用实际客户端密钥与固定主机指纹：`LOCAL_SSH_OK` 只证明本地 SSH 认证；`WSS_SHELL_READY` 只证明首条终端数据；独立 `remote-command` 检查必须执行随机标记命令、逐字节比对输出且退出码为 0，才返回 `REMOTE_COMMAND_OK`。向导完成同时要求这三项证明、当前认证 generation、匹配的运行配置和有效 SSH Config。停止状态的 bind-only 只证明端口可绑定，不能完成向导；首帧超时失败但不撤销 Cookie，只有 HTTP 401/403 才会撤销。保存相关配置、认证变化、切档案和退出都会使旧证明失效。
 
 日志筛选是大小写不敏感的纯文本匹配，不执行正则。复制和日志 JSON 导出只包含当前匹配项（ISO 时间、级别、来源和脱敏消息）；诊断包则明确包含当前最多 500 条安全日志，不受筛选影响。诊断包为单个 JSON，只含版本/架构、公开连接设置、诊断状态和再次脱敏的日志，替换 HOME/USERDATA 路径；总量最多 8 MiB，必要时逐条裁剪最旧完整日志并记录数量。不会读取原始设置、日志文件或私钥打包，也不包含账号、Cookie、密文、命令或远端输出。保存位置由原生对话框选择，取消不写文件。
 
@@ -186,7 +186,7 @@ GitHub Actions 发布需要以下仓库 Secrets：
 | macOS | `MAC_CSC_LINK`, `MAC_CSC_KEY_PASSWORD`, `APPLE_API_KEY_BASE64`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER` |
 | Windows | `WIN_CSC_LINK`, `WIN_CSC_KEY_PASSWORD` |
 
-`MAC_CSC_LINK` 和 `WIN_CSC_LINK` 可使用 electron-builder 支持的 base64 证书值。`APPLE_API_KEY_BASE64` 是 App Store Connect `.p8` 私钥的 base64 内容。用于签名或发布的标签必须严格等于 `v<package.json version>`，例如当前版本使用 `v1.2.2`，且标签提交必须属于默认分支历史。应在仓库设置中保护 `v*` 标签。
+`MAC_CSC_LINK` 和 `WIN_CSC_LINK` 可使用 electron-builder 支持的 base64 证书值。`APPLE_API_KEY_BASE64` 是 App Store Connect `.p8` 私钥的 base64 内容。用于签名或发布的标签必须严格等于 `v<package.json version>`，例如当前版本使用 `v1.2.3`，且标签提交必须属于默认分支历史。应在仓库设置中保护 `v*` 标签。
 
 发布流水线会验证签名和 macOS 公证，生成产物 SHA-256 校验文件和 GitHub 构建来源证明，并为实际生产依赖生成 CycloneDX SBOM。普通手动构建可以选择单个平台；Linux 可从功能分支构建，使用证书的 macOS/Windows 构建只能从默认分支或匹配版本的标签发起。创建 GitHub Release 时必须构建全部平台。
 
@@ -209,7 +209,7 @@ electron/
   credential-store.js     safeStorage 凭据与旧数据迁移
   settings-store.js       设置校验和原子持久化
   session-history-store.js 注册会话终结、有界历史和失败重试
-  diagnostics-service.js  有界连接检查与无命令探测
+  diagnostics-service.js  有界连接检查、终端就绪和实际命令证明
   diagnostic-export-service.js 脱敏 JSON 和筛选日志导出
   wss-connection.js        统一平台 URL、TLS 和系统追加信任政策
   ssh-key-service.js      客户端与代理主机密钥

@@ -8,7 +8,7 @@ const { validateSettingsPatch, PROFILE_DEFAULTS, PROFILE_SETTING_KEYS, APP_SETTI
 const { publicSettings, validateProfileName } = require('./settings-store');
 const { ServiceError } = require('./ipc-contract');
 
-const CONFIG_KEYS = ['host', 'port', 'cluster', 'loginNode', 'cols', 'rows', 'useRoot'];
+const CONFIG_KEYS = ['host', 'port', 'cluster', 'loginNode', 'cols', 'rows', 'useRoot', 'path', 'startupCommand'];
 const keyActionError = (error, fallback) => error instanceof ServiceError ? error : new ServiceError(
   ['SSH_KEY_MISSING', 'SSH_KEY_INVALID', 'SSH_KEY_PERMISSIONS', 'SSH_KEY_FINGERPRINT_MISMATCH',
     'KEY_BACKUP_INVALID', 'KEY_TRANSACTION_FAILED', 'KEY_ROLLBACK_FAILED', 'SECURE_STORAGE_UNAVAILABLE',
@@ -493,7 +493,9 @@ function createAppController(deps) {
                 || typeof run?.finishedAt !== 'string' || !Number.isFinite(Date.parse(run.finishedAt))
                 || run.configFingerprint !== fingerprint || fingerprintConfig(settings()) !== fingerprint
                 || !passed('local-listener', 'LOCAL_SSH_OK', 'ssh-auth')
-                || !passed('wss', 'WSS_HANDSHAKE_OK')
+                || !passed('wss', 'WSS_SHELL_READY') || !passed('remote-command', 'REMOTE_COMMAND_OK')
+                || run.authGeneration !== authGeneration
+                || run.checks.some((check) => check.status !== 'passed')
                 || state.proxyStatus !== 'started' || !state.runningConfig
                 || Object.keys(desired).some((key) => state.runningConfig[key] !== desired[key])
                 || Object.keys(state.runningConfig).some((key) => !Object.hasOwn(desired, key))
@@ -989,6 +991,7 @@ function createAppController(deps) {
 
   return {
     getSnapshot: snapshot,
+    getAuthGeneration: () => authGeneration,
     getDraftRevision: () => draft.draftRevision,
     getProfiles: profilesDto,
     getCredentials: (candidate) => {

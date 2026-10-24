@@ -17,6 +17,9 @@ export const PROFILE_DEFAULTS = Object.freeze({
   host: '127.0.0.1',
   cluster: 'training',
   loginNode: '11.11.10.202',
+  path: '',
+  startupCommand: '',
+  healthProbeEnabled: false,
   cols: 80,
   rows: 24,
   useRoot: false,
@@ -26,6 +29,7 @@ export const PROFILE_DEFAULTS = Object.freeze({
 
 export const APP_SETTING_KEYS = Object.freeze(Object.keys(APP_DEFAULTS));
 export const PROFILE_SETTING_KEYS = Object.freeze(Object.keys(PROFILE_DEFAULTS));
+export const TMUX_STARTUP_COMMAND = 'tmux new -A -s usshtc';
 
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
@@ -124,11 +128,26 @@ function parseEnum(value, choices) {
   return value;
 }
 
+function parsePath(value) {
+  // Spaces, including leading/trailing ones, are valid POSIX filename characters.
+  if (typeof value !== 'string' || value.length > 1024 || CONTROL_CHARACTERS.test(value)) invalid('invalid_path');
+  return value;
+}
+
+function parseStartupCommand(value) {
+  // This opt-in deliberately supports one reviewed command, not arbitrary shell input.
+  if (value !== '' && value !== TMUX_STARTUP_COMMAND) invalid('invalid_startup_command');
+  return value;
+}
+
 const validators = Object.freeze({
   port: (value) => parseInteger(value, 'port', 1, 65535),
   host: (value) => parseHost(value, 'host'),
   cluster: (value) => parseToken(value, 'cluster'),
   loginNode: (value) => parseHost(value, 'loginNode'),
+  path: parsePath,
+  startupCommand: parseStartupCommand,
+  healthProbeEnabled: parseBoolean,
   cols: (value) => parseInteger(value, 'cols', 40, 500),
   rows: (value) => parseInteger(value, 'rows', 10, 200),
   useRoot: parseBoolean,

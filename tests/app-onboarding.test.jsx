@@ -29,7 +29,7 @@ vi.mock('../src/views/SettingsView', () => ({
   },
 }));
 
-const config = { host: '127.0.0.1', port: 3000, cluster: 'training', loginNode: '11.11.10.202', cols: 80, rows: 24, useRoot: false, wssUrl: 'wss://fixed.invalid/' };
+const config = { host: '127.0.0.1', port: 3000, cluster: 'training', loginNode: '11.11.10.202', cols: 80, rows: 24, useRoot: false, path: '', startupCommand: '', wssUrl: 'wss://fixed.invalid/' };
 let profiles;
 let snapshot;
 let listeners;
@@ -194,7 +194,7 @@ describe('Setup route integration', () => {
   it('exits only after main accepts diagnostic completion and does not offer Resume afterward', async () => {
     initial('new', 'verify');
     snapshot = { ...snapshot, loginStatus: 'success', cookieValid: true, proxyStatus: 'started', runningConfig: config };
-    const codes = { settings: 'SETTINGS_OK', keys: 'KEYS_OK', 'ssh-config': 'SSH_CONFIG_OK', 'local-listener': 'LOCAL_SSH_OK', dns: 'DNS_OK', tls: 'TLS_OK', wss: 'WSS_HANDSHAKE_OK' };
+    const codes = { settings: 'SETTINGS_OK', keys: 'KEYS_OK', 'ssh-config': 'SSH_CONFIG_OK', 'local-listener': 'LOCAL_SSH_OK', dns: 'DNS_OK', tls: 'TLS_OK', wss: 'WSS_SHELL_READY', 'remote-command': 'REMOTE_COMMAND_OK' };
     api.getDiagnostics.mockResolvedValue({ profileId: 'default', epoch: 1, runId: 'verified-run', configFingerprint: 'main-fingerprint', startedAt: '2026-10-24T00:00:00.000Z', finishedAt: '2026-10-24T00:00:01.000Z', checks: Object.entries(codes).map(([id, code]) => ({ id, status: 'passed', code, durationMs: 4, ...(id === 'local-listener' ? { mode: 'ssh-auth' } : {}) })) });
     render(<App />);
     await waitFor(() => expect(screen.getByRole('button', { name: en.setupFinish })).toBeEnabled());
@@ -204,4 +204,23 @@ describe('Setup route integration', () => {
     expect(screen.queryByRole('button', { name: en.setupResume })).not.toBeInTheDocument();
     await waitFor(() => expect(screen.getByRole('heading', { level: 1, name: 'Dashboard' })).toHaveFocus());
   });
+  it.each(['missing', 'failed', 'timeout'])('keeps setup open with %s remote command evidence even when the shell is ready', async (mode) => {
+    initial('new', 'verify');
+    snapshot = { ...snapshot, loginStatus: 'success', cookieValid: true, proxyStatus: 'started', runningConfig: config };
+    const codes = { settings: 'SETTINGS_OK', keys: 'KEYS_OK', 'ssh-config': 'SSH_CONFIG_OK', 'local-listener': 'LOCAL_SSH_OK', dns: 'DNS_OK', tls: 'TLS_OK', wss: 'WSS_SHELL_READY' };
+    const checks = Object.entries(codes).map(([id, code]) => ({ id, code, status: 'passed', durationMs: 1,
+      ...(id === 'local-listener' ? { mode: 'ssh-auth' } : {}) }));
+    if (mode !== 'missing') checks.push({ id: 'remote-command', status: 'failed', code: mode === 'timeout' ? 'TIMEOUT' : 'REMOTE_COMMAND_FAILED', durationMs: 15000 });
+    api.getDiagnostics.mockResolvedValue({ profileId: 'default', epoch: 1, runId: 'incomplete-proof', configFingerprint: 'main-fingerprint',
+      startedAt: '2026-10-24T00:00:00.000Z', finishedAt: '2026-10-24T00:00:01.000Z', checks });
+    render(<App />);
+    await screen.findByText(en.diagnostic_WSS_SHELL_READY);
+    const finish = screen.getByRole('button', { name: en.setupFinish });
+    expect(finish).toBeDisabled();
+    fireEvent.click(finish);
+    expect(api.saveOnboarding).not.toHaveBeenCalled();
+    expect(screen.getByRole('heading', { level: 1, name: en.setupTitle })).toBeInTheDocument();
+    expect(screen.queryByText('Dashboard panel')).not.toBeInTheDocument();
+  });
+
 });

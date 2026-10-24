@@ -5,6 +5,7 @@ import DashboardView from '../src/views/DashboardView';
 import { RuntimeProvider } from '../src/contexts/RuntimeContext';
 import { LocaleProvider } from '../src/i18n/LocaleContext';
 import { ToastProvider } from '../src/components/Toast';
+import en from '../src/i18n/en';
 const mocks = vi.hoisted(() => ({ getRuntimeInfo: vi.fn(), retryRecovery: vi.fn(), getStatus: vi.fn(), onRuntimeState: vi.fn(), setAppDirty: vi.fn(), getStats: vi.fn(), getSshKeyInfo: vi.fn(), onStatsUpdate: vi.fn(), startLogin: vi.fn(), startProxy: vi.fn(), stopProxy: vi.fn(), copyToClipboard: vi.fn(), getSettings: vi.fn(), setAppLocale: vi.fn() }));
 vi.mock('../src/lib/electron', async (importOriginal) => ({ ...await importOriginal(), ...mocks }));
 const config = { host: '0.0.0.0', port: 3000 };
@@ -92,19 +93,30 @@ it('exposes traffic Retry without replacing healthy runtime controls',async()=>{
 
 it.each([
  ['unknown','Remote reachability has not been checked.'],
- ['checking','Checking the platform WebSocket handshake…'],
- ['reachable','The platform WebSocket handshake is reachable.'],
+ ['checking','Checking remote shell readiness…'],
+ ['reachable','The remote shell is ready.'],
  ['offline','The network or platform is offline. Reconnect, then retry.'],
  ['auth_required','The platform requires authentication.'],
  ['error','The connection check failed. Review settings or retry.'],
-])('renders the scoped %s remote status without claiming command execution',async(remoteStatus,message)=>{
+])('renders the scoped %s remote status with first-frame and optional command proof explained',async(remoteStatus,message)=>{
  mocks.getStatus.mockResolvedValue(snapshot(1,{remoteStatus})); mount();
  expect(await screen.findByText(message)).toBeInTheDocument();
- expect(screen.getByText(/Reachable means only a verified-TLS WebSocket handshake/)).toBeInTheDocument();
- expect(screen.getByText(/Disconnected SSH clients must reconnect themselves/)).toHaveTextContent('this application does not execute it');
+ expect(screen.getByText(/A readiness check waits for the first valid terminal data/)).toHaveTextContent('With health probes enabled, periodic read-only commands also check execution');
+ expect(screen.getByText(/Disconnected SSH clients must reconnect themselves/)).toHaveTextContent('Enable the profile’s tmux option before connecting');
  expect(mocks.retryRecovery).not.toHaveBeenCalled();
  if(remoteStatus==='checking') expect(screen.getByRole('button',{name:'Checking connection…'})).toBeDisabled();
  if(remoteStatus==='auth_required') expect(screen.getByRole('button',{name:'Retry connection'})).toBeDisabled();
+});
+
+it.each(['REMOTE_READY_TIMEOUT', 'REMOTE_COMMAND_FAILED'])('shows %s without falsely requesting login or restarting a healthy proxy', async (errorCode) => {
+ mocks.getStatus.mockResolvedValue(snapshot(1, { remoteStatus: 'error', errorCode })); mount();
+ expect(await screen.findByRole('alert')).toHaveTextContent(en[`error_${errorCode}`]);
+ expect(screen.getByRole('button', { name: 'Retry connection' })).toBeEnabled();
+ expect(screen.getByRole('button', { name: 'Stop' })).toBeEnabled();
+ expect(screen.queryByText(en.recoveryLoginRequired)).not.toBeInTheDocument();
+ expect(mocks.retryRecovery).not.toHaveBeenCalled();
+ expect(mocks.startProxy).not.toHaveBeenCalled();
+ expect(mocks.stopProxy).not.toHaveBeenCalled();
 });
 
 it('acknowledges drafts before a scoped manual recovery check without direct proxy restart or extra confirmation',async()=>{
@@ -179,7 +191,6 @@ it('renders localized recovery instructions and authenticated-action guidance in
  expect(await screen.findByRole('heading',{name:'网络与恢复'})).toBeInTheDocument();
  expect(screen.getByRole('button',{name:'重试连接'})).toBeDisabled();
  expect(screen.getByText(/网络重试无法续期认证/)).toBeInTheDocument();
- expect(screen.getByText(/可自行运行 tmux/)).toBeInTheDocument();
 });
 
 it('shows fixed background recovery failures from the scoped runtime snapshot',async()=>{

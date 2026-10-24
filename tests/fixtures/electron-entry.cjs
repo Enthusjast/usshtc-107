@@ -11,6 +11,7 @@ const { once } = require('node:events');
 const electron = require('electron');
 const { WebSocket, WebSocketServer } = require('ws');
 const { installNetworkGuard } = require('./electron-network-guard.cjs');
+const { createRemoteExecPeer } = require('./remote-exec-peer.cjs');
 
 const root = fs.realpathSync(process.env.USSHTC107_FIXTURE_ROOT || '');
 if (!path.isAbsolute(root) || root !== process.env.USSHTC107_FIXTURE_ROOT
@@ -86,9 +87,23 @@ server.on('upgrade', (request, socket, head) => {
 });
 wss.on('connection', (ws) => {
   ws.on('error', () => {});
+  let peer = null;
+  ws.send(JSON.stringify({ $case: 'data', data: { data: '' } }));
+  ws.on('close', () => peer?.kill());
   ws.on('message', (raw) => {
     const message = JSON.parse(raw);
-    if (message.$case === 'data') ws.send(JSON.stringify(message));
+    if (message.$case === 'data') {
+      if (!peer && message.data.data.startsWith('exec sh -c ')) {
+        // Execute the actual bridge protocol; an echoed command cannot prove exec.
+        peer = createRemoteExecPeer({
+          onData(data) { if (ws.readyState === 1) ws.send(JSON.stringify({ $case: 'data', data: { data } })); },
+          onError() { ws.terminate(); },
+          onClose() { if (ws.readyState === 1) ws.close(); },
+        });
+      }
+      if (peer) peer.write(message.data.data);
+      else ws.send(JSON.stringify(message));
+    }
     if (message.$case === 'disconnect') ws.send(JSON.stringify({ $case: 'exit', exit: { code: 0 } }));
   });
 });

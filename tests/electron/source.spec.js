@@ -142,7 +142,8 @@ test('real source wizard: skip/resume/back, private CAS, explicit SSH config, TL
     expect(proof.checks).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'local-listener', status: 'passed', code: 'LOCAL_SSH_OK', mode: 'ssh-auth' }),
       expect.objectContaining({ id: 'tls', status: 'passed', code: 'TLS_OK' }),
-      expect.objectContaining({ id: 'wss', status: 'passed', code: 'WSS_HANDSHAKE_OK' }),
+      expect.objectContaining({ id: 'wss', status: 'passed', code: 'WSS_SHELL_READY' }),
+      expect.objectContaining({ id: 'remote-command', status: 'passed', code: 'REMOTE_COMMAND_OK' }),
     ]));
     await screenshot(context, 'source-verified-wizard');
     await page.getByRole('button', { name: 'Finish setup', exact: true }).click();

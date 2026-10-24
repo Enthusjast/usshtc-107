@@ -9,7 +9,7 @@ function buildWssUrl(config = {}) {
   const params = new URLSearchParams({
     cluster: config.cluster || 'training',
     loginNode: config.loginNode || '11.11.10.202',
-    path: '',
+    path: config.path ?? '',
     cols: config.cols || '80',
     rows: config.rows || '24',
     useRoot: config.useRoot ? 'true' : 'false',

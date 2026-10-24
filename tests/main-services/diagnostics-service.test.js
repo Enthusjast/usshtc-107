@@ -9,6 +9,7 @@ const net = require('node:net');
 const tls = require('node:tls');
 const { WebSocket, WebSocketServer } = require('ws');
 const { createDiagnosticsService, fingerprintConfig } = require('../../electron/diagnostics-service');
+const { probeRemoteCommand } = require('../../electron/remote-command-probe');
 const { buildWssUrl } = require('../../electron/wss-connection');
 const { ProxyServer } = require('../../electron/proxy-server');
 const keyService = require('../../electron/ssh-key-service');
@@ -55,6 +56,7 @@ function fixture(options = {}) {
   const states = [], resources = [], revoked = [], requests = [];
   let saved = { ...config, ...options.config };
   let cookie = options.cookie === undefined ? 'session=fixture-private' : options.cookie;
+  let authGeneration = 1;
   let server;
   const resource = () => {
     const value = new EventEmitter();
@@ -88,7 +90,10 @@ function fixture(options = {}) {
           ws.emit('unexpected-response', {}, response);
         } else if (options.closeCode) ws.emit('close', options.closeCode, Buffer.from('private remote body'));
         else if (options.wssError) ws.emit('error', Object.assign(new Error('private network body'), { code: options.wssError }));
-        else { ws.readyState = 1; ws.emit('open'); }
+        else {
+          ws.readyState = 1; ws.emit('open');
+          if (!options.openOnly) ws.emit('message', Buffer.from(JSON.stringify({ $case: 'data', data: { data: '' } })));
+        }
       });
       return ws;
     },
@@ -106,6 +111,19 @@ function fixture(options = {}) {
     createSshClient() {
       const client = resource();
       client.end = () => { client.closed = true; };
+      client.exec = (command, callback) => {
+        requests.push(['exec', command]);
+        const channel = resource(); channel.stderr = resource(); channel.end = () => {};
+        channel.destroy = () => { channel.closed = true; channel.stderr.closed = true; };
+        callback(null, channel);
+        if (!options.hangCommand) queueMicrotask(() => {
+          const marker = command.match(/^printf '%s' '([a-f0-9]{48})'$/)?.[1];
+          assert.ok(marker, 'probe uses a fresh bounded marker command');
+          channel.emit('data', Buffer.from(options.wrongOutput ? 'private wrong output' : marker));
+          channel.emit('exit', options.commandExit ?? 0);
+          channel.emit('close', options.commandExit ?? 0);
+        });
+      };
       client.connect = (value) => {
         requests.push(['ssh', value]);
         assert.equal(value.privateKey, 'actual-adapter-key');
@@ -125,12 +143,14 @@ function fixture(options = {}) {
     getClientIdentity: () => ({ privateKey: 'actual-adapter-key' }),
     inspectSshConfig: options.inspectSshConfig || (() => ({ code: options.configCode || 'SSH_CONFIG_OK' })),
     getCookie: () => cookie,
+    getAuthGeneration: () => authGeneration,
     onState: (dto) => { states.push(dto); options.onState?.(dto, time); },
     onAuthRequired: (value) => revoked.push(value),
     adapters,
   };
   const service = createDiagnosticsService(deps);
   return { service, time, states, resources, revoked, requests, deps,
+    setAuthGeneration: (value) => { authGeneration = value; },
     setCookie: (value) => { cookie = value; }, setConfig: (value) => { saved = value; }, server: () => server };
 }
 const codes = (dto) => Object.fromEntries(dto.checks.map((check) => [check.id, check.code]));
@@ -139,10 +159,10 @@ const item = (dto, id) => dto.checks.find((check) => check.id === id);
 test('fingerprint uses fixed fields, normalizes derived URL, binds alias and ignores unrelated settings', () => {
   const original = fingerprintConfig(config);
   assert.match(original, /^[0-9a-f]{64}$/);
-  assert.equal(original, fingerprintConfig({ ...config, wssUrl: buildWssUrl(config), theme: 'light', savedCookie: 'never-hashed' }));
+  assert.equal(original, fingerprintConfig({ ...config, wssUrl: buildWssUrl(config), theme: 'light', healthProbeEnabled: true, savedCookie: 'never-hashed' }));
   assert.equal(original, fingerprintConfig(Object.fromEntries(Object.entries(config).reverse())));
   for (const [key, value] of Object.entries({ host: '::1', port: 4000, cluster: 'other', loginNode: 'localhost', cols: 100,
-    rows: 30, useRoot: true, sshAlias: 'other', wssUrl: 'wss://localhost:4443/fixture' })) {
+    rows: 30, useRoot: true, path: '/work with spaces', startupCommand: 'tmux new -A -s usshtc', sshAlias: 'other', wssUrl: 'wss://localhost:4443/fixture' })) {
     assert.notEqual(original, fingerprintConfig({ ...config, [key]: value }), key);
   }
 });
@@ -152,20 +172,21 @@ test('ordered DTO streams running and final states; stopped local check is expli
   const promise = f.service.run(scope);
   assert.strictEqual(f.service.run(scope), promise);
   const result = await promise;
-  assert.deepEqual(result.checks.map((check) => check.id), ['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'wss']);
+  assert.deepEqual(result.checks.map((check) => check.id), ['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'wss', 'remote-command']);
   assert.deepEqual(codes(result), { settings: 'SETTINGS_OK', keys: 'KEYS_OK', 'ssh-config': 'SSH_CONFIG_OK',
-    'local-listener': 'LOCAL_PORT_AVAILABLE', dns: 'DNS_OK', tls: 'TLS_OK', wss: 'WSS_HANDSHAKE_OK' });
-  assert.ok(result.checks.every((check) => check.status === 'passed' && check.durationMs >= 0));
+    'local-listener': 'LOCAL_PORT_AVAILABLE', dns: 'DNS_OK', tls: 'TLS_OK', wss: 'WSS_SHELL_READY', 'remote-command': 'DEPENDENCY_FAILED' });
+  assert.ok(result.checks.filter((check) => check.id !== 'remote-command').every((check) => check.status === 'passed' && check.durationMs >= 0));
+  assert.equal(item(result, 'remote-command').status, 'skipped');
   assert.equal(item(result, 'local-listener').mode, 'bind-only');
   assert.match(result.startedAt, /Z$/); assert.match(result.finishedAt, /Z$/);
   assert.deepEqual(f.states.filter((state) => state.checks.some((check) => check.status === 'running'))
     .map((state) => state.checks.find((check) => check.status === 'running').id)
-    .filter((id, index, ids) => id !== ids[index - 1]), result.checks.map((check) => check.id));
+    .filter((id, index, ids) => id !== ids[index - 1]), result.checks.filter((check) => check.status !== 'skipped').map((check) => check.id));
   assert.equal(f.time.size(), 0);
   assert.ok(f.resources.every((value) => value.closed));
   assert.deepEqual(f.service.get(scope), result);
   const copied = f.service.get(scope); copied.checks.length = 0;
-  assert.equal(f.service.get(scope).checks.length, 7);
+  assert.equal(f.service.get(scope).checks.length, 8);
   assert.equal(f.service.get({ ...scope, epoch: 2 }), null);
   f.setConfig({ ...config, port: 4000 });
   assert.equal(f.service.get(scope), null);
@@ -182,6 +203,7 @@ test('running local check authenticates only, pins full host wire, uses actual i
   const dto = await f.service.run(scope);
   assert.equal(item(dto, 'local-listener').mode, 'ssh-auth');
   assert.equal(item(dto, 'local-listener').code, 'LOCAL_SSH_OK');
+  assert.equal(item(dto, 'remote-command').code, 'REMOTE_COMMAND_OK');
   const ssh = f.requests.find(([type]) => type === 'ssh')[1];
   assert.equal(ssh.host, '::1'); assert.equal(ssh.port, 3000);
   assert.equal(f.requests.some(([type]) => type === 'bind'), false);
@@ -207,7 +229,7 @@ for (const code of ['SSH_KEY_MISSING', 'SSH_KEY_INVALID', 'SSH_KEY_PERMISSIONS',
     assert.equal(item(result, 'local-listener').status, 'skipped');
     assert.equal(item(result, 'ssh-config').code, 'SSH_CONFIG_OK');
     assert.equal(item(result, 'dns').code, 'DNS_OK'); assert.equal(item(result, 'tls').code, 'TLS_OK');
-    assert.equal(item(result, 'wss').code, 'WSS_HANDSHAKE_OK');
+    assert.equal(item(result, 'wss').code, 'WSS_SHELL_READY');
     assert.equal(f.requests.some(([type]) => type === 'ssh'), false);
   });
 }
@@ -217,7 +239,7 @@ for (const code of ['SSH_CONFIG_MISSING', 'SSH_CONFIG_MISMATCH', 'SSH_ALIAS_CONF
     const result = await f.service.run(scope);
     assert.equal(item(result, 'ssh-config').code, code);
     assert.equal(item(result, 'local-listener').code, 'LOCAL_PORT_AVAILABLE');
-    assert.equal(item(result, 'wss').code, 'WSS_HANDSHAKE_OK');
+    assert.equal(item(result, 'wss').code, 'WSS_SHELL_READY');
     assert.equal(JSON.stringify(result).includes('private config'), false);
   });
 }
@@ -225,7 +247,7 @@ for (const code of ['SSH_CONFIG_MISSING', 'SSH_CONFIG_MISMATCH', 'SSH_ALIAS_CONF
 test('port occupation and failed SSH authentication are fixed codes, not fabricated end-to-end successes', async () => {
   const stopped = await fixture({ portBusy: true }).service.run(scope);
   assert.equal(item(stopped, 'local-listener').code, 'PORT_IN_USE');
-  assert.equal(item(stopped, 'wss').code, 'WSS_HANDSHAKE_OK');
+  assert.equal(item(stopped, 'wss').code, 'WSS_SHELL_READY');
   const running = await fixture({ running: true, sshError: true }).service.run(scope);
   assert.equal(item(running, 'local-listener').code, 'LOCAL_SSH_FAILED');
 });
@@ -295,7 +317,7 @@ test('stalled local inspections obey the same timeout and independent checks con
   const result = await promise;
   assert.equal(item(result, 'keys').code, 'TIMEOUT'); assert.equal(item(result, 'ssh-config').code, 'TIMEOUT');
   assert.equal(item(result, 'local-listener').code, 'LOCAL_PORT_AVAILABLE');
-  assert.equal(item(result, 'wss').code, 'WSS_HANDSHAKE_OK');
+  assert.equal(item(result, 'wss').code, 'WSS_SHELL_READY');
 });
 
 test('overall deadline closes active resource and marks every remaining check skipped', async () => {
@@ -345,7 +367,7 @@ test('a different scope/config cancels the old run without overwriting latest DT
 });
 
 // Real fixtures exercise the production ssh2/net/TLS/ws paths, with only fixed
-// loopback remapping injected in main. No account, platform request, or command.
+// loopback remapping injected in main and a bounded command protocol emulator.
 const certificate = fs.readFileSync(path.join(__dirname, '../fixtures/loopback-test-only-cert.pem'));
 const certificateKey = fs.readFileSync(path.join(__dirname, '../fixtures/loopback-test-only-key.pem'));
 async function realFixture(t, { status = 101, closeCode, running = true, trust = true, hangUpgrade = false } = {}) {
@@ -376,12 +398,32 @@ async function realFixture(t, { status = 101, closeCode, running = true, trust =
   });
   wss.on('connection', (ws) => {
     peers.add(ws); ws.on('close', () => peers.delete(ws));
-    ws.on('message', () => { messages += 1; });
+    let nonce;
+    ws.on('message', (raw) => {
+      messages += 1;
+      const message = JSON.parse(raw.toString());
+      if (message.$case !== 'data') return;
+      const text = message.data.data;
+      const send = (data) => ws.send(JSON.stringify({ $case: 'data', data: { data } }));
+      if (!nonce) {
+        nonce = text.match(/USSHTC_([a-f0-9]{64}):READY/)?.[1];
+        assert.ok(nonce);
+        send(`\x1eUSSHTC_${nonce}:READY\x1f`);
+      } else {
+        const command = Buffer.from(text.trim(), 'base64').toString();
+        const marker = command.match(/^printf '%s' '([a-f0-9]{48})'$/)?.[1];
+        assert.ok(marker);
+        send(`\x1eUSSHTC_${nonce}:START\x1f`);
+        send(Buffer.from(`${marker}\x1eUSSHTC_${nonce}:END:0\x1f`).toString('base64'));
+      }
+    });
     if (closeCode) ws.close(closeCode, 'private remote response');
+    else ws.send(JSON.stringify({ $case: 'data', data: { data: '' } }));
   });
   httpsServer.listen(0, '127.0.0.1'); await once(httpsServer, 'listening');
   const proxy = new ProxyServer({ host: '127.0.0.1', port: 0, cookie: 'session=real-fixture', hostKey,
-    authorizedKey: Buffer.from(client.publicKeyRaw, 'base64'), authorizedKeyOpenSSH: client.publicKey });
+    authorizedKey: Buffer.from(client.publicKeyRaw, 'base64'), authorizedKeyOpenSSH: client.publicKey,
+    webSocketFactory: (_url, options) => new WebSocket(`wss://127.0.0.1:${httpsServer.address().port}/fixture`, { ...options, ca: certificate }) });
   let address;
   proxy.on('started', (value) => { address = value; });
   proxy.on('session-open', () => { sshSessions += 1; });
@@ -430,16 +472,17 @@ async function realFixture(t, { status = 101, closeCode, running = true, trust =
     counters: () => ({ messages, sshSessions, upgrades }) };
 }
 
-test('real SSH diagnostics authenticate existing PKCS8 identity, pin host, and perform TLS/WSS without any command', { timeout: 15000 }, async (t) => {
+test('real SSH diagnostics authenticate existing PKCS8 identity, pin host, and prove a marker exec through TLS/WSS', { timeout: 15000 }, async (t) => {
   const f = await realFixture(t);
   const result = await f.service.run(scope);
   assert.equal(item(result, 'keys').code, 'KEYS_OK'); assert.equal(item(result, 'ssh-config').code, 'SSH_CONFIG_OK');
   assert.equal(item(result, 'local-listener').code, 'LOCAL_SSH_OK');
   assert.equal(item(result, 'local-listener').mode, 'ssh-auth');
-  assert.equal(item(result, 'tls').code, 'TLS_OK'); assert.equal(item(result, 'wss').code, 'WSS_HANDSHAKE_OK');
+  assert.equal(item(result, 'tls').code, 'TLS_OK'); assert.equal(item(result, 'wss').code, 'WSS_SHELL_READY');
+  assert.equal(item(result, 'remote-command').code, 'REMOTE_COMMAND_OK');
   assert.deepEqual(fs.readFileSync(f.client.privateKeyPath), f.originalPrivate);
   assert.match(f.originalPrivate.toString(), /BEGIN PRIVATE KEY/);
-  assert.deepEqual(f.counters(), { messages: 0, sshSessions: 0, upgrades: 1 });
+  assert.deepEqual(f.counters(), { messages: 2, sshSessions: 1, upgrades: 2 });
 });
 
 test('real bind-only releases its temporary port and never claims SSH authentication', { timeout: 15000 }, async (t) => {
@@ -469,10 +512,10 @@ for (const status of [401, 403]) {
   });
 }
 for (const closeCode of [1008, 1011]) {
-  test(`real WSS upgrade followed by ${closeCode} is handshake-only success, not revoked application auth`, { timeout: 15000 }, async (t) => {
+  test(`real WSS upgrade followed by ${closeCode} never proves shell readiness or revokes auth`, { timeout: 15000 }, async (t) => {
     const f = await realFixture(t, { closeCode });
     const result = await f.service.run(scope);
-    assert.equal(item(result, 'wss').code, 'WSS_HANDSHAKE_OK'); assert.equal(f.revoked.length, 0);
+    assert.equal(item(result, 'wss').code, 'WSS_FAILED'); assert.equal(f.revoked.length, 0);
     assert.equal(f.counters().messages, 0);
   });
 }
@@ -497,7 +540,7 @@ test('real occupied local port is reported while independent TLS/WSS checks cont
   t.after(() => new Promise((resolve) => listener.close(resolve)));
   const result = await f.service.run(scope);
   assert.equal(item(result, 'local-listener').code, 'PORT_IN_USE');
-  assert.equal(item(result, 'wss').code, 'WSS_HANDSHAKE_OK');
+  assert.equal(item(result, 'wss').code, 'WSS_SHELL_READY');
 });
 
 test('real missing client key remains missing: diagnostics never ensure or repair identity files', { timeout: 15000 }, async (t) => {
@@ -507,7 +550,7 @@ test('real missing client key remains missing: diagnostics never ensure or repai
   assert.equal(item(result, 'keys').code, 'SSH_KEY_MISSING');
   assert.equal(item(result, 'local-listener').status, 'skipped');
   assert.equal(fs.existsSync(f.client.privateKeyPath), false);
-  assert.equal(item(result, 'wss').code, 'WSS_HANDSHAKE_OK');
+  assert.equal(item(result, 'wss').code, 'WSS_SHELL_READY');
 });
 
 test('authentication revocation abort after final publication retains the proven AUTH_REQUIRED result', async () => {
@@ -539,4 +582,155 @@ test('real unsafe private-key mode is reported without chmod or repair', {
   assert.equal(item(result, 'local-listener').status, 'skipped');
   assert.equal(fs.statSync(f.client.privateKeyPath).mode & 0o777, 0o644);
   assert.deepEqual(fs.readFileSync(f.client.privateKeyPath), f.originalPrivate);
+});
+
+test('open alone and unknown frames cannot pass; empty valid data proves readiness', async () => {
+  const f = fixture({ openOnly: true, running: true });
+  const promise = f.service.run(scope);
+  await flush();
+  const ws = f.resources.find((value) => value.readyState === 1);
+  assert.equal(item(f.states.at(-1), 'wss').status, 'running');
+  for (const frame of ['not-json', 'null', '{}', '{"$case":"ping"}', '{"$case":"data","data":{"data":1}}']) {
+    ws.emit('message', Buffer.from(frame));
+  }
+  await f.time.tick(5000);
+  assert.equal(item(f.states.at(-1), 'wss').status, 'running');
+  assert.equal(f.requests.some(([type]) => type === 'exec'), false);
+  ws.emit('message', Buffer.from('{"$case":"data","data":{"data":""}}'));
+  const result = await promise;
+  assert.equal(item(result, 'wss').code, 'WSS_SHELL_READY');
+  assert.equal(item(result, 'remote-command').code, 'REMOTE_COMMAND_OK');
+  assert.equal(f.time.size(), 0);
+  for (const [, command] of f.requests.filter(([type]) => type === 'exec')) {
+    assert.equal(JSON.stringify(f.states).includes(command), false);
+  }
+});
+
+test('first valid frame deadline starts after open and silence never revokes auth', async () => {
+  const f = fixture({ hangWss: true });
+  const promise = f.service.run(scope);
+  await f.time.tick(4500);
+  const ws = f.resources.find((value) => value.readyState === 0);
+  ws.readyState = 1; ws.emit('open');
+  await f.time.tick(9999);
+  assert.equal(item(f.states.at(-1), 'wss').status, 'running');
+  await f.time.tick(1);
+  const result = await promise;
+  assert.equal(item(result, 'wss').code, 'REMOTE_READY_TIMEOUT');
+  assert.equal(item(result, 'wss').durationMs, 14500);
+  assert.equal(item(result, 'remote-command').status, 'skipped');
+  assert.equal(f.revoked.length, 0);
+  assert.ok(f.resources.every((value) => value.closed));
+  assert.equal(f.time.size(), 0);
+});
+
+test('network failure after open remains network failure rather than silence or auth', async () => {
+  const f = fixture({ openOnly: true });
+  const promise = f.service.run(scope);
+  await flush();
+  f.resources.find((value) => value.readyState === 1).emit('error', Object.assign(new Error('secret'), { code: 'ENETDOWN' }));
+  assert.equal(item(await promise, 'wss').code, 'NETWORK_UNAVAILABLE');
+  assert.equal(f.revoked.length, 0);
+  assert.equal(f.time.size(), 0);
+});
+
+for (const change of ['cookie', 'auth-generation', 'config']) {
+  test(`first-frame proof rejects stale ${change} and cannot run a command`, async () => {
+    const f = fixture({ openOnly: true, running: true });
+    const promise = f.service.run(scope);
+    await flush();
+    if (change === 'cookie') f.setCookie('replacement-private-cookie');
+    if (change === 'auth-generation') f.setAuthGeneration(2);
+    if (change === 'config') f.setConfig({ ...config, path: '/changed' });
+    f.resources.find((value) => value.readyState === 1).emit('message', Buffer.from('{"$case":"data","data":{"data":""}}'));
+    assert.equal(item(await promise, 'wss').code, 'CANCELLED');
+    assert.equal(f.service.get(scope), null);
+    assert.equal(f.requests.some(([type]) => type === 'exec'), false);
+    assert.equal(f.revoked.length, 0);
+  });
+}
+
+for (const change of ['cookie', 'auth-generation']) {
+  test(`cached diagnostic proof expires with ${change} even in the same scope`, async () => {
+    const f = fixture({ running: true });
+    await f.service.run(scope);
+    assert.ok(f.service.get(scope));
+    if (change === 'cookie') f.setCookie('replacement-private-cookie');
+    else f.setAuthGeneration(2);
+    assert.equal(f.service.get(scope), null);
+    const next = await f.service.run(scope);
+    assert.equal(next.authGeneration, change === 'cookie' ? 1 : 2);
+    assert.equal(item(next, 'remote-command').code, 'REMOTE_COMMAND_OK');
+  });
+}
+
+for (const options of [{ wrongOutput: true }, { commandExit: 7 }]) {
+  test(`remote command requires exact nonce and exit zero: ${JSON.stringify(options)}`, async () => {
+    const f = fixture({ running: true, ...options });
+    const result = await f.service.run(scope);
+    assert.equal(item(result, 'wss').code, 'WSS_SHELL_READY');
+    assert.equal(item(result, 'remote-command').code, 'REMOTE_COMMAND_FAILED');
+    assert.equal(JSON.stringify(result).includes('private wrong output'), false);
+    assert.equal(f.revoked.length, 0);
+  });
+}
+
+for (const stage of ['first-frame', 'remote-command']) {
+  test(`abort cleans up pending ${stage} without authentication invalidation`, async () => {
+    const f = fixture({ running: true, openOnly: stage === 'first-frame', hangCommand: stage === 'remote-command' });
+    const controller = new AbortController();
+    const promise = f.service.run({ ...scope, signal: controller.signal });
+    await flush();
+    controller.abort();
+    const result = await promise;
+    assert.equal(item(result, stage === 'first-frame' ? 'wss' : 'remote-command').code, 'CANCELLED');
+    assert.ok(f.resources.every((value) => value.closed));
+    assert.equal(f.time.size(), 0);
+    assert.equal(f.revoked.length, 0);
+  });
+}
+
+test('remote command has a bounded deadline independent of shell readiness', async () => {
+  const f = fixture({ running: true, hangCommand: true });
+  const promise = f.service.run(scope);
+  await f.time.tick(14999);
+  assert.equal(item(f.states.at(-1), 'remote-command').status, 'running');
+  await f.time.tick(1);
+  assert.equal(item(await promise, 'remote-command').code, 'TIMEOUT');
+  assert.ok(f.resources.every((value) => value.closed));
+  assert.equal(f.time.size(), 0);
+});
+
+test('shared probe pins host key, handles fragmented output and bounds stderr without retaining output', async () => {
+  for (const mode of ['success', 'overflow', 'signal', 'missing-exit', 'true']) {
+    const client = new EventEmitter(); client.destroy = () => {};
+    const channel = new EventEmitter(); channel.stderr = new EventEmitter();
+    channel.destroy = () => {}; channel.end = () => {};
+    let sent;
+    client.connect = (options) => {
+      assert.equal(options.host, '127.0.0.1');
+      assert.equal(options.hostVerifier(wire), true);
+      assert.equal(options.hostVerifier(Buffer.alloc(32)), false);
+      queueMicrotask(() => client.emit('ready'));
+    };
+    client.exec = (command, callback) => {
+      sent = command;
+      callback(null, channel);
+      queueMicrotask(() => {
+        if (mode === 'overflow') return channel.stderr.emit('data', Buffer.alloc(4097));
+        const marker = command.match(/^printf '%s' '([a-f0-9]{48})'$/)?.[1] || '';
+        channel.emit('data', Buffer.from(marker.slice(0, 17)));
+        channel.emit('data', Buffer.from(marker.slice(17)));
+        if (mode !== 'missing-exit') channel.emit('exit', mode === 'signal' ? null : 0, mode === 'signal' ? 'TERM' : null);
+        channel.emit('close');
+      });
+    };
+    const pending = probeRemoteCommand({ config: { host: '0.0.0.0', port: 3000 }, identity: { privateKey: 'private' },
+      hostFingerprint, createSshClient: () => client, ...(mode === 'true' ? { command: 'true' } : {}) });
+    if (mode === 'success' || mode === 'true') assert.equal(await pending, 'REMOTE_COMMAND_OK');
+    else await assert.rejects(pending, { code: 'REMOTE_COMMAND_FAILED' });
+    if (mode === 'true') assert.equal(sent, 'true');
+    assert.equal(client.listenerCount('ready'), 0);
+    assert.equal(channel.listenerCount('data'), 0);
+  }
 });

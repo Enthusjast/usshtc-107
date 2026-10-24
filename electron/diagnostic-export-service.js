@@ -4,10 +4,10 @@ const { redactLogMessage } = require('./log-redaction');
 const { validateLogFilters, filterLogs, isLogTimestamp } = require('../shared/log-filters.mjs');
 
 const MAX_EXPORT_BYTES = 8 * 1024 * 1024;
-const SETTINGS = ['host', 'port', 'cluster', 'loginNode', 'cols', 'rows', 'useRoot', 'wssUrl', 'sshAlias'];
-const CHECK_IDS = new Set(['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'wss']);
+const SETTINGS = ['host', 'port', 'cluster', 'loginNode', 'cols', 'rows', 'useRoot', 'path', 'startupCommand', 'healthProbeEnabled', 'wssUrl', 'sshAlias'];
+const CHECK_IDS = new Set(['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'wss', 'remote-command']);
 const STATUSES = new Set(['pending', 'running', 'passed', 'failed', 'skipped']);
-const CODES = new Set(('SETTINGS_OK SETTINGS_INVALID SETTINGS_LOCKED KEYS_OK SSH_KEY_MISSING SSH_KEY_INVALID SSH_KEY_PERMISSIONS SSH_KEY_FINGERPRINT_MISMATCH SSH_CONFIG_OK SSH_CONFIG_MISSING SSH_CONFIG_MISMATCH SSH_ALIAS_CONFLICT SSH_CONFIG_INVALID LOCAL_SSH_OK LOCAL_PORT_AVAILABLE PORT_IN_USE LOCAL_SSH_FAILED DNS_OK DNS_FAILED TLS_OK TLS_FAILED WSS_HANDSHAKE_OK AUTH_REQUIRED WSS_FAILED NETWORK_UNAVAILABLE TIMEOUT CANCELLED DEPENDENCY_FAILED DIAGNOSTIC_DEADLINE').split(' '));
+const CODES = new Set(('SETTINGS_OK SETTINGS_INVALID SETTINGS_LOCKED KEYS_OK SSH_KEY_MISSING SSH_KEY_INVALID SSH_KEY_PERMISSIONS SSH_KEY_FINGERPRINT_MISMATCH SSH_CONFIG_OK SSH_CONFIG_MISSING SSH_CONFIG_MISMATCH SSH_ALIAS_CONFLICT SSH_CONFIG_INVALID LOCAL_SSH_OK LOCAL_PORT_AVAILABLE PORT_IN_USE LOCAL_SSH_FAILED DNS_OK DNS_FAILED TLS_OK TLS_FAILED WSS_SHELL_READY REMOTE_READY_TIMEOUT REMOTE_COMMAND_OK REMOTE_COMMAND_FAILED AUTH_REQUIRED WSS_FAILED NETWORK_UNAVAILABLE TIMEOUT CANCELLED DEPENDENCY_FAILED DIAGNOSTIC_DEADLINE').split(' '));
 const LEVELS = new Set(['debug', 'info', 'warn', 'error']);
 function fail(code) { const error = new Error(code); error.code = code; return error; }
 function text(value, max = 256) { return typeof value === 'string' ? value.slice(0, max) : ''; }
@@ -17,9 +17,10 @@ function safeDiagnostics(value) {
     runId: /^[a-zA-Z0-9_-]{1,128}$/.test(value.runId) ? value.runId : '',
     profileId: text(value.profileId, 128), epoch: Number.isSafeInteger(value.epoch) ? value.epoch : 0,
     configFingerprint: /^[a-f0-9]{64}$/i.test(value.configFingerprint) ? value.configFingerprint : '',
+    authGeneration: Number.isSafeInteger(value.authGeneration) && value.authGeneration >= 0 ? value.authGeneration : null,
     startedAt: isLogTimestamp(value.startedAt) ? value.startedAt : null,
     finishedAt: isLogTimestamp(value.finishedAt) ? value.finishedAt : null,
-    checks: (Array.isArray(value.checks) ? value.checks : []).slice(0, 7).filter((check) => CHECK_IDS.has(check.id)).map((check) => ({
+    checks: (Array.isArray(value.checks) ? value.checks : []).slice(0, CHECK_IDS.size).filter((check) => CHECK_IDS.has(check.id)).map((check) => ({
       id: check.id, status: STATUSES.has(check.status) ? check.status : 'skipped',
       code: CODES.has(check.code) ? check.code : null,
       durationMs: Number.isFinite(check.durationMs) && check.durationMs >= 0 ? Math.min(check.durationMs, 30000) : 0,
@@ -79,7 +80,8 @@ function createDiagnosticExportService({ dialog, getWindow, getRuntime = () => (
       const saved = getSettings(scope);
       for (const key of SETTINGS) {
         const value = saved[key];
-        if (typeof value === 'string') settings[key] = clean(text(value));
+        if (key === 'startupCommand' && value !== '' && value !== 'tmux new -A -s usshtc') continue;
+        if (typeof value === 'string') settings[key] = clean(text(value, key === 'path' ? 1024 : 256));
         else if (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))) settings[key] = value;
       }
       const value = { formatVersion: 1, generatedAt: new Date(clock()).toISOString(), runtime,

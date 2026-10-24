@@ -4,6 +4,8 @@ const {
   APP_DEFAULTS,
   PROFILE_DEFAULTS,
   APP_SETTING_KEYS,
+  PROFILE_SETTING_KEYS,
+  TMUX_STARTUP_COMMAND,
   parseHost,
   parseInteger,
   parseToken,
@@ -104,7 +106,7 @@ test('tokens enforce allowed characters and independent field lengths', () => {
 });
 
 test('boolean and enum validation preserves existing supported representations', () => {
-  for (const key of ['useRoot', 'autoConnect', ...APP_SETTING_KEYS.filter((key) => typeof APP_DEFAULTS[key] === 'boolean')]) {
+  for (const key of ['useRoot', 'autoConnect', 'healthProbeEnabled', ...APP_SETTING_KEYS.filter((key) => typeof APP_DEFAULTS[key] === 'boolean')]) {
     for (const value of [true, false, 'true', 'false']) {
       assert.equal(validateSettingsPatch({ [key]: value }).value[key], value === true || value === 'true');
     }
@@ -162,4 +164,31 @@ test('SSH config generation consumes the same host, port and alias validation', 
   assert.match(block, /Host alias\n  HostName ::1\n  Port 3000/);
   rejectsCode(() => buildManagedBlock({ alias: 'alias\n', host: 'localhost', port: 3000, privateKeyPath: '/fixture/key' }), 'invalid_token');
   rejectsCode(() => buildManagedBlock({ alias: 'alias', host: 'localhost\n', port: 3000, privateKeyPath: '/fixture/key' }), 'invalid_host');
+});
+
+test('remote path is optional, length-bounded and preserves POSIX spaces and punctuation', () => {
+  assert.equal(PROFILE_DEFAULTS.path, '');
+  for (const path of ['', ' ', ' /home/research data/目录 & # +% ', 'a'.repeat(1024)]) {
+    const result = validateSettingsPatch({ path });
+    assert.equal(result.ok, true);
+    assert.equal(result.value.path, path);
+  }
+  for (const path of ['a'.repeat(1025), null, 1, {}, ...['\n', '\r', '\t', '\0', '\x1b', '\x7f', '\x85', '\u2028', '\u2029'].map((control) => `/home/a${control}`)]) {
+    assert.deepEqual(validateSettingsPatch({ path }), { ok: false, fieldErrors: { path: 'invalid_path' } });
+  }
+});
+
+test('session preservation is a conservative opt-in and health probes default off per profile', () => {
+  assert.equal(PROFILE_DEFAULTS.startupCommand, '');
+  assert.equal(PROFILE_DEFAULTS.healthProbeEnabled, false);
+  for (const key of ['path', 'startupCommand', 'healthProbeEnabled']) {
+    assert.equal(PROFILE_SETTING_KEYS.includes(key), true);
+    assert.equal(APP_SETTING_KEYS.includes(key), false);
+  }
+  for (const startupCommand of ['', TMUX_STARTUP_COMMAND]) {
+    assert.equal(validateSettingsPatch({ startupCommand }).value.startupCommand, startupCommand);
+  }
+  for (const startupCommand of [null, false, 'tmux', ` ${TMUX_STARTUP_COMMAND}`, `${TMUX_STARTUP_COMMAND}\n`, `${TMUX_STARTUP_COMMAND}; id`, 'tmux new -A -s other']) {
+    assert.deepEqual(validateSettingsPatch({ startupCommand }), { ok: false, fieldErrors: { startupCommand: 'invalid_startup_command' } });
+  }
 });

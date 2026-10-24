@@ -45,6 +45,53 @@ test('fresh schema is complete, has empty isolated secrets and does not create a
   assert.deepEqual(publicSettings(root), { ...root.app, ...root.profiles[0].settings });
 });
 
+test('new remote preferences round-trip independently for each profile without exposing secrets', (t) => {
+  const { store, filePath } = fixture(t);
+  const root = createDefaultRoot();
+  root.profiles[0].settings.path = ' /home/research data/目录 &% ';
+  root.profiles[0].settings.startupCommand = 'tmux new -A -s usshtc';
+  root.profiles[0].settings.healthProbeEnabled = true;
+  root.profiles.push(nextProfile(createDefaultRoot()));
+  assert.equal(store.save(root).state, 'committed');
+  const loaded = new SettingsStore({ filePath }).load();
+  assert.deepEqual(loaded, root);
+  assert.deepEqual(publicSettings(loaded), { ...root.app, ...root.profiles[0].settings });
+  const second = publicSettings(loaded, root.profiles[1].id);
+  assert.equal(second.path, '');
+  assert.equal(second.startupCommand, '');
+  assert.equal(second.healthProbeEnabled, false);
+});
+
+test('older schema 2 profiles gain only new optional defaults without rewriting the file', (t) => {
+  const { store, filePath } = fixture(t);
+  const older = createDefaultRoot();
+  for (const key of ['path', 'startupCommand', 'healthProbeEnabled']) delete older.profiles[0].settings[key];
+  write(filePath, older);
+  const original = fs.readFileSync(filePath, 'utf8');
+  const loaded = store.load();
+  assert.equal(store.isLocked(), false);
+  assert.deepEqual(loaded, createDefaultRoot());
+  assert.equal(fs.readFileSync(filePath, 'utf8'), original);
+  assert.equal(store.save(loaded).state, 'committed');
+  assert.deepEqual(JSON.parse(fs.readFileSync(filePath, 'utf8')), loaded);
+});
+
+test('new optional defaults do not hide missing required settings or invalid opt-ins', (t) => {
+  for (const mutate of [
+    (settings) => { delete settings.host; },
+    (settings) => { settings.path = '/home/a\n'; },
+    (settings) => { settings.startupCommand = 'arbitrary command'; },
+    (settings) => { settings.healthProbeEnabled = 'true'; },
+  ]) {
+    const { store, filePath } = fixture(t);
+    const root = createDefaultRoot();
+    mutate(root.profiles[0].settings);
+    write(filePath, root);
+    assert.throws(() => store.load(), { code: 'SETTINGS_INVALID' });
+    assert.equal(store.isLocked(), true);
+  }
+});
+
 test('full root validation rejects malformed references, duplicates and additional secret fields', () => {
   const mutations = [
     (root) => { root.activeProfileId = crypto.randomUUID(); },

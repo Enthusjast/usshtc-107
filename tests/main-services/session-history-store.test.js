@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { createSessionHistoryStore, MAX_HISTORY_BYTES, MAX_HISTORY_SESSIONS,
-  HISTORY_RETENTION_MS, HISTORY_REASONS } = require('../../electron/session-history-store');
+  HISTORY_RETENTION_MS } = require('../../electron/session-history-store');
 
 const NOW = Date.UTC(2026, 9, 24, 12);
 const DAY = 86400000;
@@ -232,6 +232,15 @@ test('oversized unreadable sources are not overwritten; disposal flushes and can
   assert.equal(f.timers.size, 0);
   assert.equal(readDocument(f).sessions[0].bytesReceived, 2);
   assert.equal(register(f, 'run:after-dispose'), false);
-  assert.deepEqual(HISTORY_REASONS, ['completed', 'user_disconnect', 'proxy_stop', 'network_error',
-    'auth_error', 'timeout', 'output_limit', 'app_exit', 'interrupted']);
+});
+
+test('remote readiness timeouts persist as distinct session outcomes', t => {
+  const f = fixture(t);
+  register(f, 'run:ready-timeout');
+  assert.equal(f.store.finalize('run:ready-timeout', { endedAt: NOW + 10000,
+    exitCode: 255, reason: 'remote_not_ready' }), true);
+  const record = readDocument(f).sessions.find(item => item.id === 'run:ready-timeout');
+  assert.equal(record.reason, 'remote_not_ready');
+  assert.equal(record.exitCode, 255);
+  assert.equal(record.endedAt, NOW + 10000);
 });

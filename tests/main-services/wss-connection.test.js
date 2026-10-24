@@ -18,6 +18,18 @@ test('WSS URL preserves platform defaults and safely encodes saved connection fi
   assert.equal(buildWssUrl({ wssUrl: 'wss://localhost:4443/main-only-fixture' }), 'wss://localhost:4443/main-only-fixture');
 });
 
+test('WSS path preserves POSIX spaces and cannot inject another query parameter', () => {
+  const path = ' /home/研究 data/a&useRoot=true# +% ';
+  const url = new URL(buildWssUrl({ path, useRoot: false, startupCommand: 'tmux new -A -s usshtc', healthProbeEnabled: true }));
+  assert.equal(url.searchParams.get('path'), path);
+  assert.equal(url.searchParams.get('useRoot'), 'false');
+  assert.equal(url.searchParams.getAll('useRoot').length, 1);
+  assert.equal(url.hash, '');
+  assert.equal(url.searchParams.has('startupCommand'), false);
+  assert.equal(url.searchParams.has('healthProbeEnabled'), false);
+  assert.match(url.search, /path=\+%2Fhome%2F/);
+});
+
 test('WSS options preserve immutable TLS policy and append custom trust to default roots', () => {
   const defaults = buildWssOptions();
   assert.equal(defaults.rejectUnauthorized, true);

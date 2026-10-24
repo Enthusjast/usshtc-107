@@ -27,7 +27,7 @@ function fixture(t, overrides = {}) {
 test('diagnostic JSON is allowlisted, re-redacted and excludes private paths', async (t) => {
   const f = fixture(t, { getDiagnostics: () => ({ runId: 'run-1', ...scope, configFingerprint: 'a'.repeat(64),
     startedAt: time, finishedAt: time, secret: 'top-secret', checks: [{ id: 'wss', status: 'passed',
-      code: 'WSS_HANDSHAKE_OK', durationMs: 5, body: 'remote-secret' }, { id: 'arbitrary', code: 'unsafe' }] }) });
+      code: 'WSS_SHELL_READY', durationMs: 5, body: 'remote-secret' }, { id: 'arbitrary', code: 'unsafe' }] }) });
   f.logs[0].message = 'Cookie: secret-cookie\nAuthorization: Bearer secret-token\npassword=secret-password ticket=secret-ticket /private/home/app/log /private/home/file\nExec: secret-command\n-----BEGIN PRIVATE KEY-----\nsecret-key\n-----END PRIVATE KEY-----';
   f.logs.push({ ...scope, epoch: 1, time, level: 'warn', source: 'app', message: 'previous scope' });
   assert.deepEqual(await f.service.exportDiagnostics(scope), { exported: true });
@@ -95,4 +95,45 @@ test('caps at 500 records and trims oldest whole records to the eight MiB limit'
   assert.ok(value.logs[0].message.startsWith(`${10 + value.truncatedLogCount}:`));
   assert.ok(value.logs.at(-1).message.startsWith('509:'));
   assert.equal(value.logs.every((entry) => typeof entry.message === 'string'), true);
+});
+
+test('exports all eight bounded proof checks and public profile options without remote command or output bodies', async (t) => {
+  const ids = ['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'wss', 'remote-command'];
+  const codes = ['SETTINGS_OK', 'KEYS_OK', 'SSH_CONFIG_OK', 'LOCAL_SSH_OK', 'DNS_OK', 'TLS_OK', 'WSS_SHELL_READY', 'REMOTE_COMMAND_OK'];
+  const remotePath = `/private/home/work with spaces/${'a'.repeat(300)}`;
+  const f = fixture(t, { getSettings: () => ({ host: 'localhost', port: 3000, path: remotePath,
+    startupCommand: 'tmux new -A -s usshtc', healthProbeEnabled: true, cookie: 'private-cookie', privateKey: 'private-key' }),
+  getDiagnostics: () => ({ runId: 'run-proof', ...scope, configFingerprint: 'b'.repeat(64), authGeneration: 4,
+    startedAt: time, finishedAt: time, command: 'private-command', output: 'private-output',
+    checks: ids.map((id, index) => ({ id, status: 'passed', code: codes[index], durationMs: 1,
+      command: 'private-command', stdout: 'private-output', stderr: 'private-stderr' })) }) });
+  await f.service.exportDiagnostics(scope);
+  const raw = fs.readFileSync(f.filePath, 'utf8');
+  const value = JSON.parse(raw);
+  assert.deepEqual(value.diagnostics.checks.map((check) => check.id), ids);
+  assert.deepEqual(value.diagnostics.checks.map((check) => check.code), codes);
+  assert.equal(value.diagnostics.authGeneration, 4);
+  assert.equal(value.settings.path, remotePath.replace('/private/home', '[HOME]'));
+  assert.equal(value.settings.startupCommand, 'tmux new -A -s usshtc');
+  assert.equal(value.settings.healthProbeEnabled, true);
+  for (const secret of ['private-cookie', 'private-key', 'private-command', 'private-output', 'private-stderr', '/private/home']) {
+    assert.equal(raw.includes(secret), false, secret);
+  }
+});
+
+test('exports readiness and command failures distinctly and excludes obsolete handshake codes and arbitrary startup commands', async (t) => {
+  const f = fixture(t, { getSettings: () => ({ startupCommand: 'printf private-command' }),
+    getDiagnostics: () => ({ runId: 'run-failed', ...scope, configFingerprint: 'c'.repeat(64), authGeneration: -1,
+      startedAt: time, finishedAt: time, checks: [
+        { id: 'wss', status: 'failed', code: 'REMOTE_READY_TIMEOUT', durationMs: 10000 },
+        { id: 'remote-command', status: 'failed', code: 'REMOTE_COMMAND_FAILED', durationMs: 15000 },
+        { id: 'tls', status: 'passed', code: 'WSS_HANDSHAKE_OK', durationMs: 1 },
+      ] }) });
+  await f.service.exportDiagnostics(scope);
+  const raw = fs.readFileSync(f.filePath, 'utf8');
+  const value = JSON.parse(raw);
+  assert.deepEqual(value.diagnostics.checks.map((check) => check.code), ['REMOTE_READY_TIMEOUT', 'REMOTE_COMMAND_FAILED', null]);
+  assert.equal(value.diagnostics.authGeneration, null);
+  assert.equal(Object.hasOwn(value.settings, 'startupCommand'), false);
+  assert.equal(raw.includes('private-command'), false);
 });

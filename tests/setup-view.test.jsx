@@ -19,10 +19,10 @@ const runtime = vi.hoisted(() => ({ scope: null, snapshot: null, getScope: vi.fn
 vi.mock('../src/lib/electron', async (original) => ({ ...await original(), ...api }));
 vi.mock('../src/contexts/RuntimeContext', async (original) => ({ ...await original(), useRuntime: () => runtime }));
 
-const config = { host: '127.0.0.1', port: 3000, cluster: 'training', loginNode: '11.11.10.202', cols: 80, rows: 24, useRoot: false, wssUrl: 'wss://fixed.invalid/' };
+const config = { host: '127.0.0.1', port: 3000, cluster: 'training', loginNode: '11.11.10.202', cols: 80, rows: 24, useRoot: false, path: '', startupCommand: '', wssUrl: 'wss://fixed.invalid/' };
 const preview = { block: '# managed\nHost usshtc107\n  Port 3000\nHost *\n', changed: true, sourceHash: 'a'.repeat(64), configHash: 'b'.repeat(64), backupPath: null };
-const ids = ['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'wss'];
-const codes = ['SETTINGS_OK', 'KEYS_OK', 'SSH_CONFIG_OK', 'LOCAL_SSH_OK', 'DNS_OK', 'TLS_OK', 'WSS_HANDSHAKE_OK'];
+const ids = ['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'wss', 'remote-command'];
+const codes = ['SETTINGS_OK', 'KEYS_OK', 'SSH_CONFIG_OK', 'LOCAL_SSH_OK', 'DNS_OK', 'TLS_OK', 'WSS_SHELL_READY', 'REMOTE_COMMAND_OK'];
 let profiles;
 let listeners;
 const emit = (value) => listeners.forEach((listener) => listener(value));
@@ -274,6 +274,12 @@ describe('Temporary first-use setup', () => {
     ['bind-only', (run) => changeCheck(run, 'local-listener', { code: 'LOCAL_PORT_AVAILABLE', mode: 'bind-only' })],
     ['bind-only with an SSH code', (run) => changeCheck(run, 'local-listener', { mode: 'bind-only' })],
     ['a failed WSS upgrade', (run) => changeCheck(run, 'wss', { status: 'failed', code: 'WSS_FAILED' })],
+    ['a handshake-only result', (run) => changeCheck(run, 'wss', { code: 'WSS_HANDSHAKE_OK' })],
+    ['readiness silence', (run) => changeCheck(run, 'wss', { status: 'failed', code: 'REMOTE_READY_TIMEOUT' })],
+    ['a failed marker command', (run) => changeCheck(run, 'remote-command', { status: 'failed', code: 'REMOTE_COMMAND_FAILED' })],
+    ['a missing marker command', (run) => ({ ...run, checks: run.checks.filter((check) => check.id !== 'remote-command') })],
+    ['a skipped independent check', (run) => changeCheck(run, 'keys', { status: 'skipped', code: 'DEPENDENCY_FAILED' })],
+    ['an invalid completion timestamp', (run) => ({ ...run, finishedAt: 'invalid' })],
     ['a mismatched managed block', (run) => changeCheck(run, 'ssh-config', { status: 'failed', code: 'SSH_CONFIG_MISMATCH' })],
     ['an unfinished run', (run) => ({ ...run, finishedAt: null })],
   ])('does not treat %s as completed setup', async (label, modify) => {
@@ -421,4 +427,51 @@ describe('Temporary first-use setup', () => {
     for (const button of screen.getAllByRole('button')) expect(button).toHaveAttribute('type', 'button');
     expect(within(screen.getByRole('region', { name: zh.setupStep_login })).getByRole('button', { name: zh.reLogin })).toBeInTheDocument();
   });
+  it('does not enable completion between shell readiness and successful remote command proof', async () => {
+    setStep('verify');
+    const pending = changeCheck(validRun({ finishedAt: null }), 'remote-command', { status: 'running', code: null });
+    api.getDiagnostics.mockResolvedValue(pending);
+    mount();
+    await screen.findByRole('list', { name: en.diagnosticsChecks });
+    await screen.findByText(en.diagnostic_WSS_SHELL_READY);
+    expect(screen.getByRole('button', { name: en.setupFinish })).toBeDisabled();
+    act(() => emit(changeCheck({ ...pending, finishedAt: '2026-10-24T00:00:01.000Z' }, 'remote-command', { status: 'failed', code: 'REMOTE_COMMAND_FAILED' })));
+    expect(await screen.findByText(en.diagnostic_REMOTE_COMMAND_FAILED)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: en.setupFinish })).toBeDisabled();
+    expect(api.saveOnboarding).not.toHaveBeenCalled();
+    act(() => emit(validRun({ runId: 'run-complete', startedAt: '2026-10-24T00:00:02.000Z' })));
+    await waitFor(() => expect(screen.getByRole('button', { name: en.setupFinish })).toBeEnabled());
+  });
+
+  it.each([{ path: '/work with spaces' }, { startupCommand: 'tmux new -A -s usshtc' }])('requires fresh proof when matching running and desired settings change %j', async (patch) => {
+    setStep('verify');
+    const old = validRun();
+    api.getDiagnostics.mockResolvedValueOnce(old).mockResolvedValue(null);
+    const view = mount();
+    await waitFor(() => expect(screen.getByRole('button', { name: en.setupFinish })).toBeEnabled());
+    const changed = { ...config, ...patch };
+    runtime.snapshot = { ...runtime.snapshot, desiredConfig: changed, runningConfig: changed };
+    view.rerender(<Harness />);
+    expect(screen.getByRole('button', { name: en.setupFinish })).toBeDisabled();
+    act(() => emit(old));
+    expect(screen.getByRole('button', { name: en.setupFinish })).toBeDisabled();
+  });
+
+  it('keeps connection proof across a health preference change but not a visible authentication transition', async () => {
+    setStep('verify');
+    api.getDiagnostics.mockResolvedValueOnce(validRun()).mockResolvedValue(null);
+    const view = mount();
+    await waitFor(() => expect(screen.getByRole('button', { name: en.setupFinish })).toBeEnabled());
+    runtime.snapshot = { ...runtime.snapshot, healthProbeEnabled: true };
+    view.rerender(<Harness />);
+    expect(screen.getByRole('button', { name: en.setupFinish })).toBeEnabled();
+    runtime.snapshot = { ...runtime.snapshot, cookieValid: false, loginStatus: 'idle' };
+    view.rerender(<Harness />);
+    expect(screen.getByRole('button', { name: en.setupFinish })).toBeDisabled();
+    runtime.snapshot = { ...runtime.snapshot, cookieValid: true, loginStatus: 'success' };
+    view.rerender(<Harness />);
+    await waitFor(() => expect(api.getDiagnostics).toHaveBeenCalledTimes(3));
+    expect(screen.getByRole('button', { name: en.setupFinish })).toBeDisabled();
+  });
+
 });

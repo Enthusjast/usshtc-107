@@ -5,11 +5,12 @@ const tls = require('node:tls');
 const { Client } = require('ssh2');
 const { WebSocket } = require('ws');
 const { validateSettingsPatch } = require('../shared/settings-schema.mjs');
-const { PLATFORM, MAX_WSS_PAYLOAD_BYTES } = require('./constants');
+const { PLATFORM, MAX_WSS_PAYLOAD_BYTES, REMOTE_READY_TIMEOUT } = require('./constants');
 const { buildWssUrl, buildWssOptions } = require('./wss-connection');
+const { probeRemoteCommand, REMOTE_COMMAND_TIMEOUT_MS } = require('./remote-command-probe');
 
-const CHECK_IDS = Object.freeze(['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'wss']);
-const CONFIG_FIELDS = Object.freeze(['host', 'port', 'cluster', 'loginNode', 'cols', 'rows', 'useRoot', 'sshAlias', 'wssUrl']);
+const CHECK_IDS = Object.freeze(['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'wss', 'remote-command']);
+const CONFIG_FIELDS = Object.freeze(['host', 'port', 'cluster', 'loginNode', 'cols', 'rows', 'useRoot', 'path', 'startupCommand', 'sshAlias', 'wssUrl']);
 const KEY_CODES = new Set(['SSH_KEY_MISSING', 'SSH_KEY_INVALID', 'SSH_KEY_PERMISSIONS', 'SSH_KEY_FINGERPRINT_MISMATCH']);
 const CONFIG_CODES = new Set(['SSH_CONFIG_OK', 'SSH_CONFIG_MISSING', 'SSH_CONFIG_MISMATCH', 'SSH_ALIAS_CONFLICT', 'SSH_CONFIG_INVALID']);
 const CHECK_TIMEOUT_MS = 5000;
@@ -75,6 +76,7 @@ function createDiagnosticsService(deps) {
   let active = null;
   let currentRunId = null;
   let latest = null;
+  let latestAuth = null;
   let disposed = false;
 
   function publish(dto) {
@@ -87,6 +89,8 @@ function createDiagnosticsService(deps) {
     if (!latest || latest.profileId !== scope.profileId || latest.epoch !== scope.epoch) return null;
     try {
       if (latest.configFingerprint !== fingerprintConfig(deps.getConfig(scope))) return null;
+      if (!latestAuth || latestAuth.cookie !== deps.getCookie(scope)
+          || latestAuth.authGeneration !== (deps.getAuthGeneration?.(scope) ?? null)) return null;
     } catch (_) { return null; }
     return clone(latest);
   }
@@ -98,11 +102,16 @@ function createDiagnosticsService(deps) {
     let configError = null;
     try { config = Object.freeze({ ...deps.getConfig(scope) }); } catch (error) { configError = error; config = Object.freeze({}); }
     const configFingerprint = fingerprintConfig(config);
+    let cookie;
+    let authGeneration;
+    try { cookie = deps.getCookie(scope); } catch (_) { cookie = ''; }
+    try { authGeneration = deps.getAuthGeneration?.(scope) ?? null; } catch (_) { authGeneration = null; }
     if (active && active.profileId === profileId && active.epoch === epoch
-        && active.configFingerprint === configFingerprint) return active.promise;
+        && active.configFingerprint === configFingerprint && active.cookie === cookie
+        && active.authGeneration === authGeneration) return active.promise;
     active?.controller.abort('CANCELLED');
     const controller = new AbortController();
-    const entry = { profileId, epoch, configFingerprint, controller, promise: null };
+    const entry = { profileId, epoch, configFingerprint, cookie, authGeneration, controller, promise: null };
     active = entry;
     const externalAbort = () => controller.abort('CANCELLED');
     if (signal?.aborted) externalAbort();
@@ -110,22 +119,31 @@ function createDiagnosticsService(deps) {
     const deadline = setTimer(() => controller.abort('DIAGNOSTIC_DEADLINE'), RUN_TIMEOUT_MS);
     const dto = {
       runId: crypto.randomUUID(), profileId, epoch, configFingerprint,
+      authGeneration,
       startedAt: new Date(now()).toISOString(), finishedAt: null,
       checks: CHECK_IDS.map((id) => ({ id, status: 'pending', code: null, durationMs: 0 })),
     };
     entry.runId = dto.runId;
     currentRunId = dto.runId;
+    latestAuth = entry;
     const runtime = (() => { try { return clone(deps.getRuntime(scope)) || {}; } catch (_) { return {}; } })();
+    const running = runtime.proxyStatus === 'started';
     let keys;
-    let cookie;
-    try { cookie = deps.getCookie(scope); } catch (_) { cookie = ''; }
+    const isFresh = () => {
+      try {
+        return active === entry && deps.getCookie(scope) === cookie
+          && (deps.getAuthGeneration?.(scope) ?? null) === authGeneration
+          && fingerprintConfig(deps.getConfig(scope)) === configFingerprint;
+      } catch (_) { return false; }
+    };
     let authRequired = false;
     const passed = (id) => dto.checks.find((check) => check.id === id).status === 'passed';
 
-    async function check(id, dependencies, execute, fallback, mode) {
+    async function check(id, dependencies, execute, fallback, mode, timeoutMs = CHECK_TIMEOUT_MS) {
       const item = dto.checks.find((value) => value.id === id);
       if (mode) item.mode = mode;
-      if (controller.signal.aborted || dependencies.some((dependency) => !passed(dependency))) {
+      if (controller.signal.aborted || (id === 'remote-command' && !running)
+          || dependencies.some((dependency) => !passed(dependency))) {
         item.status = 'skipped';
         item.code = controller.signal.aborted ? controller.signal.reason : 'DEPENDENCY_FAILED';
         publish(dto);
@@ -137,15 +155,16 @@ function createDiagnosticsService(deps) {
       const checkController = new AbortController();
       const abort = () => checkController.abort(controller.signal.reason);
       controller.signal.addEventListener('abort', abort, { once: true });
-      const timer = setTimer(() => checkController.abort('TIMEOUT'), CHECK_TIMEOUT_MS);
+      const timer = timeoutMs === null ? null : setTimer(() => checkController.abort('TIMEOUT'), timeoutMs);
       try {
         // Race even injected asynchronous local inspections; a stalled adapter
         // cannot hold the single-flight slot past the check deadline.
         const code = await probe(checkController.signal, ({ finish }) => {
           Promise.resolve().then(() => execute(checkController.signal)).then((value) => finish(null, value), finish);
         });
+        if (!isFresh()) throw failure('CANCELLED');
         item.code = code;
-        item.status = code.endsWith('_OK') || code === 'LOCAL_PORT_AVAILABLE' ? 'passed' : 'failed';
+        item.status = code.endsWith('_OK') || code === 'WSS_SHELL_READY' || code === 'LOCAL_PORT_AVAILABLE' ? 'passed' : 'failed';
       } catch (error) {
         const reason = checkController.signal.aborted ? checkController.signal.reason : null;
         item.code = reason || fallback(error);
@@ -182,7 +201,6 @@ function createDiagnosticsService(deps) {
         const result = await deps.inspectSshConfig(scope, config);
         return CONFIG_CODES.has(result?.code) ? result.code : 'SSH_CONFIG_INVALID';
       }, (error) => CONFIG_CODES.has(error?.code) ? error.code : 'SSH_CONFIG_INVALID');
-      const running = runtime.proxyStatus === 'started';
       await check('local-listener', running ? ['settings', 'keys'] : ['settings'], async (checkSignal) => {
         if (!running) {
           return probe(checkSignal, ({ finish, own, listen }) => {
@@ -235,12 +253,29 @@ function createDiagnosticsService(deps) {
         item.status = 'skipped'; item.code = 'AUTH_REQUIRED'; publish(dto);
       } else {
         await check('wss', ['settings', 'tls'], (checkSignal) => probe(checkSignal, ({ finish, own, listen }) => {
+          let readyTimer = setTimer(() => finish(failure('TIMEOUT')), CHECK_TIMEOUT_MS);
+          own({}, () => clearTimer(readyTimer));
+          let opened = false;
           const ws = own(createWebSocket(buildWssUrl(config), buildWssOptions({ cookie, tlsCa: adapters.tlsCa,
             handshakeTimeoutMs: CHECK_TIMEOUT_MS, maxPayload: MAX_WSS_PAYLOAD_BYTES })), () => {
             if (ws.readyState === 1) ws.close();
             ws.terminate();
           });
-          listen(ws, 'open', () => finish(null, 'WSS_HANDSHAKE_OK'));
+          listen(ws, 'open', () => {
+            if (opened) return;
+            opened = true;
+            clearTimer(readyTimer);
+            readyTimer = setTimer(() => finish(failure('REMOTE_READY_TIMEOUT')), REMOTE_READY_TIMEOUT);
+          });
+          listen(ws, 'message', (raw) => {
+            if (!opened) return;
+            try {
+              const message = JSON.parse(raw.toString('utf8'));
+              if (message?.$case === 'data' && typeof message.data?.data === 'string') {
+                finish(null, 'WSS_SHELL_READY');
+              }
+            } catch (_) { /* Unknown frames do not prove shell readiness. */ }
+          });
           listen(ws, 'unexpected-response', (_request, response) => {
             response.on?.('error', () => {});
             response.destroy?.();
@@ -248,7 +283,7 @@ function createDiagnosticsService(deps) {
             if (auth) {
               let currentCookie;
               try { currentCookie = deps.getCookie(scope); } catch (_) {}
-              if (active !== entry || checkSignal.aborted || currentCookie !== cookie) {
+              if (!isFresh() || checkSignal.aborted || currentCookie !== cookie) {
                 return finish(failure('CANCELLED'));
               }
               authRequired = true;
@@ -258,14 +293,23 @@ function createDiagnosticsService(deps) {
           listen(ws, 'error', (error) => finish(failure(['ENETUNREACH', 'EHOSTUNREACH', 'ENETDOWN', 'ECONNREFUSED'].includes(error?.code)
             ? 'NETWORK_UNAVAILABLE' : 'WSS_FAILED')));
           listen(ws, 'close', () => finish(failure('WSS_FAILED')));
-        }), (error) => ['AUTH_REQUIRED', 'NETWORK_UNAVAILABLE', 'CANCELLED'].includes(error?.code) ? error.code : 'WSS_FAILED');
+        }), (error) => ['AUTH_REQUIRED', 'NETWORK_UNAVAILABLE', 'CANCELLED', 'REMOTE_READY_TIMEOUT', 'TIMEOUT'].includes(error?.code)
+          ? error.code : 'WSS_FAILED', undefined, null);
       }
+      await check('remote-command', ['local-listener', 'wss'], async (checkSignal) => {
+        if (!running || !isFresh()) throw failure('CANCELLED');
+        const identity = await deps.getClientIdentity(scope);
+        if (!isFresh()) throw failure('CANCELLED');
+        return probeRemoteCommand({ config: runtime.runningConfig || config, identity,
+          hostFingerprint: keys.host.fingerprint, signal: checkSignal, createSshClient,
+          setTimeout: setTimer, clearTimeout: clearTimer, timeoutMs: REMOTE_COMMAND_TIMEOUT_MS });
+      }, (error) => error?.code === 'CANCELLED' ? 'CANCELLED' : 'REMOTE_COMMAND_FAILED', undefined, REMOTE_COMMAND_TIMEOUT_MS);
       dto.finishedAt = new Date(now()).toISOString();
       publish(dto);
       if (authRequired && active === entry && !controller.signal.aborted) {
         let currentCookie;
         try { currentCookie = deps.getCookie(scope); } catch (_) {}
-        if (currentCookie === cookie) {
+        if (currentCookie === cookie && isFresh()) {
           try { Promise.resolve(deps.onAuthRequired?.(scope)).catch(() => {}); } catch (_) {}
         }
       }
@@ -284,6 +328,7 @@ function createDiagnosticsService(deps) {
     disposed = true;
     active?.controller.abort('CANCELLED');
     latest = null;
+    latestAuth = null;
   }
 
   return { run, get, dispose };

@@ -10,7 +10,7 @@ import { IconKey, IconFileEdit, IconZap, IconActivity, IconInfo } from '../compo
 
 const STEPS = ['login', 'config', 'connect', 'verify'];
 const ICONS = { login: IconKey, config: IconFileEdit, connect: IconZap, verify: IconActivity };
-const CONNECTION_FIELDS = ['host', 'port', 'cluster', 'loginNode', 'cols', 'rows', 'useRoot', 'wssUrl'];
+const CONNECTION_FIELDS = ['host', 'port', 'cluster', 'loginNode', 'cols', 'rows', 'useRoot', 'path', 'startupCommand', 'wssUrl'];
 const cancelled = (error) => ['CANCELLED', 'OPERATION_CANCELLED'].includes(error?.code);
 
 function runningMatches(snapshot) {
@@ -50,9 +50,10 @@ export default function SetupView({ onBusyChange, onNavigate, onSetupExit }) {
   const reviewed = review?.identity === identity && sameScope(review.scope, scope) && review.matched;
   const diagnostic = proof?.identity === identity && sameScope(proof.run, scope) ? proof.run : null;
   const passed = (id, code, mode) => diagnostic?.checks.some((check) => check.id === id && check.status === 'passed' && check.code === code && (!mode || check.mode === mode));
-  const verified = Boolean(connected && diagnostic?.finishedAt && passed('ssh-config', 'SSH_CONFIG_OK')
-    && passed('local-listener', 'LOCAL_SSH_OK', 'ssh-auth')
-    && passed('wss', 'WSS_HANDSHAKE_OK'));
+  const verified = Boolean(authenticated && connected && typeof diagnostic?.finishedAt === 'string'
+    && Number.isFinite(Date.parse(diagnostic.finishedAt)) && diagnostic.checks.every((check) => check.status === 'passed')
+    && passed('ssh-config', 'SSH_CONFIG_OK') && passed('local-listener', 'LOCAL_SSH_OK', 'ssh-auth')
+    && passed('wss', 'WSS_SHELL_READY') && passed('remote-command', 'REMOTE_COMMAND_OK'));
   const canNext = step === 'login' ? authenticated : step === 'config' ? reviewed : step === 'connect' ? connected : verified;
 
   useEffect(() => {
