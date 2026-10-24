@@ -236,6 +236,12 @@ tests/                    核心代理、安全服务和前端交互测试
 
 隔离运行可传 `--user-data-dir=<绝对路径>`，应用在访问设置、日志和登录 session 前创建私有目录并设置 userData/sessionData/logs；空值或相对路径被拒绝。主进程 fixture 可导入 `startApplication(deps)` 注入本地适配器，不提供 renderer 任意 URL 或凭据注入入口。
 
+## 真实门户验收
+
+`tests/live/` 是与默认 CI 隔离的真实门户用例，只有同时设置 `LIVE_SMOKE=1` 与短期 `SCOW_TOKEN` 才运行；凭据不进入命令参数、仓库或日志。用例覆盖 exec、交互、首帧超时与退出行为；`LIVE_CONCURRENCY=1` 另行启用 2/4/8 并发、各三轮的只读观察，记录成功率和延迟，不预设全部成功，不自动重放。提供凭据、选择集群/节点及运行方式见 [live 验收说明](tests/live/README.md)。
+
+未提供凭据时 live 用例明确跳过，不算真实门户通过。本轮由用户明确选择暂缓真实门户验收；本地 TLS/WSS、SSH、PTY 和 Electron fixture 只能证明本地路径，不能替代学校平台、真实密钥环或 Windows/macOS 签名升级证据。未执行发布。
+
 ## License
 
 MIT
