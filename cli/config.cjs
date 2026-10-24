@@ -10,8 +10,10 @@ const OPTIONS = Object.freeze({
   '--login-node': 'loginNode', '--config': 'config', '--data-dir': 'dataDir',
   '--ssh-directory': 'sshDirectory', '--max-bytes': 'maxBytes', '--timeout-ms': 'timeoutMs',
   '--path': 'path', '--startup-command': 'startupCommand', '--health-probe': 'healthProbeEnabled',
+  '--validate-token-periodically': 'validateTokenPeriodically',
+  '--overwrite': 'overwrite',
 });
-const PROFILE_KEYS = ['port', 'host', 'cluster', 'loginNode', 'path', 'startupCommand', 'healthProbeEnabled'];
+const PROFILE_KEYS = ['port', 'host', 'cluster', 'loginNode', 'path', 'startupCommand', 'healthProbeEnabled', 'validateTokenPeriodically'];
 const CONFIG_KEYS = new Set([...PROFILE_KEYS, 'dataDir', 'sshDirectory', 'maxBytes', 'timeoutMs']);
 const MAX_TRANSFER_BYTES = 64 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -41,6 +43,11 @@ function parseArgs(argv) {
       const option = equals < 0 ? arg : arg.slice(0, equals);
       const key = OPTIONS[option];
       if (!key || Object.hasOwn(values, key)) fail();
+      if (key === 'overwrite') {
+        if (equals >= 0) fail();
+        values.overwrite = true;
+        continue;
+      }
       const value = equals < 0 ? argv[++index] : arg.slice(equals + 1);
       if (typeof value !== 'string' || !value.length || (equals < 0 && value.startsWith('--'))) fail();
       values[key] = value;
@@ -85,11 +92,12 @@ async function loadConfig(parsed, env = process.env) {
     validateCookie(cookie);
     if (/[\u0000-\u001f\u007f]/.test(cookie)) fail('CLI_CONFIG');
   } catch { fail('CLI_CONFIG'); }
-  if (parsed.command === 'serve' && !cookie) fail('CLI_COOKIE_REQUIRED');
+  if (!cookie) fail('CLI_COOKIE_REQUIRED');
   const dataHome = env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share');
   return {
     ...validated.value,
     cookie,
+    overwrite: input.overwrite === true,
     dataDir: cleanPath(input.dataDir ?? path.join(dataHome, 'usshtc107-cli')),
     sshDirectory: cleanPath(input.sshDirectory ?? path.join(os.homedir(), '.ssh')),
     maxBytes: boundedInteger(input.maxBytes ?? MAX_TRANSFER_BYTES, 1, MAX_TRANSFER_BYTES),

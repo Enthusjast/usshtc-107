@@ -4,6 +4,8 @@ const path = require('node:path');
 const { ProxyServer } = require('../electron/proxy-server');
 const keys = require('../electron/ssh-key-service');
 const { createHealthProbeService } = require('../electron/health-probe-service');
+const { createPortalPreflight } = require('../electron/portal-preflight');
+const { createTokenValidationService } = require('../electron/token-validation-service');
 
 function loadIdentity(options) {
   const client = keys.ensureClientKeyPair({ sshDirectory: options.sshDirectory });
@@ -11,7 +13,11 @@ function loadIdentity(options) {
   const identity = keys.getSsh2ClientIdentity({ sshDirectory: options.sshDirectory });
   return { client, hostKey, identity };
 }
-async function startService(options, { ProxyServerClass = ProxyServer, healthClock } = {}) {
+async function startService(options, { ProxyServerClass = ProxyServer, healthClock, tokenClock,
+  portalPreflight = createPortalPreflight() } = {}) {
+  await portalPreflight.run({ cookie: options.cookie, scope: { profileId: 'cli', epoch: 1 },
+    authGeneration: 0, signal: options.signal });
+  if (options.signal?.aborted) throw Object.assign(new Error('OPERATION_CANCELLED'), { code: 'OPERATION_CANCELLED' });
   const material = loadIdentity(options);
   const proxy = new ProxyServerClass({
     ...options,
@@ -29,6 +35,8 @@ async function startService(options, { ProxyServerClass = ProxyServer, healthClo
   }
   let stopping;
   let health;
+  let tokenValidation;
+  const disposeServices = () => { health?.dispose(); tokenValidation?.dispose(); };
   const host = address?.host || proxy.host;
   const port = address?.port ?? proxy.port;
   if (options.healthProbeEnabled === true) {
@@ -42,7 +50,7 @@ async function startService(options, { ProxyServerClass = ProxyServer, healthClo
       getSnapshot: () => ({ profileId: 'cli', epoch: 1, desiredRunning: !stopping,
         proxyStatus: stopping ? 'stopped' : 'started', operation: null, runningConfig, ...remoteState }),
       getConfig: () => runningConfig,
-      getCookie: () => options.cookie,
+      getCookie: () => proxy.cookie,
       getPreferences: () => ({ healthProbeEnabled: true }),
       getKeys: () => keys.inspect({ sshDirectory: options.sshDirectory, hostKeyPath, expected }),
       getClientIdentity: () => keys.getSsh2ClientIdentity({ sshDirectory: options.sshDirectory }),
@@ -57,12 +65,28 @@ async function startService(options, { ProxyServerClass = ProxyServer, healthClo
       proxy.emit('health-state', remoteState);
       health.update();
     });
-    proxy.once('stopped', () => health.dispose());
     health.update();
   }
+  if (options.validateTokenPeriodically === true) {
+    tokenValidation = createTokenValidationService({
+      clock: tokenClock || healthClock,
+      portalPreflight,
+      getSnapshot: () => ({ profileId: 'cli', epoch: 1, cookieValid: Boolean(proxy.cookie),
+        proxyStatus: stopping ? 'stopped' : 'started', operation: null }),
+      getCookie: () => proxy.cookie,
+      getAuthGeneration: () => proxy.getCookieGeneration(),
+      getPreferences: () => ({ validateTokenPeriodically: true }),
+      onResult: ({ status, errorCode }) => {
+        if (status === 'invalid') health?.cancel('AUTH_REQUIRED');
+        proxy.emit('token-state', { status, errorCode });
+      },
+    });
+    tokenValidation.update();
+  }
+  proxy.once('stopped', disposeServices);
   return {
     proxy, ...material, host, port,
-    stop: () => (stopping ||= Promise.resolve().then(() => { health?.dispose(); return proxy.stop(); })),
+    stop: () => (stopping ||= Promise.resolve().then(() => { disposeServices(); return proxy.stop(); })),
   };
 }
 module.exports = { loadIdentity, startService };
