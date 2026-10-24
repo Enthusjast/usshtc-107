@@ -60,8 +60,8 @@ test('CLI put/get uses SCOW_TOKEN and verified TLS official HTTP directly, with 
   assert.equal(`${put.stdout}${put.stderr}${get.stdout}${get.stderr}`.includes('fixture-token'), false);
 });
 
-test('CLI boolean --overwrite is required independently for remote and local destination replacement', async t => {
-  const f = await portalFixture(t);
+test('CLI overwrite requires explicit permission and a replacement-capable backend', async t => {
+  const f = await portalFixture(t, { moveOverwrite: true });
   const source = path.join(f.local, 'source');
   const destination = path.join(f.local, 'destination');
   await fs.writeFile(source, 'replacement');

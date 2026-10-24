@@ -9,7 +9,7 @@ const { publicSettings, validateProfileName } = require('./settings-store');
 const { ServiceError } = require('./ipc-contract');
 const { createPortalPreflight, operationalCode } = require('./portal-preflight');
 
-const CONFIG_KEYS = ['host', 'port', 'cluster', 'loginNode', 'cols', 'rows', 'useRoot', 'path', 'startupCommand'];
+const CONFIG_KEYS = ['host', 'port', 'cluster', 'loginNode', 'cols', 'rows', 'useRoot', 'path', 'startupCommand', 'scpMaxFileBytes', 'scpNoOverwrite'];
 const keyActionError = (error, fallback) => error instanceof ServiceError ? error : new ServiceError(
   ['SSH_KEY_MISSING', 'SSH_KEY_INVALID', 'SSH_KEY_PERMISSIONS', 'SSH_KEY_FINGERPRINT_MISMATCH',
     'KEY_BACKUP_INVALID', 'KEY_TRANSACTION_FAILED', 'KEY_ROLLBACK_FAILED', 'SECURE_STORAGE_UNAVAILABLE',

@@ -235,6 +235,22 @@ test('CLI exposes validated remote path, canonical tmux startup and opt-in healt
   assert.equal((await loadConfig(parseArgs([]), { SCOW_TOKEN: 'secret' })).healthProbeEnabled, false);
 });
 
+test('CLI legacy SCP configuration uses schema ranges without changing get/put limits', async t => {
+  const root = await temporary(t);
+  const config = path.join(root, 'scp-profile.json');
+  await fs.writeFile(config, JSON.stringify({ scpMaxFileBytes: 100, scpNoOverwrite: true }));
+  const options = await loadConfig(parseArgs(['serve', '--config', config, '--scp-max-file-bytes', '200', '--scp-no-overwrite', 'false']), { SCOW_TOKEN: 'secret' });
+  assert.equal(options.scpMaxFileBytes, 200);
+  assert.equal(options.scpNoOverwrite, false);
+  assert.equal(options.maxBytes, 64 * 1024 * 1024);
+  const defaults = await loadConfig(parseArgs([]), { SCOW_TOKEN: 'secret' });
+  assert.equal(defaults.scpMaxFileBytes, 1073741824);
+  assert.equal(defaults.scpNoOverwrite, false);
+  for (const args of [['--scp-max-file-bytes', '0'], ['--scp-max-file-bytes', '1073741825'], ['--scp-max-file-bytes', '1.5'], ['--scp-no-overwrite', 'yes']]) {
+    await assert.rejects(loadConfig(parseArgs(args), { SCOW_TOKEN: 'secret' }), { code: 'CLI_CONFIG' });
+  }
+});
+
 test('CLI opt-in health service schedules without opening an immediate remote session and disposes on stop', async t => {
   const root = await temporary(t);
   const service = await startService({ port: 0, host: '127.0.0.1', cookie: 'SCOW_USER=secret',

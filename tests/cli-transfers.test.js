@@ -131,8 +131,8 @@ test('empty files use exact zero-byte hashes and round-trip without spurious chu
   await noParts(f.local);
 });
 
-test('default no-overwrite preserves both remote and local targets; explicit overwrite publishes verified bytes', async t => {
-  const f = await portalFixture(t);
+test('default no-overwrite preserves targets; explicit overwrite publishes on a replacement-capable backend', async t => {
+  const f = await portalFixture(t, { moveOverwrite: true });
   const source = path.join(f.local, 'source');
   const destination = path.join(f.local, 'destination');
   await fs.writeFile(source, 'replacement');

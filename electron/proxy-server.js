@@ -11,6 +11,10 @@ const { quotePosix, buildExecBootstrap, createExecParser } = require('./exec-cod
 const { validateCookie } = require('./credential-store');
 const { buildWssUrl, buildWssOptions } = require('./wss-connection');
 const { validateSettingsPatch } = require('../shared/settings-schema.mjs');
+const { createPortalApiClient } = require('./portal-api/client');
+const { createFileApi } = require('./portal-api/file-api');
+const { parseScpCommand } = require('./scp/command-parser');
+const { startScpSession } = require('./scp/session');
 const {
   WSS_HANDSHAKE_TIMEOUT,
   REMOTE_READY_TIMEOUT,
@@ -128,9 +132,18 @@ class ProxyServer extends EventEmitter {
     this.host = typeof options.host === 'string' && options.host ? options.host : '127.0.0.1';
     this.cookie = validateCookie(options.cookie === undefined ? '' : options.cookie);
     this._cookieGeneration = 0;
-    const startup = validateSettingsPatch({ startupCommand: options.startupCommand === undefined ? '' : options.startupCommand }, {});
-    if (!startup.ok) throw new TypeError('Invalid interactive startup command');
+    const startup = validateSettingsPatch({
+      startupCommand: options.startupCommand === undefined ? '' : options.startupCommand,
+      scpMaxFileBytes: options.scpMaxFileBytes ?? 1024 * 1024 * 1024,
+      scpNoOverwrite: options.scpNoOverwrite ?? false,
+      cluster: options.cluster ?? 'training',
+    }, {});
+    if (!startup.ok) throw new TypeError('Invalid proxy profile configuration');
     this.startupCommand = startup.value.startupCommand;
+    this.scpMaxFileBytes = startup.value.scpMaxFileBytes;
+    this.scpNoOverwrite = startup.value.scpNoOverwrite;
+    this.cluster = startup.value.cluster;
+    this._portalApiOptions = options.portalApiOptions;
     this._acceptingConnections = options.acceptingConnections !== false;
     this.wssUrl = buildWssUrl(options);
 
@@ -154,6 +167,7 @@ class ProxyServer extends EventEmitter {
         : (process.env.XDG_CONFIG_HOME && path.isAbsolute(process.env.XDG_CONFIG_HOME)
           ? process.env.XDG_CONFIG_HOME : path.join(os.homedir(), '.config'));
     this._hostKeyPath = options.hostKeyPath || path.join(configHome, 'usshtc107', 'proxy_host_ed25519');
+    this.scpTempDirectory = options.scpTempDirectory || path.join(path.dirname(this._hostKeyPath), 'scp-tmp');
 
     this.wssHandshakeTimeoutMs = positiveInteger(
       options.wssHandshakeTimeoutMs,
@@ -241,6 +255,8 @@ class ProxyServer extends EventEmitter {
     this._sockets = new Map();
     this._sshChannels = new Set();
     this._sessions = new Map();
+    this._scpHandles = new Set();
+    this._scpTasks = new Set();
 
     this._startTime = null;
     this._totalBytesSent = 0;
@@ -331,6 +347,75 @@ class ProxyServer extends EventEmitter {
       endedAt: Date.now(), exitCode, reason });
     this._sessions.delete(session.id);
     this._emitStats();
+  }
+
+  _bridgeScp(channel, clientStr, command, ptyState) {
+    const generation = this._cookieGeneration;
+    let handle;
+    let apiClient;
+    let interrupted = false;
+    const timers = new Set();
+    const interrupt = (reason = 'interrupted') => {
+      interrupted = true;
+      handle?.close(reason);
+      try { channel.close(); } catch (_) {}
+    };
+    const session = this._openSession(clientStr, interrupt, 'exec');
+    const onClose = () => {
+      this._clearTimers(timers);
+      handle?.close(ptyState.closeReason?.() || 'interrupted');
+    };
+    // Keep an error listener until close even after protocol cleanup.
+    channel.on('error', onClose);
+    channel.once('close', onClose);
+    const done = (async () => {
+      let result = { exitCode: 1, reason: 'interrupted' };
+      try {
+        if (command.invalid) {
+          channel.stderr?.write('Unsupported or malformed SCP command. Use legacy SCP mode (scp -O).\n');
+          channel.write(Buffer.from('\x02Unsupported or malformed SCP command\n'));
+        } else {
+          apiClient = createPortalApiClient({ ...this._portalApiOptions, cookie: this.cookie,
+            tlsCa: this.tlsCa ?? this._portalApiOptions?.tlsCa });
+          handle = startScpSession({ channel, command, api: createFileApi({ client: apiClient }),
+            cluster: this.cluster, tempDirectory: this.scpTempDirectory,
+            maxFileBytes: this.scpMaxFileBytes, noOverwrite: this.scpNoOverwrite,
+            assertCurrent: () => {
+              if (interrupted || this._stopping || generation !== this._cookieGeneration) {
+                throw Object.assign(new Error('PORTAL_CANCELLED'), { code: 'PORTAL_CANCELLED' });
+              }
+            },
+            onTraffic: ({ sent = 0, received = 0 }) => {
+              if (session._finalized) return;
+              for (const [direction, bytes] of [['sent', sent], ['received', received]]) {
+                if (!bytes) continue;
+                if (direction === 'sent') { session.bytesSent += bytes; this._totalBytesSent += bytes; }
+                else { session.bytesReceived += bytes; this._totalBytesReceived += bytes; }
+                this.emit('traffic', { sessionId: session.id, direction, bytes });
+              }
+            },
+          });
+          this._scpHandles.add(handle);
+          result = await handle.done;
+          if (result.remoteTempsRetained) {
+            channel.stderr?.write('SCP: remote temporary files may remain; no remote rollback was performed.\n');
+          }
+        }
+      } catch (_) {
+        try { channel.stderr?.write('SCP transfer failed.\n'); } catch (_) {}
+      } finally {
+        apiClient?.dispose();
+        this._scpHandles.delete(handle);
+        this._closeSessionRecord(session, { exitCode: result.exitCode, reason: result.reason });
+        if (!channel.destroyed && !channel.closed) {
+          try { channel.exit(result.exitCode); channel.end(); } catch (_) { interrupt(); }
+          this._schedule(timers, () => { try { channel.close(); } catch (_) {} }, this.shutdownTimeoutMs);
+        }
+      }
+    })();
+    this._scpTasks.add(done);
+    done.finally(() => this._scpTasks.delete(done)).catch(() => {});
+    return { resize() {}, close: interrupt };
   }
 
   _bridgeExecToWss(channel, clientStr, command, ptyState) {
@@ -806,6 +891,9 @@ class ProxyServer extends EventEmitter {
         this._sshChannels.add(sshSession);
         clientChannels.add(sshSession);
         const removeSshChannel = () => {
+          // ssh2 defers channel close until unread input drains. Session close
+          // is immediate and must cancel a pending HTTP publication first.
+          bridgeHandle?.close?.(socketState?.reason || 'user_disconnect');
           this._sshChannels.delete(sshSession);
           clientChannels.delete(sshSession);
           clientChannelCleanups.delete(sshSession);
@@ -842,7 +930,9 @@ class ProxyServer extends EventEmitter {
           }
           bridgeStarted = true;
           const channel = acceptExec();
-          bridgeHandle = this._bridgeExecToWss(channel, addr, info.command, ptyState);
+          const scp = parseScpCommand(info.command);
+          bridgeHandle = scp ? this._bridgeScp(channel, addr, scp, ptyState)
+            : this._bridgeExecToWss(channel, addr, info.command, ptyState);
         });
 
         sshSession.on('env', (acceptEnv) => acceptEnv?.());
@@ -1176,6 +1266,8 @@ class ProxyServer extends EventEmitter {
       for (const socket of this._sockets.keys()) {
         try { socket.destroy(); } catch (_) {}
       }
+      // SCP owns disk files and HTTP requests: do not report stop before cleanup.
+      await Promise.allSettled([...this._scpTasks]);
 
       const server = this._server;
       await this._closeTcpServer(server);
@@ -1199,7 +1291,10 @@ class ProxyServer extends EventEmitter {
 
   updateCookie(cookieString) {
     const cookie = validateCookie(cookieString);
-    if (cookie !== this.cookie) this._cookieGeneration += 1;
+    if (cookie !== this.cookie) {
+      this._cookieGeneration += 1;
+      for (const handle of this._scpHandles) handle.close('auth_error');
+    }
     this.cookie = cookie;
   }
 }

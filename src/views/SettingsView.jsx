@@ -21,7 +21,7 @@ import { useRuntime, sameScope } from '../contexts/RuntimeContext';
 const SETTINGS_DEFAULTS = { ...APP_DEFAULTS, ...PROFILE_DEFAULTS };
 const APP_PREFERENCE_KEYS = ['startMinimized', 'reconnectOnResume', 'autoCheckUpdates', 'notifyConnections', 'notifyAuth', 'notifyRecovery', 'notifyUpdates'];
 const EDITABLE_SETTING_KEYS = [...PROFILE_SETTING_KEYS, ...APP_PREFERENCE_KEYS];
-const CONNECTION_SETTING_KEYS = ['host', 'port', 'cluster', 'loginNode', 'path', 'startupCommand', 'cols', 'rows', 'useRoot', 'sshAlias'];
+const CONNECTION_SETTING_KEYS = ['host', 'port', 'cluster', 'loginNode', 'path', 'startupCommand', 'cols', 'rows', 'useRoot', 'sshAlias', 'scpMaxFileBytes', 'scpNoOverwrite'];
 
 function FieldError({ id, message }) {
   if (!message) return null;
@@ -399,6 +399,29 @@ export default function SettingsView({ onDirtyChange, onDraftChange, onBusyChang
           </span>
         </label>
         <p id="setting-root-help" className="settings-help">{t('useRootHint')}</p>
+      </section>
+
+      <section className="card" aria-labelledby="scp-settings-heading">
+        <h2 id="scp-settings-heading" className="card-header">{t('legacyScpSettings')}</h2>
+        <div className="settings-grid">
+          <div>
+            <label className="form-label" htmlFor="setting-scpMaxFileBytes">{t('scpMaxFileBytes')}</label>
+            <input id="setting-scpMaxFileBytes" className="form-input" type="number" min={1} max={1073741824} step={1} value={settings.scpMaxFileBytes} onChange={(e) => update('scpMaxFileBytes', e.target.value)} disabled={isSaving} aria-invalid={Boolean(fieldErrors.scpMaxFileBytes)} aria-describedby={['setting-scp-max-help', fieldErrors.scpMaxFileBytes && 'setting-scpMaxFileBytes-error'].filter(Boolean).join(' ')} />
+            <p id="setting-scp-max-help" className="settings-help">{t('scpMaxFileBytesHint')}</p>
+            <FieldError id="setting-scpMaxFileBytes-error" message={fieldErrors.scpMaxFileBytes} />
+          </div>
+          <div>
+            <label className="toggle-wrapper" htmlFor="setting-scpNoOverwrite">
+              <span className="toggle-label">{t('scpNoOverwrite')}</span>
+              <span className="toggle-switch">
+                <input id="setting-scpNoOverwrite" type="checkbox" checked={settings.scpNoOverwrite === true} onChange={(e) => update('scpNoOverwrite', e.target.checked)} disabled={isSaving} aria-invalid={Boolean(fieldErrors.scpNoOverwrite)} aria-describedby={['setting-scp-overwrite-help', fieldErrors.scpNoOverwrite && 'setting-scpNoOverwrite-error'].filter(Boolean).join(' ')} />
+                <span className="toggle-slider" aria-hidden="true" />
+              </span>
+            </label>
+            <p id="setting-scp-overwrite-help" className="settings-help">{t('scpNoOverwriteHint')}</p>
+            <FieldError id="setting-scpNoOverwrite-error" message={fieldErrors.scpNoOverwrite} />
+          </div>
+        </div>
       </section>
 
       <section className="card" aria-labelledby="behavior-settings-heading">

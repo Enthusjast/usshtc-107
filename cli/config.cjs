@@ -11,9 +11,10 @@ const OPTIONS = Object.freeze({
   '--ssh-directory': 'sshDirectory', '--max-bytes': 'maxBytes', '--timeout-ms': 'timeoutMs',
   '--path': 'path', '--startup-command': 'startupCommand', '--health-probe': 'healthProbeEnabled',
   '--validate-token-periodically': 'validateTokenPeriodically',
+  '--scp-max-file-bytes': 'scpMaxFileBytes', '--scp-no-overwrite': 'scpNoOverwrite',
   '--overwrite': 'overwrite',
 });
-const PROFILE_KEYS = ['port', 'host', 'cluster', 'loginNode', 'path', 'startupCommand', 'healthProbeEnabled', 'validateTokenPeriodically'];
+const PROFILE_KEYS = ['port', 'host', 'cluster', 'loginNode', 'path', 'startupCommand', 'healthProbeEnabled', 'validateTokenPeriodically', 'scpMaxFileBytes', 'scpNoOverwrite'];
 const CONFIG_KEYS = new Set([...PROFILE_KEYS, 'dataDir', 'sshDirectory', 'maxBytes', 'timeoutMs']);
 const MAX_TRANSFER_BYTES = 64 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;

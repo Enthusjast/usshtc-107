@@ -294,7 +294,7 @@ class SettingsStore {
         if (raw.schemaVersion === 2 && Array.isArray(raw.profiles)) {
           for (const profile of raw.profiles) {
             if (!isPlainObject(profile?.settings)) continue;
-            for (const key of ['path', 'startupCommand', 'healthProbeEnabled', 'validateTokenPeriodically']) {
+            for (const key of ['path', 'startupCommand', 'healthProbeEnabled', 'validateTokenPeriodically', 'scpMaxFileBytes', 'scpNoOverwrite']) {
               if (!Object.hasOwn(profile.settings, key)) profile.settings[key] = PROFILE_DEFAULTS[key];
             }
           }

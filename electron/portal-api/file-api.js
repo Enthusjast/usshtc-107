@@ -2,11 +2,27 @@
 
 const crypto = require('node:crypto');
 const { Readable } = require('node:stream');
+const path = require('node:path');
 
 function invalid() { return Object.assign(new Error('TRANSFER_METADATA'), { code: 'TRANSFER_METADATA' }); }
 function text(value) {
   if (typeof value !== 'string' || !value.length || /[\u0000-\u001f\u007f]/.test(value)) throw invalid();
   return value;
+}
+function absolutePath(value) {
+  const result = text(value);
+  if (!result.startsWith('/') || path.posix.normalize(result) !== result) throw invalid();
+  return result;
+}
+function fileInfo(item) {
+  if (!item || typeof item.name !== 'string' || !item.name.length || item.name === '.' || item.name === '..'
+      || /[\\/\u0000-\u001f\u007f]/.test(item.name) || !['FILE', 'DIR'].includes(item.type)
+      || typeof item.mtime !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(item.mtime)
+      || !Number.isFinite(Date.parse(item.mtime)) || !Number.isInteger(item.mode) || item.mode < 0 || item.mode > 0xffffffff
+      || !Number.isSafeInteger(item.size) || item.size < 0) throw invalid();
+  // Preserve raw mode: the SSH backend labels symlinks FILE. Callers enforcing
+  // no-follow must inspect S_IFMT on selected entries, not trust the type enum.
+  return { name: item.name, type: item.type, mtime: item.mtime, mode: item.mode, size: item.size };
 }
 function options(input) {
   const { signal, scope, assertCurrent, timeoutMs, maxBytes } = input;
@@ -74,7 +90,7 @@ function createFileApi({ client }) {
     },
     async getFileType(input) {
       const result = await client.json('/api/file/getFileType', { ...options(input), query: query(input), expectedStatus: [200] });
-      if (!result || typeof result.type !== 'string') throw invalid();
+      if (!result || !['file', 'dir'].includes(result.type)) throw invalid();
       return result.type;
     },
     async list(input) {
@@ -82,12 +98,23 @@ function createFileApi({ client }) {
         ...options(input), query: { ...query(input), updateAccessTime: false }, expectedStatus: [200],
       });
       if (!result || !Array.isArray(result.items)) throw invalid();
+      const names = new Set();
       return result.items.map(item => {
-        if (!item || typeof item.name !== 'string' || !['FILE', 'DIR'].includes(item.type)
-            || typeof item.mtime !== 'string' || !Number.isFinite(item.mode)
-            || !Number.isSafeInteger(item.size) || item.size < 0) throw invalid();
-        return { name: item.name, type: item.type, mtime: item.mtime, mode: item.mode, size: item.size };
+        const info = fileInfo(item);
+        if (names.has(info.name)) throw invalid();
+        names.add(info.name);
+        return info;
       });
+    },
+    async getHome(input) {
+      const result = await client.json('/api/file/getHome', {
+        ...options(input), query: { cluster: text(input.cluster) }, expectedStatus: [200],
+      });
+      if (!result) throw invalid();
+      return absolutePath(result.path);
+    },
+    mkdir(input) {
+      return post('/api/file/mkdir', input, query(input));
     },
     move(input) {
       return client.empty('/api/file/move', { ...options(input), method: 'PATCH', expectedStatus: [204],

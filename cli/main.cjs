@@ -20,6 +20,8 @@ Options:
   --startup-command CMD  Optional canonical command: tmux new -A -s usshtc
   --health-probe BOOL  Enable read-only periodic true probes (default false)
   --validate-token-periodically BOOL  Opt-in token checks, at least five minutes apart
+  --scp-max-file-bytes NUMBER  Legacy SCP cap, default/maximum 1073741824 (1 GiB)
+  --scp-no-overwrite BOOL  Legacy SCP remote preflight protection (default false)
   --config FILE        Strict JSON configuration; unknown keys are rejected
   --data-dir DIR       Stable proxy host-key directory
   --ssh-directory DIR  Stable client identity directory (default ~/.ssh)
@@ -31,8 +33,11 @@ Options:
 
 Use SCOW_TOKEN instead of --cookie to avoid process-argument visibility.
 Config keys: port, host, cluster, loginNode, path, startupCommand,
-healthProbeEnabled, validateTokenPeriodically, dataDir, sshDirectory, maxBytes, timeoutMs. Config never
-stores credentials. Transfers reject existing targets unless --overwrite is set.
+healthProbeEnabled, validateTokenPeriodically, scpMaxFileBytes, scpNoOverwrite,
+dataDir, sshDirectory, maxBytes, timeoutMs. Config never stores credentials.
+GUI Files and CLI get/put retain their separate 64 MiB cap and reject existing
+targets unless --overwrite is set. Legacy SCP overwrites remote files by default;
+scpNoOverwrite is a non-atomic preflight, not a remote symlink sandbox.
 Remote paths must be absolute. Remote overwrite protection is a fileExist
 preflight, not atomic: a concurrent creator may race the final publish.
 Directories and directory archives are not transferred. Remote temporary files

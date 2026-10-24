@@ -521,7 +521,8 @@ function startApplication(deps = {}) {
     const keyErrorCode = initializeKeys();
     createWindow();
     const proxy = createProxyController({ clock, publish, log: addLog, history,
-      createServer: deps.createProxyServer || ((options) => new ProxyServer({ ...deps.transport, ...options })),
+      createServer: deps.createProxyServer || ((options) => new ProxyServer({ ...deps.transport, ...options,
+        portalApiOptions: deps.portalApiOptions, scpTempDirectory: path.join(userDataPath, 'scp-tmp') })),
       getKeyMaterial: () => sshKeys.getKeyMaterial(),
       isTransactionCommitted: (id) => !settingsStore.isLocked()
         && settingsStore.getRoot().keyTransaction?.id === id

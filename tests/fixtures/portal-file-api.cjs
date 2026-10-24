@@ -21,7 +21,31 @@ async function portalFixture(t, options = {}) {
     fs.readFile(path.join(__dirname, 'loopback-test-only-key.pem')),
   ]);
   const files = new Map();
-  const dirs = new Set(['/', '.', '/remote']);
+  const dirs = new Set(['/', '.', '/remote', '/tmp']);
+  const symlinks = new Map();
+  const metadata = new Map();
+  const home = options.home ?? '/remote';
+  dirs.add(home);
+  function resolveTarget(value) {
+    let resolved = path.posix.resolve(home, value);
+    for (let count = 0; count < 40; count += 1) {
+      const parts = resolved.split('/');
+      let replaced = false;
+      for (let index = 1; index < parts.length; index += 1) {
+        const candidate = parts.slice(0, index + 1).join('/');
+        if (!symlinks.has(candidate)) continue;
+        resolved = path.posix.resolve(path.posix.dirname(candidate), symlinks.get(candidate), ...parts.slice(index + 1));
+        replaced = true;
+        break;
+      }
+      if (!replaced) return resolved;
+    }
+    return null;
+  }
+  function listed(name, type, size, mode) {
+    return { name: path.posix.basename(name), type, mtime: '2026-01-01T00:00:00.000Z', mode, size,
+      ...metadata.get(name) };
+  }
   const requests = [];
   const errors = [];
   const initializations = [];
@@ -72,11 +96,12 @@ async function portalFixture(t, options = {}) {
       assert.equal(request.headers.cookie, `SCOW_USER=${options.token || 'fixture-token'}`);
       if (record.number > (options.authAfterRequest ?? Infinity)) return json(response, 401, null);
       if (options.permission === true || (typeof options.permission === 'function' && options.permission(ctx))) {
-        return json(response, 403, { code: 'PERMISSION_DENIED' });
+        return json(response, 403, { code: url.pathname === '/api/file/list' ? 'NOT_ACCESSIBLE' : 'PERMISSION_DENIED' });
       }
       if (!url.pathname.startsWith('/api/file/')) return json(response, 404, { code: 'NOT_EXISTS' });
       const operation = url.pathname.slice('/api/file/'.length);
-      const target = url.searchParams.get('path');
+      const rawTarget = url.searchParams.get('path');
+      const target = rawTarget === null ? null : resolveTarget(rawTarget);
       if (request.method === 'POST' || request.method === 'PATCH') {
         const bytes = await receive(request);
         record.body = operation === 'upload' ? multipart(request, bytes) : JSON.parse(bytes.toString('utf8'));
@@ -86,18 +111,42 @@ async function portalFixture(t, options = {}) {
         json(response, 200, { result: files.has(target) || dirs.has(target) });
       } else if (operation === 'getFileType') {
         assert.equal(request.method, 'GET');
-        json(response, 200, { type: dirs.has(target) ? 'DIR' : files.has(target) ? 'FILE' : 'NOT_EXISTS' });
+        if (!dirs.has(target) && !files.has(target)) return json(response, 400, { code: 'INVALID_PATH' });
+        json(response, 200, { type: dirs.has(target) ? 'dir' : 'file' });
       } else if (operation === 'list') {
         assert.equal(request.method, 'GET');
         assert.notEqual(url.searchParams.get('updateAccessTime'), 'true');
+        if (!dirs.has(target) && !files.has(target)) return json(response, 403, { code: 'NOT_ACCESSIBLE' });
+        if (!dirs.has(target)) return json(response, 412, { code: 'DIRECTORY_NOT_FOUND' });
         const items = [];
         for (const [name, bytes] of files) if (path.posix.dirname(name) === target) {
-          items.push({ name: path.posix.basename(name), type: 'FILE', mtime: '2026-01-01T00:00:00Z', mode: 0o600, size: bytes.length });
+          items.push(listed(name, 'FILE', bytes.length, 0o100600));
         }
         for (const name of dirs) if (name !== target && path.posix.dirname(name) === target) {
-          items.push({ name: path.posix.basename(name), type: 'DIR', mtime: '2026-01-01T00:00:00Z', mode: 0o700, size: 0 });
+          items.push(listed(name, 'DIR', 0, 0o040700));
+        }
+        // The pinned SSH backend labels non-directories FILE, preserving lstat mode.
+        for (const [name, link] of symlinks) if (path.posix.dirname(name) === target) {
+          items.push(listed(name, 'FILE', Buffer.byteLength(link), 0o120777));
         }
         json(response, 200, { items });
+      } else if (operation === 'getHome') {
+        assert.equal(request.method, 'GET');
+        assert.deepEqual(Object.keys(record.query), ['cluster']);
+        json(response, 200, { path: home });
+      } else if (operation === 'mkdir') {
+        assert.equal(request.method, 'POST');
+        assert.deepEqual(Object.keys(record.body).sort(), ['cluster', 'path']);
+        assert.equal(typeof record.body.cluster, 'string');
+        assert.equal(typeof record.body.path, 'string');
+        const name = path.posix.resolve(home, record.body.path);
+        if (files.has(name) || dirs.has(name) || symlinks.has(name)) return json(response, 409, { code: 'ALREADY_EXISTS' });
+        const parent = resolveTarget(path.posix.dirname(name));
+        // The SSH route calls one sftpMkdir, never mkdir -p or recursive creation.
+        if (!dirs.has(parent)) return json(response, 500, null);
+        dirs.add(path.posix.join(parent, path.posix.basename(name)));
+        response.writeHead(204);
+        response.end();
       } else if (operation === 'download') {
         assert.equal(request.method, 'GET');
         const occurrence = (downloads.get(target) || 0) + 1;
@@ -173,7 +222,12 @@ async function portalFixture(t, options = {}) {
         const { fromPath, toPath } = record.body;
         assert.deepEqual(Object.keys(record.body).sort(), ['cluster', 'fromPath', 'toPath']);
         assert.ok(files.has(fromPath));
-        assert.equal(dirs.has(toPath), false, 'directories must never be replaced');
+        // Pinned SSH uses ordinary SFTP rename, not posix-rename@openssh.com.
+        // Overwrite is an explicit simulated-backend capability, never the default.
+        if (dirs.has(toPath) || ((files.has(toPath) || symlinks.has(toPath)) && options.moveOverwrite !== true)) {
+          return json(response, 415, { code: 'RENAME_FAILED', error: 'Destination already exists' });
+        }
+        symlinks.delete(toPath);
         files.set(toPath, files.get(fromPath));
         files.delete(fromPath);
         response.writeHead(204);
@@ -192,7 +246,8 @@ async function portalFixture(t, options = {}) {
   const baseUrl = `https://127.0.0.1:${server.address().port}`;
   const client = createPortalApiClient({ baseUrl, tlsCa, cookie: `SCOW_USER=${options.token || 'fixture-token'}` });
   const api = createFileApi({ client });
-  fixture = { root, local, remote, baseUrl, tlsCa, client, api, files, dirs, requests, errors, initializations, downloads, server };
+  fixture = { root, local, remote, baseUrl, tlsCa, client, api, files, dirs, symlinks, metadata, home,
+    requests, errors, initializations, downloads, server };
   t.after(async () => {
     client.dispose();
     for (const socket of sockets) socket.destroy();

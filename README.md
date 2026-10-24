@@ -204,15 +204,40 @@ npm run cli -- get -- /remote/new-file.bin ./downloaded.bin
 
 GUI 只接受远程路径，本地文件/保存位置由带父窗口的原生对话框选择；最多 2 个活动传输、20 个排队项、50 条完成历史。列表只发布文件名、状态和确认字节，不把 Cookie、本地绝对路径或 VNC 链接传给 renderer。切档案、认证/连接上下文变化及退出会取消旧操作。
 
+## 传统 SCP 兼容层
+
+本地代理处理 SCP exec 协议，文件与元数据仍走官方 HTTPS file API，不启动远端 scp，也不改变普通 exec。**OpenSSH 9 起 `scp` 默认使用 SFTP，本功能必须加 `-O`**；PuTTY 使用 `pscp -scp`。不提供 SFTP；WinSCP 强制 SCP 仅作观察项，不保证其额外 shell 命令格式兼容。
+
+```bash
+scp -O ./local.bin usshtc107:/absolute/path/remote.bin
+scp -O usshtc107:/absolute/path/remote.bin ./downloaded.bin
+scp -O -r ./directory usshtc107:/absolute/parent/
+scp -O 'usshtc107:results/*.log' ./results/
+```
+
+支持单文件、空文件、递归、中文/空格/安全字面特殊文件名，以及逐路径段的 `*`、`?`、字符组匹配；无匹配非零，不支持 `**`。相对路径通过官方 `getHome` 定位，不猜家目录、不展开 `~`/变量/命令替换。空格和特殊字符仍需按旧 SCP 客户端要求转义；不使用 `-T` 关闭 OpenSSH 文件名检查。直接 SCP 命令支持 `-f/-t/-r/-p/-d/-v/-q/--`；明确识别为 SCP 但参数非法时本地拒绝，其他 exec 保持原路径。没有双远端专用通道；服务端无法可靠识别客户端 `-3` 的两个独立连接是否属于同一次编排，不承诺双远端支持。
+通配符默认不选择隐藏项；只有显式以 `.` 开头的模式或文件路径才会选择隐藏文件，避免意外复制秘密文件和遗留暂存文件。
+
+**传统 SCP 默认覆盖已有普通文件**。档案级 `scpNoOverwrite`（CLI `--scp-no-overwrite true`）可拒绝已有目标；`scpMaxFileBytes`（`--scp-max-file-bytes`）默认/最高 1 GiB，可下调至 1 字节。Settings 保存后需重启代理生效，GUI Files 与 CLI get/put 的独立 64 MiB 上限不变。
+
+上传先完整接收到私有本地临时文件，再按服务端协商大小分块、merge、SHA-256 回读校验。新目标用 move 发布；普通 SFTP rename 不能保证覆盖已有目标，因此 SCP 覆盖先校验暂存文件，再通过官方普通 upload 原地写入目标并再次回读校验，最后才发完成 ACK。**覆盖不是原子的，失败可能已截断或部分替换原目标，不保证保留原内容或回滚**。服务端拒绝时非零退出，不删除目标绕过限制；私有守护进程的覆盖能力仍需真实验收。GUI/CLI 原暂存 move 路径未改，其显式覆盖依赖服务端 rename 能力。
+
+下载采用列表中的大小、mtime 和普通权限位，剥离 setuid/setgid/sticky。`-p` 下载发送 mtime；API 无 atime，协议 atime 明确取 mtime 作为派生值，不声称真实访问时间已保留。上传接受时间戳和权限帧，但 API 不支持设置，因此不保留上传的 mode/mtime/atime。选中路径及祖先必须有匹配的 POSIX 文件种类位；符号链接、特殊文件和无法确认种类的元数据均拒绝。检查与读写仍有竞态，不构成原子 no-follow 或符号链接沙箱。
+
+协议带有界缓冲和背压；单会话最多 10,000 项、32 层、8 GiB 文件数据，最长一小时，空闲 30 秒取消。本地上传总预留上限 2 GiB，另保留 64 MiB 磁盘余量。POSIX 临时目录/文件为 0700/0600；完成、失败、断连、Cookie 变化及 stop 清理本地暂存。下次分配只清理能确认归属且原进程已结束的目录，不删除未知内容。远端暂存可能保留，失败不自动重试。SCP 复用 exec 会话统计、连接/会话上限和脱敏日志，不记录命令或文件内容。
+
+本地验收使用真实 OpenSSH、PuTTY、SSH 与本地 TLS file API，覆盖超过 64 MiB 的分块往返、递归、通配符、覆盖和取消。PuTTY 用例需设置 `PSCP_BINARY`、`PUTTYGEN_BINARY`；Linux CI 安装客户端后执行。fixture 不替代真实学校门户、Windows/macOS 客户端或 WinSCP 验收。
+
+
 ## 桌面与应用入口
 
 **Desktops & apps** 只列出当前账号/集群的已有桌面、应用会话和应用目录。刷新列表不会拉起桌面；必须点击打开或复制才调用 launch/connect。主进程验证固定 HTTPS 门户来源、host/port/proxy 路径及模板，再交给系统浏览器或剪贴板；完整 noVNC/应用链接与 VNC 密码不经过 IPC、不显示在页面、不进日志、设置或导出。链接含会话凭据，剪贴板和系统浏览器历史不受本应用控制，请勿外发。
 
 支持已核对的 v1.9.11 嵌套桌面结构、VNC 应用及 `connect.method=GET` 的 web 应用；连接应用 API 本身仍为 POST JSON。模板替换采用门户的 `{{ HOST }}`/`{{ PORT }}`/`{{ PASSWORD }}` 与 customFormData 规则，query 后编码。会话已结束/未就绪分别显示错误，不自动重试；POST 表单、ShadowDesk、新建桌面和 WM 选择不在本轮范围。私有契约证据与剩余边界见 [SCOW API 契约记录](docs/scow-api-contracts.md)。
 
-不提供完整 SFTP/scp 子系统，不承诺现有 `scp`/`sftp` 客户端兼容；不提供本地/动态/反向端口转发，也不承诺 VS Code Remote-SSH。
+不提供 SFTP 子系统、本地/动态/反向端口转发，也不承诺 VS Code Remote-SSH；传统 SCP 的范围和限制见上节。
 
-回滚边界：新档案字段一旦保存，未识别这些字段的旧版本（包括已固定的 `v1.3.0` 快照）会因严格 schema 保持只读，不能宣称免配置处理回滚。按依赖逆序撤销提交，并先备份完整私有 userData；回到更早版本时使用对应设置备份，不删除秘密字段、私钥或 known_hosts 绕过保护。缺省补齐只发生在内存，不在只读加载时改写原文件。现有 `v1.3.0` 标签保持原提交，本专项不移动标签或发布。
+回滚边界：新档案字段保存后，未识别这些字段的旧版本（包括固定的 `v1.3.0`、`v1.3.1` 快照）会因严格 schema 保持只读。按依赖逆序撤销提交前先备份完整私有 userData，使用对应设置备份；不删除秘密字段、私钥或 known_hosts 绕过保护。缺省补齐仅发生在内存，不在只读加载时改写文件。传统 SCP 兼容层自 `v1.3.2` 提供，旧标签保持原提交；创建本地提交和标签不等同于推送或发布。
 
 ## 打包与发布
 
@@ -231,7 +256,7 @@ GitHub Actions 发布需要以下仓库 Secrets：
 | macOS | `MAC_CSC_LINK`, `MAC_CSC_KEY_PASSWORD`, `APPLE_API_KEY_BASE64`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER` |
 | Windows | `WIN_CSC_LINK`, `WIN_CSC_KEY_PASSWORD` |
 
-`MAC_CSC_LINK` 和 `WIN_CSC_LINK` 可使用 electron-builder 支持的 base64 证书值。`APPLE_API_KEY_BASE64` 是 App Store Connect `.p8` 私钥的 base64 内容。用于签名或发布的标签必须严格等于 `v<package.json version>`，例如当前版本使用 `v1.3.1`，且标签提交必须属于默认分支历史。应在仓库设置中保护 `v*` 标签。
+`MAC_CSC_LINK` 和 `WIN_CSC_LINK` 可使用 electron-builder 支持的 base64 证书值。`APPLE_API_KEY_BASE64` 是 App Store Connect `.p8` 私钥的 base64 内容。用于签名或发布的标签必须严格等于 `v<package.json version>`，例如当前版本使用 `v1.3.2`，且标签提交必须属于默认分支历史。应在仓库设置中保护 `v*` 标签。
 
 发布流水线会验证签名和 macOS 公证，生成产物 SHA-256 校验文件和 GitHub 构建来源证明，并为实际生产依赖生成 CycloneDX SBOM。普通手动构建可以选择单个平台；Linux 可从功能分支构建，使用证书的 macOS/Windows 构建只能从默认分支或匹配版本的标签发起。创建 GitHub Release 时必须构建全部平台。
 

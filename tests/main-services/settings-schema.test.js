@@ -74,7 +74,7 @@ test('raw controls cannot be hidden by trim in any string parser', () => {
 });
 
 test('integer fields enforce exact ranges and reject coercion traps', () => {
-  for (const [field, min, max] of [['port', 1, 65535], ['cols', 40, 500], ['rows', 10, 200]]) {
+  for (const [field, min, max] of [['port', 1, 65535], ['cols', 40, 500], ['rows', 10, 200], ['scpMaxFileBytes', 1, 1073741824]]) {
     for (const value of [min, max, ` ${min} `, String(max)]) {
       const result = validateSettingsPatch({ [field]: value }, defaults);
       assert.equal(result.ok, true);
@@ -106,7 +106,7 @@ test('tokens enforce allowed characters and independent field lengths', () => {
 });
 
 test('boolean and enum validation preserves existing supported representations', () => {
-  for (const key of ['useRoot', 'autoConnect', 'healthProbeEnabled', ...APP_SETTING_KEYS.filter((key) => typeof APP_DEFAULTS[key] === 'boolean')]) {
+  for (const key of ['useRoot', 'autoConnect', 'healthProbeEnabled', 'scpNoOverwrite', ...APP_SETTING_KEYS.filter((key) => typeof APP_DEFAULTS[key] === 'boolean')]) {
     for (const value of [true, false, 'true', 'false']) {
       assert.equal(validateSettingsPatch({ [key]: value }).value[key], value === true || value === 'true');
     }
@@ -190,5 +190,15 @@ test('session preservation is a conservative opt-in and health probes default of
   }
   for (const startupCommand of [null, false, 'tmux', ` ${TMUX_STARTUP_COMMAND}`, `${TMUX_STARTUP_COMMAND}\n`, `${TMUX_STARTUP_COMMAND}; id`, 'tmux new -A -s other']) {
     assert.deepEqual(validateSettingsPatch({ startupCommand }), { ok: false, fieldErrors: { startupCommand: 'invalid_startup_command' } });
+  }
+});
+
+test('legacy SCP limits and overwrite preferences are public per-profile settings', () => {
+  const visible = publicSettings(createDefaultRoot());
+  assert.equal(visible.scpMaxFileBytes, 1073741824);
+  assert.equal(visible.scpNoOverwrite, false);
+  for (const key of ['scpMaxFileBytes', 'scpNoOverwrite']) {
+    assert.equal(PROFILE_SETTING_KEYS.includes(key), true);
+    assert.equal(APP_SETTING_KEYS.includes(key), false);
   }
 });

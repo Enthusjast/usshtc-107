@@ -50,6 +50,33 @@ it('keeps path empty and tmux and health probes off for older settings until exp
  expect(mocks.restartProxy).not.toHaveBeenCalled();
 });
 
+it('saves legacy SCP preferences through the profile flow with accessible limits and overwrite boundaries', async () => {
+ const draft = vi.fn(); mount(draft);
+ const limit = await screen.findByLabelText(en.scpMaxFileBytes);
+ expect(limit).toHaveValue(1073741824);
+ expect(limit).toHaveAccessibleDescription(/GUI Files and CLI get\/put.*64 MiB/);
+ const noOverwrite = screen.getByLabelText(en.scpNoOverwrite);
+ expect(noOverwrite).not.toBeChecked();
+ expect(noOverwrite).toHaveAccessibleDescription(/overwrites remote files.*not atomic.*symlinks/);
+ fireEvent.change(limit, { target: { value: '12345' } });
+ fireEvent.click(noOverwrite);
+ expect(draft).toHaveBeenLastCalledWith({ dirty: true, draftRevision: 2 });
+ fireEvent.click(screen.getByRole('button', { name: 'Save Settings' }));
+ await waitFor(() => expect(mocks.saveSettings).toHaveBeenCalledExactlyOnceWith({ scope: runtime.scope, patch: { scpMaxFileBytes: 12345, scpNoOverwrite: true } }));
+ expect(mocks.saveAppSettings).not.toHaveBeenCalled();
+ expect(mocks.restartProxy).not.toHaveBeenCalled();
+});
+
+it('rejects an out-of-range legacy SCP limit at the accessible field without saving', async () => {
+ mount(); const limit = await screen.findByLabelText(en.scpMaxFileBytes);
+ fireEvent.change(limit, { target: { value: '1073741825' } });
+ fireEvent.click(screen.getByRole('button', { name: 'Save Settings' }));
+ expect(await screen.findByText(en.validation_integer_range)).toBeInTheDocument();
+ expect(limit).toHaveAttribute('aria-invalid', 'true');
+ expect(limit).toHaveAccessibleDescription(new RegExp(en.validation_integer_range.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+ expect(mocks.saveSettings).not.toHaveBeenCalled();
+});
+
 it('retains saved path and opt-ins and resets them to unsaved conservative defaults', async () => {
  mocks.getSettings.mockResolvedValue({ ...settings, path: '/work dir', startupCommand: 'tmux new -A -s usshtc', healthProbeEnabled: true });
  const draft = vi.fn(); mount(draft);

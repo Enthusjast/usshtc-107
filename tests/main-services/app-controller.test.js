@@ -116,6 +116,26 @@ test('saved configuration remains distinct from the frozen running instance', as
   assert.equal(f.app.getSnapshot().operation, null);
 });
 
+test('legacy SCP preferences are frozen at start and participate in restart comparison', async () => {
+  const f = fixture();
+  await f.app.run('start', { scope: f.currentScope() });
+  assert.equal(f.app.getSnapshot().runningConfig.scpMaxFileBytes, 1073741824);
+  assert.equal(f.app.getSnapshot().runningConfig.scpNoOverwrite, false);
+  for (const patch of [{ scpMaxFileBytes: 100 }, { scpNoOverwrite: true }]) {
+    await f.app.run('save-settings', { scope: f.currentScope(), patch });
+    assert.equal(f.app.getSnapshot().needsRestart, true);
+    assert.equal(f.app.getSnapshot().runningConfig.scpMaxFileBytes, 1073741824);
+    assert.equal(f.app.getSnapshot().runningConfig.scpNoOverwrite, false);
+    await f.app.run('save-settings', { scope: f.currentScope(), patch: { scpMaxFileBytes: 1073741824, scpNoOverwrite: false } });
+    assert.equal(f.app.getSnapshot().needsRestart, false);
+  }
+  await f.app.run('save-settings', { scope: f.currentScope(), patch: { scpMaxFileBytes: 100, scpNoOverwrite: true } });
+  await f.app.run('restart', { scope: f.currentScope() });
+  assert.equal(f.app.getSnapshot().runningConfig.scpMaxFileBytes, 100);
+  assert.equal(f.app.getSnapshot().runningConfig.scpNoOverwrite, true);
+  assert.equal(f.app.getSnapshot().needsRestart, false);
+});
+
 test('only identical normalized action/scope/target payloads reuse a promise', async () => {
   const confirmation = deferred();
   const f = fixture({ confirm: () => confirmation.promise });

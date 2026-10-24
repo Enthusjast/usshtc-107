@@ -22,6 +22,7 @@ async function startService(options, { ProxyServerClass = ProxyServer, healthClo
   const proxy = new ProxyServerClass({
     ...options,
     hostKey: material.hostKey,
+    scpTempDirectory: path.join(options.dataDir, 'scp-tmp'),
     authorizedKey: Buffer.from(material.client.publicKeyRaw, 'base64'),
     authorizedKeyOpenSSH: material.client.publicKey,
   });

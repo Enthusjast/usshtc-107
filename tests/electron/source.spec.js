@@ -434,3 +434,37 @@ test('real source REST rejection and setup failure gate new listeners without re
     await exitNormally(context);
   } finally { await cleanup(context); }
 });
+
+test('real source SCP profile limits save, require restart, and remain accessible in both languages', async ({}, testInfo) => {
+  let context;
+  try {
+    context = await launch(testInfo);
+    const { page } = context;
+    await skipSetup(context);
+    await control(context, { confirmResponse: 0 });
+    await navigate(page, 'Settings');
+    await expect(page.getByLabel('Legacy SCP maximum file size (bytes)', { exact: true })).toHaveValue('1073741824');
+    await expect(page.getByLabel('Legacy SCP: refuse existing remote files', { exact: true })).not.toBeChecked();
+    await page.locator('#setting-scpMaxFileBytes').fill('2097152');
+    await page.locator('label[for="setting-scpNoOverwrite"]').click();
+    await page.getByRole('button', { name: 'Save Settings', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Saved', exact: true })).toBeDisabled();
+    await navigate(page, 'Dashboard');
+    await login(context, () => page.getByRole('button', { name: 'Login', exact: true }).click());
+    await navigate(page, 'Settings');
+    await page.locator('#setting-scpMaxFileBytes').fill('1048576');
+    await page.locator('#setting-scpNoOverwrite').focus();
+    await page.locator('#setting-scpNoOverwrite').press('Space');
+    await page.getByRole('button', { name: 'Save Settings', exact: true }).click();
+    await waitState(page, { needsRestart: true, runningConfig: { scpMaxFileBytes: 2097152, scpNoOverwrite: true },
+      desiredConfig: { scpMaxFileBytes: 1048576, scpNoOverwrite: false } });
+    await page.getByRole('button', { name: 'Restart and apply', exact: true }).click();
+    await waitState(page, { operation: null, needsRestart: false, proxyStatus: 'started',
+      runningConfig: { scpMaxFileBytes: 1048576, scpNoOverwrite: false } });
+    await page.getByRole('button', { name: '切换到中文', exact: true }).click();
+    await expect(page.getByLabel('传统 SCP 单文件大小上限（字节）', { exact: true })).toHaveValue('1048576');
+    await page.locator('#scp-settings-heading').scrollIntoViewIfNeeded();
+    await screenshot(context, 'source-scp-profile-settings');
+    await exitNormally(context);
+  } finally { await cleanup(context); }
+});

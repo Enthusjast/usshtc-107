@@ -51,6 +51,15 @@ jobs:
       - name: Check Electron source syntax
         run: npm run check:electron
 
+      - name: Install legacy SCP acceptance clients
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes openssh-client putty-tools
+          echo "PSCP_BINARY=/usr/bin/pscp" >> "$GITHUB_ENV"
+          echo "PUTTYGEN_BINARY=/usr/bin/puttygen" >> "$GITHUB_ENV"
+
       - name: Run Node, renderer, and real SSH transport tests
         run: npm test
 

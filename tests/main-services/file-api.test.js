@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { createFileApi } = require('../../electron/portal-api/file-api');
+const { portalFixture } = require('../fixtures/portal-file-api.cjs');
 
 const cluster = 'cluster-1';
 const target = "/remote/quoted ' & +?#%/file.bin";
@@ -132,12 +133,12 @@ test('init and merge use official JSON schemas, server-selected size and origina
 test('existence/type/list unwrap only official response envelopes and listing never touches access times', async () => {
   const { api, calls } = fakeClient({
     '/api/file/fileExist': { result: false },
-    '/api/file/getFileType': { type: 'FILE' },
+    '/api/file/getFileType': { type: 'file' },
     '/api/file/list': { items: [{ ...info, backendPath: '/private/path', password: 'discard' },
       { ...info, name: 'directory', type: 'DIR', size: 0 }] },
   });
   assert.equal(await api.fileExist({ cluster, path: target }), false);
-  assert.equal(await api.getFileType({ cluster, path: target }), 'FILE');
+  assert.equal(await api.getFileType({ cluster, path: target }), 'file');
   assert.deepEqual(await api.list({ cluster, path: '/remote' }), [info, { ...info, name: 'directory', type: 'DIR', size: 0 }]);
   for (const call of calls) {
     assert.equal(call.mode, 'json');
@@ -165,15 +166,23 @@ test('publication uses PATCH move with only cluster/fromPath/toPath and no delet
 
 for (const { method, endpoint, responses } of [
   { method: 'fileExist', endpoint: 'fileExist', responses: [null, true, {}, { result: 'true' }, { result: 1 }] },
-  { method: 'getFileType', endpoint: 'getFileType', responses: [null, 'FILE', {}, { type: 1 }] },
+  { method: 'getFileType', endpoint: 'getFileType', responses: [null, 'file', {}, { type: 1 },
+    { type: 'FILE' }, { type: 'DIR' }, { type: 'NOT_EXISTS' }, { type: 'symlink' }, { type: '' }] },
   { method: 'list', endpoint: 'list', responses: [null, [], {}, { items: null }, { items: [null] },
     { items: [{ ...info, type: 'SYMLINK' }] }, { items: [{ ...info, size: -1 }] },
-    { items: [{ ...info, size: 1.5 }] }, { items: [{ ...info, mtime: 1 }] }, { items: [{ ...info, mode: NaN }] }] },
+    { items: [{ ...info, size: 1.5 }] }, { items: [{ ...info, size: Number.MAX_SAFE_INTEGER + 1 }] },
+    { items: [{ ...info, mtime: 1 }] }, { items: [{ ...info, mtime: 'not-a-time' }] },
+    { items: [{ ...info, mode: NaN }] }, { items: [{ ...info, mode: -1 }] },
+    { items: [{ ...info, mode: 0.5 }] }, { items: [{ ...info, mode: 0x100000000 }] },
+    ...['', '.', '..', 'a/b', 'a\\b', 'a\nb', 'a\u0000b'].map(name => ({ items: [{ ...info, name }] })),
+    { items: [info, info] }] },
   { method: 'initMultipartUpload', endpoint: 'initMultipartUpload', responses: [null, {},
     { tempFileDir: 'relative', chunkSizeByte: 37, filesInfo: [] },
     { tempFileDir: '/tmp/files', chunkSizeByte: 0, filesInfo: [] },
     { tempFileDir: '/tmp/files', chunkSizeByte: 1.5, filesInfo: [] },
     { tempFileDir: '/tmp/files', chunkSizeByte: 37, filesInfo: {} }] },
+  { method: 'getHome', endpoint: 'getHome', responses: [null, {}, { path: 1 }, { path: '' },
+    { path: 'relative' }, { path: '/home/../other' }, { path: '/home//user' }, { path: '/home/user\n' }] },
 ]) {
   test(`${method} rejects malformed official response envelopes with fixed metadata errors`, async () => {
     for (const response of responses) {
@@ -195,4 +204,115 @@ test('invalid upload parameters and merge sizes fail before sending a request', 
     await assert.rejects(async () => api.mergeFileChunks({ cluster, path: '/remote', name: 'file', sizeByte }), { code: 'TRANSFER_METADATA' });
   }
   assert.equal(calls.length, 0);
+});
+
+test('file type accepts exactly the lowercase values evidenced in both backend implementations', async () => {
+  for (const type of ['file', 'dir']) {
+    const { api } = fakeClient({ '/api/file/getFileType': { type } });
+    assert.equal(await api.getFileType({ cluster, path: target }), type);
+  }
+});
+
+test('listing preserves raw mode including symlinks and special files rather than following or relabelling them', async () => {
+  const items = [
+    { ...info, name: 'regular', mode: 0o100640 },
+    { ...info, name: 'directory', type: 'DIR', mode: 0o040750 },
+    { ...info, name: 'link', mode: 0o120777 },
+    { ...info, name: 'fifo', mode: 0o010600 },
+    { ...info, name: 'permission-only', mode: 0o600 },
+  ];
+  const { api } = fakeClient({ '/api/file/list': { items } });
+  assert.deepEqual(await api.list({ cluster, path: '/remote' }), items);
+});
+
+test('TLS fixture makes one directory per mkdir with encoded paths and preserves metadata', async t => {
+  const f = await portalFixture(t);
+  const directory = '/remote/directory & +?#%';
+  assert.equal(await f.api.getHome({ cluster }), '/remote');
+  await f.api.mkdir({ cluster, path: directory });
+  await f.api.mkdir({ cluster, path: `${directory}/nested` });
+  f.files.set(`${directory}/data`, Buffer.from('data'));
+  f.metadata.set(`${directory}/data`, { mode: 0o100640, mtime: '2026-10-25T12:34:56.000Z' });
+  assert.equal(await f.api.getFileType({ cluster, path: directory }), 'dir');
+  assert.equal(await f.api.getFileType({ cluster, path: `${directory}/data` }), 'file');
+  const items = await f.api.list({ cluster, path: directory });
+  assert.deepEqual(items.find(item => item.name === 'data'), {
+    name: 'data', type: 'FILE', mode: 0o100640, size: 4, mtime: '2026-10-25T12:34:56.000Z',
+  });
+  assert.equal(items.find(item => item.name === 'nested').mode, 0o040700);
+  await assert.rejects(f.api.mkdir({ cluster, path: directory }), { statusCode: 409 });
+  await assert.rejects(f.api.mkdir({ cluster, path: '/remote/missing/child' }), { statusCode: 500 });
+  assert.equal(f.dirs.has('/remote/missing'), false);
+});
+
+test('TLS fixture exposes symlink lstat mode while getFileType follows links like the pinned SSH backend', async t => {
+  const f = await portalFixture(t);
+  f.files.set('/remote/data', Buffer.from('unchanged'));
+  f.symlinks.set('/remote/link', 'data');
+  f.symlinks.set('/remote/directory-link', '.');
+  f.symlinks.set('/remote/dangling', 'absent');
+  const items = await f.api.list({ cluster, path: '/remote' });
+  assert.deepEqual(items.find(item => item.name === 'link'), {
+    name: 'link', type: 'FILE', mode: 0o120777, size: 4, mtime: '2026-01-01T00:00:00.000Z',
+  });
+  assert.equal(items.find(item => item.name === 'directory-link').type, 'FILE');
+  assert.equal(await f.api.getFileType({ cluster, path: '/remote/link' }), 'file');
+  assert.equal(await f.api.getFileType({ cluster, path: '/remote/directory-link' }), 'dir');
+  await assert.rejects(f.api.getFileType({ cluster, path: '/remote/dangling' }), { statusCode: 400 });
+  await assert.rejects(f.api.mkdir({ cluster, path: '/remote/link' }), { statusCode: 409 });
+  assert.equal(f.files.get('/remote/data').toString(), 'unchanged');
+});
+
+test('TLS fixture uses evidenced list errors and keeps directory permission failures non-authentication', async t => {
+  const f = await portalFixture(t, { permission: ({ pathname, query, record }) =>
+    (pathname === '/api/file/list' && query.path === '/remote/private')
+      || (pathname === '/api/file/mkdir' && record.number === 1) });
+  await assert.rejects(f.api.mkdir({ cluster, path: '/remote/denied' }), { code: 'PORTAL_PERMISSION', statusCode: 403 });
+  assert.equal(f.dirs.has('/remote/denied'), false);
+  f.dirs.add('/remote/private');
+  await assert.rejects(f.api.list({ cluster, path: '/remote/private' }), { code: 'PORTAL_PERMISSION', statusCode: 403 });
+  f.files.set('/remote/plain', Buffer.from('x'));
+  await assert.rejects(f.api.list({ cluster, path: '/remote/plain' }), { statusCode: 412 });
+  await assert.rejects(f.api.list({ cluster, path: '/remote/missing' }), { code: 'PORTAL_PERMISSION', statusCode: 403 });
+});
+
+test('TLS default SFTP rename rejects an existing destination without modifying either file or retrying', async t => {
+  const f = await portalFixture(t);
+  const source = '/remote/.staged-file';
+  const destination = '/remote/existing';
+  const original = Buffer.from('original destination bytes');
+  const replacement = Buffer.from('replacement staged bytes');
+  f.files.set(source, replacement);
+  f.files.set(destination, original);
+  await assert.rejects(f.api.move({ cluster, fromPath: source, toPath: destination }), {
+    code: 'PORTAL_UNKNOWN', statusCode: 415,
+  });
+  assert.deepEqual(f.files.get(destination), original);
+  assert.deepEqual(f.files.get(source), replacement);
+  assert.equal(f.requests.filter(request => request.pathname === '/api/file/move').length, 1);
+  assert.equal(f.requests.some(request => /delete|unlink/.test(request.pathname)), false);
+  await f.api.move({ cluster, fromPath: source, toPath: '/remote/new-name' });
+  assert.equal(f.files.has(source), false);
+  assert.deepEqual(f.files.get('/remote/new-name'), replacement);
+  assert.deepEqual(f.files.get(destination), original);
+});
+
+test('TLS rename overwrite succeeds only with an explicitly simulated capable backend', async t => {
+  const f = await portalFixture(t, { moveOverwrite: true });
+  f.files.set('/remote/staged', Buffer.from('replacement'));
+  f.files.set('/remote/existing', Buffer.from('original'));
+  await f.api.move({ cluster, fromPath: '/remote/staged', toPath: '/remote/existing' });
+  assert.equal(f.files.get('/remote/existing').toString(), 'replacement');
+  assert.equal(f.files.has('/remote/staged'), false);
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.requests[0].pathname, '/api/file/move');
+});
+
+test('TLS ordinary upload can replace existing bytes without a rename-overwrite capability', async t => {
+  const f = await portalFixture(t);
+  f.files.set('/remote/existing', Buffer.from('longer original destination'));
+  const replacement = Buffer.from('new');
+  await f.api.upload({ cluster, path: '/remote/existing', source: Readable.from([replacement]), size: replacement.length });
+  assert.deepEqual(f.files.get('/remote/existing'), replacement);
+  assert.deepEqual(f.requests.map(request => request.pathname), ['/api/file/upload']);
 });

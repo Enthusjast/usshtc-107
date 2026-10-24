@@ -51,6 +51,8 @@ test('new remote preferences round-trip independently for each profile without e
   root.profiles[0].settings.path = ' /home/research data/目录 &% ';
   root.profiles[0].settings.startupCommand = 'tmux new -A -s usshtc';
   root.profiles[0].settings.healthProbeEnabled = true;
+  root.profiles[0].settings.scpMaxFileBytes = 12345;
+  root.profiles[0].settings.scpNoOverwrite = true;
   root.profiles.push(nextProfile(createDefaultRoot()));
   assert.equal(store.save(root).state, 'committed');
   const loaded = new SettingsStore({ filePath }).load();
@@ -60,12 +62,14 @@ test('new remote preferences round-trip independently for each profile without e
   assert.equal(second.path, '');
   assert.equal(second.startupCommand, '');
   assert.equal(second.healthProbeEnabled, false);
+  assert.equal(second.scpMaxFileBytes, 1073741824);
+  assert.equal(second.scpNoOverwrite, false);
 });
 
 test('older schema 2 profiles gain only new optional defaults without rewriting the file', (t) => {
   const { store, filePath } = fixture(t);
   const older = createDefaultRoot();
-  for (const key of ['path', 'startupCommand', 'healthProbeEnabled']) delete older.profiles[0].settings[key];
+  for (const key of ['path', 'startupCommand', 'healthProbeEnabled', 'scpMaxFileBytes', 'scpNoOverwrite']) delete older.profiles[0].settings[key];
   write(filePath, older);
   const original = fs.readFileSync(filePath, 'utf8');
   const loaded = store.load();
@@ -82,6 +86,9 @@ test('new optional defaults do not hide missing required settings or invalid opt
     (settings) => { settings.path = '/home/a\n'; },
     (settings) => { settings.startupCommand = 'arbitrary command'; },
     (settings) => { settings.healthProbeEnabled = 'true'; },
+    (settings) => { settings.scpMaxFileBytes = 0; },
+    (settings) => { settings.scpNoOverwrite = 'true'; },
+    (settings) => { delete settings.scpMaxFileBytes; settings.scpUnexpected = true; },
   ]) {
     const { store, filePath } = fixture(t);
     const root = createDefaultRoot();
