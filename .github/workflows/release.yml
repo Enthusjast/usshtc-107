@@ -150,13 +150,6 @@ jobs:
         if: steps.select.outputs.enabled == 'true'
         run: node node_modules/electron/install.js
 
-      - name: Provision GNU remote-shell fixture tools on macOS
-        if: steps.select.outputs.enabled == 'true' && matrix.target == 'mac'
-        shell: bash
-        run: |
-          brew list --versions coreutils >/dev/null || brew install coreutils
-          printf '%s/libexec/gnubin\n' "$(brew --prefix coreutils)" >> "$GITHUB_PATH"
-
       - name: Run release checks
         if: steps.select.outputs.enabled == 'true'
         run: npm run check

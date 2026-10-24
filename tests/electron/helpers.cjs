@@ -254,9 +254,9 @@ async function cleanup(context) {
     fs.rmSync(context.root, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 });
   }
 }
-async function navigate(page, name) {
+async function navigate(page, name, title = name) {
   await page.locator('aside').getByRole('button', { name, exact: true }).click();
-  await expect(page.getByRole('heading', { level: 1, name, exact: true })).toBeFocused();
+  await expect(page.getByRole('heading', { level: 1, name: title, exact: true })).toBeFocused();
 }
 
 module.exports = { launch, cleanup, rpc, envelope, scope, waitState, unusedPort, invalidSender, screenshot,

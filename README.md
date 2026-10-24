@@ -17,9 +17,11 @@ ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/usshtc107_ed25519 -p 3000 user
 - **会话与日志管理**：可查看和断开单个会话；Active/History 分页提供当前档案的 7/30 天历史与 UTC 日汇总，内存日志限制为最近 500 条。
 - **系统托盘与用户偏好**：关闭窗口后代理可继续运行；自启动必须用户主动开启，四类系统通知及断网/休眠恢复分别可控，实际 OS 注册状态与档案自动连接意图分开显示。
 - **SSH Config 管理**：原子更新受管配置块，生成前备份现有配置。
-- **连接诊断与安全导出**：依次检查保存设置、既有密钥、受管配置、本地监听、DNS、TLS 和 WSS；日志支持纯文本/级别/来源/UTC 时间筛选及匹配结果复制、JSON 导出。
+- **连接诊断与安全导出**：检查设置、密钥、SSH Config、本地监听、DNS/TLS、token、门户 setup、首条终端数据及真实轻量命令；日志支持筛选及脱敏导出。
 - **首次使用向导**：按档案保存登录、SSH Config、连接和验证进度；支持跳过与继续，完成状态由主进程复验，不把端口空闲或单纯的 WebSocket 升级当作远端命令成功。
 - **安全更新**：全局提示新版本，下载与安装分别由用户触发；安装前复核缓存和平台签名要求，取消或准备失败不退出应用。
+- **官方 API 文件传输**：CLI 与 GUI 共用流式下载、服务端协商分块上传、SHA-256 验证、取消和显式覆盖；不再经 SSH/Base64 搬运文件。
+- **桌面与应用入口**：列出本人已有桌面/应用；仅在点击后拉起 VNC 或准备 GET 网页连接，由主进程在系统浏览器打开或复制链接，renderer 不接触密码。
 - **中英文与明暗主题**：界面、托盘菜单和状态提示支持中英文。
 
 ## 安装与开发
@@ -42,7 +44,7 @@ npm run package:smoke    # Linux unpacked 打包冒烟
 npm audit --audit-level=high # 包含 Electron 与开发工具的完整依赖审计
 ```
 
-Electron 二进制通过包内安装器显式供应，并使用包内 checksum 校验；不要设置远端 checksum 绕过变量。Node 测试入口递归枚举 `tests/**/*.test.js`（含 `main-services` 和 `integration`），JSX 测试由 Vitest 执行；语法入口逐一检查 `electron/*.js` 和 `shared/*.mjs`。安装脚本仅批准 `esbuild@0.25.12`，打包保持 `npmRebuild: false`。
+Electron 二进制通过包内安装器显式供应，并使用包内 checksum 校验；不要设置远端 checksum 绕过变量。Node 测试递归枚举 `tests/**/*.test.js`，JSX 测试由 Vitest 执行；语法入口递归检查 `electron/`、`shared/` 与 `cli/` 下的 JS/MJS/CJS，覆盖率也包含新增 API 子目录。安装脚本仅批准 `esbuild@0.25.12`，打包保持 `npmRebuild: false`。
 
 ### 桌面运行验收
 
@@ -59,7 +61,7 @@ Windows PowerShell 先设置 `$env:APP_EXECUTABLE='C:\absolute\win-unpacked\ussh
 
 source 与 packaged 项目均使用私有 HOME/userData/sessionData/logs/SSH/XDG 目录、关闭自动连接/更新/自启动，并在主进程实查实际路径。测试侧拒绝外网；source 只使用固定本地 TLS/WSS 与隔离 CAS fixture，不代表真实学校登录、OS 密钥环或签名升级证据。packaged 不注入生产测试入口。沙箱保持开启；截图和原生上下文 trace 保存在 `test-results/`，CI 按平台分别保留。
 
-本地执行 CLI 文件传输 fixture 需要 GNU coreutils 来模拟 Linux 远端；macOS 使用 `brew install coreutils` 并把 `$(brew --prefix coreutils)/libexec/gnubin` 加入 PATH，CI/发布检查会显式准备。source 的远端命令 fixture 在 POSIX 使用真实 Python PTY，在 Windows 使用已安装的 Git Bash 执行实际命令，并只对管道模式的终端设置请求做测试侧建模；这不是原生 Windows PTY 或真实学校平台的通过证据。
+文件传输 fixture 使用真实本地 HTTPS 与原始二进制，不再需要 GNU coreutils 或远端 shell 工具。source 的命令 fixture 在 POSIX 使用真实 Python PTY，在 Windows 使用已安装的 Git Bash 执行命令，仅对管道模式的终端设置做测试侧建模；这不是原生 Windows PTY 或真实学校平台的通过证据。
 
 公开设置的默认值与校验由 `shared/settings-schema.mjs` 统一，renderer 校验仅供交互提示，主进程再次权威验证。IPC 成功响应为 `{ok:true,value}`，业务失败为 `{ok:false,error:{code,fieldErrors?}}`；取消操作是成功的 `{cancelled:true}` 值。前端只显示固定错误码的本地化文案，不显示主进程异常正文；缺少桌面 runtime/API 的动作会明确失败，不再静默成功。
 
@@ -72,7 +74,7 @@ source 与 packaged 项目均使用私有 HOME/userData/sessionData/logs/SSH/XDG
 1. 点击 **Login**，在隔离登录窗口中手动完成统一认证并进入 Web SSH 页面。向导不要求也不保存密码；需要自动填充时，可在 Settings 的 SSO 区域另行主动保存。
 2. 预览当前档案已保存设置的 SSH 受管配置块，检查后主动生成；已有配置匹配时可直接继续。向导不会自动改写文件。
 3. 启动代理；运行参数与保存参数不一致时，使用 **Restart and apply**，确认后才中断现有连接。
-4. 运行诊断。只有当前 scope/保存配置下的本地 SSH 公钥认证、受管配置现场匹配、运行配置一致、平台首条终端数据和随机标记的轻量远端命令证明均满足条件，主进程才保存完成状态。只完成 WebSocket Upgrade 不能通过向导。
+4. 运行诊断。主进程要求当前 scope、配置和认证 generation 下的 `TOKEN_OK`、`SETUP_OK`、本地公钥认证、有效 SSH Config、首条终端数据及真实随机标记命令全部通过，才保存完成状态。只完成 WebSocket Upgrade、只有旧版八项检查或 token 校验失败均不能完成向导。
 
 **Back/Next** 保存当前步骤；**Skip for now** 保留步骤并记为已跳过，之后可从 Dashboard 或 Settings 的 **Resume setup** 继续。取消或失败不伪造完成状态。连接设置保存后，旧诊断立即失效，需重新验证；向导不会开启 OS 自启动或修改通知偏好。
 
@@ -133,7 +135,11 @@ Exec 需要远端提供 POSIX `sh`、`stty` 和 `base64 -d`；缺失工具或协
 
 会话历史保存在私有 `session-history.json`，仅记录运行唯一 ID、档案 ID、shell/exec 类型、起止时间、字节总数、退出码和固定原因；不保存命令、输出、用户名或远端地址。最多保留 1000 条、30 天且文件不超过 1 MiB，活动摘要合并写入、关闭立即写入，启动时未完成记录标为 interrupted。历史持久化失败只显示可重试错误，不中断健康 SSH。清空历史需要原生确认，并先停止、最终化当前档案会话；取消保留连接与草稿。删除档案也删除其历史。
 
-Diagnostics 的本地、DNS/TLS 与握手检查各最多 5 秒，WSS Upgrade 后另给首条有效终端帧 10 秒，远端命令证明最多 15 秒，并受整体 30 秒上限约束，可取消。运行代理使用实际客户端密钥与固定主机指纹：`LOCAL_SSH_OK` 只证明本地 SSH 认证；`WSS_SHELL_READY` 只证明首条终端数据；独立 `remote-command` 检查必须执行随机标记命令、逐字节比对输出且退出码为 0，才返回 `REMOTE_COMMAND_OK`。向导完成同时要求这三项证明、当前认证 generation、匹配的运行配置和有效 SSH Config。停止状态的 bind-only 只证明端口可绑定，不能完成向导；首帧超时失败但不撤销 Cookie，只有 HTTP 401/403 才会撤销。保存相关配置、认证变化、切档案和退出都会使旧证明失效。
+Diagnostics 依次提供十项证明：设置、密钥、受管配置、本地监听、DNS、TLS、token 校验、门户 setup、WSS 首帧和真实轻量命令。本地/DNS/TLS/握手检查各最多 5 秒，token 校验默认 10 秒，setup 最多 4 秒，Upgrade 后首帧最多 10 秒，命令证明最多 15 秒，并受整体 30 秒上限约束。`LOCAL_SSH_OK`、`WSS_SHELL_READY` 与 `REMOTE_COMMAND_OK` 分别证明本地认证、首条终端数据和精确随机标记输出且退出 0；端口 bind-only 不证明可用。token/setup 失败会跳过 WSS 与命令检查，不伪造成功。配置、scope 或认证变化会使旧证明失效。
+
+每个新的 GUI/CLI 代理生命周期在监听前主动请求 `GET /api/auth/validateToken?token=...`，只使用 `SCOW_USER` 的值；被拒绝则提示核实登录，不进入监听。校验返回 valid 后才调用一次幂等 `GET /api/setup`，每个 SSH channel 不重复调用；恢复探测也先校验与 setup。setup、网络和超时失败不能证明 token 失效。REST 拒绝只阻止新操作并提示，不删除已保存 Cookie、不终止既有健康 SSH；只有既有 WSS 握手 HTTP 401/403 路径自动撤销 Cookie。文件 API 的 403 权限错误明确区别于 AUTH。
+
+`validateTokenPeriodically` 默认关闭，启用后至少每五分钟校验一次，不建立 shell 会话；繁忙、暂停、切档案、认证变化和退出会取消旧请求。API 拒绝抑制此凭据上下文的后续定期轮询，等待凭据变化；网络失败不推断过期。校验服务内部故障也可能被门户返回为拒绝，所以应用不会因此删除凭据。
 
 日志筛选是大小写不敏感的纯文本匹配，不执行正则。复制和日志 JSON 导出只包含当前匹配项（ISO 时间、级别、来源和脱敏消息）；诊断包则明确包含当前最多 500 条安全日志，不受筛选影响。诊断包为单个 JSON，只含版本/架构、公开连接设置、诊断状态和再次脱敏的日志，替换 HOME/USERDATA 路径；总量最多 8 MiB，必要时逐条裁剪最旧完整日志并记录数量。不会读取原始设置、日志文件或私钥打包，也不包含账号、Cookie、密文、用户 exec 命令或远端输出；公开的 `startupCommand` 仅允许下述固定 tmux 选项。保存位置由原生对话框选择，取消不写文件。
 
@@ -147,7 +153,7 @@ Rotate 替换选中的可用身份前必须成功导出加密备份；原生确�
 
 自启动仅支持已安装/打包应用，开发和 unpacked 运行明确显示不支持，读取状态不会自动注册。Windows 按同一路径、参数和本应用 launch-item 的实际 enabled 状态读取；macOS 如需 Login Items 批准会如实显示，不能把登录启动来源当作已启用。Linux 只管理用户 XDG autostart 下带 `X-usshtc107-Managed=true` 的文件，不覆盖同名他人文件；Exec 不使用 shell，并按 freedesktop 规则转义。先更改 OS 状态再保存偏好，保存失败会恢复原 OS 状态；SSO/自动连接仍由当前档案独立控制。
 
-恢复遵循 `desiredRunning`：用户 Start/Restart/Login 请求连接，Stop 取消意图；后台检查不改变意图。自动恢复开关关闭会中止探测和 timer，不停止健康 SSH；显式 Retry 仍可执行一轮。网络故障按 1/2/4/8/16/30 秒、最多六次退避，每次握手最多 5 秒，Upgrade 后还必须在 10 秒内收到有效终端数据才算可达。首帧超时立即停止该 scope/config/Cookie 的自动恢复，保留凭据并提示验证登录；恢复开关、在线提示或系统 resume 不会绕过此限制，需显式 Retry 或连接/凭据变化。只有 HTTP 401/403 会撤销 Cookie。只有监听确实停止且仍有连接意图才启动代理；不会重启健康监听、重放 exec 或重建旧 channel，停止、切档案、认证撤销和退出均取消迟到结果。
+恢复遵循 `desiredRunning`，后台检查不改变连接意图。每轮先执行 token 校验和 setup，再等待真实 WSS 首帧；网络故障按 1/2/4/8/16/30 秒、最多六次退避。REST 拒绝是终止性的登录提示，不进入网络退避、不撤销 Cookie；只有 WSS 握手 401/403 自动撤销。首帧静默同样抑制该 scope/config/Cookie 的自动恢复，显式 Retry 或上下文变化才可重试。不会重启健康监听、重放 exec 或重建旧 channel。
 
 交互会话保持为每档案主动选择：`startupCommand` 只允许空字符串（关闭）或 `tmux new -A -s usshtc`，不接受任意启动脚本。仅在收到首条终端数据后、用户排队输入之前注入交互 shell；先检查 `command -v tmux`，缺少时显示提示并保留普通 shell，exec 一律不注入。tmux 会话名固定为 `usshtc`，因此同一远端账号/节点的启用连接会附加到同一会话。
 
@@ -178,25 +184,35 @@ netsh interface ipv4 show excludedportrange protocol=tcp
 
 ## Headless CLI 与文件传输
 
-CLI 不依赖 Electron，直接复用代理、设置校验与密钥服务。安装依赖后使用 `npm run cli -- --help` 或 `node cli/main.cjs`；`package.json.bin` 声明的 Node CLI 名为 `usshtc107`，不等同于 Electron 安装后的同名桌面可执行文件，后者不会因此变成无头模式。`serve` 是默认子命令，支持 `--port`、`--host`、`--cluster`、`--login-node`、`--path`、`--startup-command`、`--health-probe` 和 `--config`。默认只监听回环，SIGINT/SIGTERM 会等待代理资源关闭。
+CLI 不依赖 Electron。安装依赖后使用 `npm run cli -- --help` 或 `node cli/main.cjs`；`package.json.bin` 的 Node CLI 名为 `usshtc107`，不等同于 Electron 安装后的同名桌面可执行文件。默认 `serve` 启动经过 API 前置校验的回环 SSH 代理，SIGINT/SIGTERM 等待资源关闭。连接参数与档案沿用统一 schema，短期 Cookie 只在内存使用。
 
-短期凭据通过环境变量 `SCOW_TOKEN` 在内存使用，不写入配置或日志；安全输入示例见 live 说明。兼容 `--cookie`，但它会暴露在进程参数中，因此会显示警告，不推荐使用。严格 JSON 配置只接受 `port`、`host`、`cluster`、`loginNode`、`path`、`startupCommand`、`healthProbeEnabled`、`dataDir`、`sshDirectory`、`maxBytes`、`timeoutMs`，拒绝凭据和未知键。客户端身份默认位于 `~/.ssh`，CLI host key 默认位于 `${XDG_DATA_HOME:-~/.local/share}/usshtc107-cli/proxy_host_ed25519`；`--data-dir` 与 `--ssh-directory` 可隔离实例。
+`SCOW_TOKEN` 是短期 `SCOW_USER` 值，`serve`、`get` 与 `put` 都需要；通过环境变量安全输入，不写配置、日志或命令历史。`--cookie` 仍可显式提供，但会暴露在进程参数中并显示警告。严格 JSON 配置拒绝凭据和未知键；文件操作不读取、生成或依赖本地 SSH 身份。`dataDir`、`sshDirectory`、host/port 等只影响 `serve`。远端文件路径必须为绝对路径，拒绝控制字符、目录根和路径穿越，不假设用户家目录。
 
 ```bash
 # 先安全设置 SCOW_TOKEN，不把 token 写在命令行中
 npm run cli -- serve
-# 另一个终端，通过已运行的代理传输
+# 文件 API 直接使用 Cookie 与 cluster，不需要先运行 serve
 npm run cli -- put -- ./local.bin /remote/new-file.bin
 npm run cli -- get -- /remote/new-file.bin ./downloaded.bin
 ```
 
-`get`/`put` 不另起代理、不需要 token，须与 `serve` 使用相同的 host/port、data-dir 和 ssh-directory；使用既有客户端身份并固定验证本地主机密钥。默认不覆盖已存在的文件、符号链接或目录。远端需要 GNU `base64`、`dd`、`stat`、`sha256sum`、`ln` 和 `rm`；上传块 16 KiB、下载块 512 KiB，SSH exec 请求另限 32 KiB，避免超出协议包界限。单文件默认/最大 64 MiB，默认总时限 10 分钟，可用 `--max-bytes` 缩小上限、`--timeout-ms` 指定时限（最多一小时）。
+`get`/`put` 及 **File transfers** 页面直接使用官方 HTTPS file API，不再使用 SSH/Base64、远端 shell 工具或旧传输回退。默认/最大单文件 64 MiB、总时限 10 分钟；CLI 可用 `--max-bytes` 缩小上限、`--timeout-ms` 指定时限（最多一小时）。上传先协商服务端 `chunkSizeByte`，小于阈值使用单次 multipart，达到阈值按服务端大小串行分块；块名是原始块 SHA-256 加一基索引，`chunk`/`originPath` 经 URL query 编码，merge 的 `sizeByte` 是完整原文件大小。init 明确返回 UNIMPLEMENTED 时仅使用已确认的官方普通 upload，不回退到 SSH，也不声称进行了分块。
 
-传输先后计算 SHA-256 并核对内容与大小，局部写入临时文件后以原子 no-clobber hard-link 发布完整目标；本地临时文件在发布前 fsync。中断会移除本地临时文件，并有界地尝试清理远端临时文件；若连接已完全丢失，远端可能残留隐藏 `.usshtc107-<UUID>.part`，但不会把半文件发布到最终路径。不会自动重放失败的数据命令。
+上传先写唯一暂存文件，完整下载回读并核对 SHA-256 后，再通过官方 move API 发布；本地源文件变化、远端回读不一致或 AUTH 都会明确失败。进度只计算 HTTP 成功确认的字节，最后一块不超计。默认通过 `fileExist` 拒绝已存在目标，`--overwrite` 或 GUI 明确确认才可替换普通文件，不替换目录。**门户没有原子排他写入契约：存在性检查之后仍有并发写入竞态，不能保证远端原子 no-clobber。**这是用户明确接受的官方 API 边界。
+
+下载前、写入期间及完成后分别计算/核对 SHA-256，本地使用 0600 `.part` 文件、fsync 后发布，默认原子保护本地已存在目标；显式覆盖时使用最终改名。取消会停止后续请求并清理本地临时文件，远端暂存目录/文件可能保留；其共享和清理契约未确认，应用不会删除未知远端临时目录或假称回滚。上传、合并与 move 不自动重试，不支持断点续传、自动同步、目录传输或目录打包下载。
+
+GUI 只接受远程路径，本地文件/保存位置由带父窗口的原生对话框选择；最多 2 个活动传输、20 个排队项、50 条完成历史。列表只发布文件名、状态和确认字节，不把 Cookie、本地绝对路径或 VNC 链接传给 renderer。切档案、认证/连接上下文变化及退出会取消旧操作。
+
+## 桌面与应用入口
+
+**Desktops & apps** 只列出当前账号/集群的已有桌面、应用会话和应用目录。刷新列表不会拉起桌面；必须点击打开或复制才调用 launch/connect。主进程验证固定 HTTPS 门户来源、host/port/proxy 路径及模板，再交给系统浏览器或剪贴板；完整 noVNC/应用链接与 VNC 密码不经过 IPC、不显示在页面、不进日志、设置或导出。链接含会话凭据，剪贴板和系统浏览器历史不受本应用控制，请勿外发。
+
+支持已核对的 v1.9.11 嵌套桌面结构、VNC 应用及 `connect.method=GET` 的 web 应用；连接应用 API 本身仍为 POST JSON。模板替换采用门户的 `{{ HOST }}`/`{{ PORT }}`/`{{ PASSWORD }}` 与 customFormData 规则，query 后编码。会话已结束/未就绪分别显示错误，不自动重试；POST 表单、ShadowDesk、新建桌面和 WM 选择不在本轮范围。私有契约证据与剩余边界见 [SCOW API 契约记录](docs/scow-api-contracts.md)。
 
 不提供完整 SFTP/scp 子系统，不承诺现有 `scp`/`sftp` 客户端兼容；不提供本地/动态/反向端口转发，也不承诺 VS Code Remote-SSH。
 
-回滚边界：P0 的输入门控不修改用户配置或密钥；但新增档案字段一旦写入，旧版 `1.2.2` 的严格 schema 会拒绝多余字段并保持只读，不能宣称任意旧版本都能免配置处理回滚。回滚应按依赖逆序撤销提交，并先备份完整私有 userData；恢复到更早版本时使用对应版本可读取的设置备份，不手工删除秘密字段、私钥或 known_hosts 来绕过保护。新增字段的 v2 缺省补齐本身只发生在内存，不会在只读加载时重写原文件。
+回滚边界：新档案字段一旦保存，未识别这些字段的旧版本（包括已固定的 `v1.3.0` 快照）会因严格 schema 保持只读，不能宣称免配置处理回滚。按依赖逆序撤销提交，并先备份完整私有 userData；回到更早版本时使用对应设置备份，不删除秘密字段、私钥或 known_hosts 绕过保护。缺省补齐只发生在内存，不在只读加载时改写原文件。现有 `v1.3.0` 标签保持原提交，本专项不移动标签或发布。
 
 ## 打包与发布
 
@@ -239,6 +255,12 @@ electron/
   settings-store.js       设置校验和原子持久化
   session-history-store.js 注册会话终结、有界历史和失败重试
   diagnostics-service.js  有界连接检查、终端就绪和实际命令证明
+  portal-api/             统一 HTTPS、token/setup、文件与桌面/应用 API
+  portal-preflight.js     新监听与恢复的非破坏性认证/setup 门控
+  token-validation-service.js 默认关闭、至少五分钟的定期 token 校验
+  file-transfer/          流式哈希、官方分块、暂存发布及 GUI 队列
+  remote-session/         scope 归属、主进程链接生成和显式打开/复制
+  portal-services.js      主进程服务组装、取消与 trusted IPC 注册
   diagnostic-export-service.js 脱敏 JSON 和筛选日志导出
   wss-connection.js        统一平台 URL、TLS 和系统追加信任政策
   ssh-key-service.js      客户端与代理主机密钥
@@ -246,7 +268,7 @@ electron/
   preload.js              最小化 IPC API
 src/
   components/             通用界面组件
-  views/                  Dashboard、Sessions、Logs、Diagnostics、Settings，以及临时 Setup 向导
+  views/                  Dashboard、SSH Sessions、Logs、Diagnostics、Transfers、Remote Sessions、Settings 与临时 Setup
   i18n/                   中英文资源和 Locale Context
 tests/                    核心代理、安全服务和前端交互测试
 ```
@@ -276,7 +298,7 @@ tests/                    核心代理、安全服务和前端交互测试
 
 ## 真实门户验收
 
-`tests/live/` 是与默认 CI 隔离的真实门户用例，只有同时设置 `LIVE_SMOKE=1` 与短期 `SCOW_TOKEN` 才运行；凭据不进入命令参数、仓库或日志。用例覆盖 exec、交互、首帧超时与退出行为；`LIVE_CONCURRENCY=1` 另行启用 2/4/8 并发、各三轮的只读观察，记录成功率和延迟，不预设全部成功，不自动重放。提供凭据、选择集群/节点及运行方式见 [live 验收说明](tests/live/README.md)。
+`tests/live/` 只有同时设置 `LIVE_SMOKE=1` 和短期 `SCOW_TOKEN` 才联系真实门户；`portal-api.live.cjs` 校验 token、setup 并只读列出桌面/应用，不自动启动会话或上传文件。`LIVE_CONCURRENCY=1` 另启用 2/4/8 并发只读观察。没有凭据的跳过不算成功；真实 token/文件/桌面验收本轮未取得，local fixture 不能替代。运行与秘密处理见 [live 验收说明](tests/live/README.md)。
 
 未提供凭据时 live 用例明确跳过，不算真实门户通过。本轮由用户明确选择暂缓真实门户验收；本地 TLS/WSS、SSH、PTY 和 Electron fixture 只能证明本地路径，不能替代学校平台、真实密钥环或 Windows/macOS 签名升级证据。未执行发布。
 

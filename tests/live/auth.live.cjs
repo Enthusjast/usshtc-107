@@ -3,9 +3,20 @@
 const crypto = require('node:crypto');
 const { liveTest, harness, check, cookie, event } = require('./helpers.cjs');
 
-async function rejectedCredential(t, token) {
+async function rejectedCredential(t, token, backend = process.env.LIVE_BACKEND || 'proxy') {
   const timeoutMs = 10000;
-  const f = await harness(t, { cookie: cookie(token), remoteReadyTimeoutMs: timeoutMs, execTimeoutMs: 20000 });
+  if (backend === 'cli') {
+    let listening = false;
+    let rejection;
+    try {
+      await harness(t, { cookie: cookie(token) }, { backend,
+        onListening: () => { listening = true; } });
+    } catch (error) { rejection = error; }
+    check(rejection?.code === 'AUTH_REQUIRED', 'LIVE_CLI_PREFLIGHT_REJECTION_MISSING');
+    check(!listening, 'LIVE_CLI_REJECTED_TOKEN_BOUND_LISTENER');
+    return;
+  }
+  const f = await harness(t, { cookie: cookie(token), remoteReadyTimeoutMs: timeoutMs, execTimeoutMs: 20000 }, { backend });
   const auth = [];
   const notReady = [];
   let readyCount = 0;
@@ -29,8 +40,12 @@ async function rejectedCredential(t, token) {
   }
 }
 
-liveTest('live invalid token fails clearly within the readiness deadline', { timeout: 35000 }, async (t) => {
-  await rejectedCredential(t, `invalid-live-test-${crypto.randomBytes(24).toString('hex')}`);
+liveTest('live invalid token gates CLI preflight before listener binding', { timeout: 35000 }, async (t) => {
+  await rejectedCredential(t, `invalid-live-test-${crypto.randomBytes(24).toString('hex')}`, 'cli');
+});
+
+liveTest('live raw proxy invalid token fails within the readiness deadline without false readiness', { timeout: 35000 }, async (t) => {
+  await rejectedCredential(t, `invalid-live-test-${crypto.randomBytes(24).toString('hex')}`, 'proxy');
 });
 
 liveTest('live expired token fails without false readiness', {

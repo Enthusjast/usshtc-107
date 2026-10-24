@@ -11,6 +11,8 @@ import LogsView from './views/LogsView';
 import SettingsView from './views/SettingsView';
 import DiagnosticsView from './views/DiagnosticsView';
 import SetupView from './views/SetupView';
+import RemoteSessionsView from './views/RemoteSessionsView';
+import TransfersView from './views/TransfersView';
 import { IconMenu } from './components/Icons';
 import { RuntimeProvider, useRuntime } from './contexts/RuntimeContext';
 import { ProfileProvider, useProfiles } from './contexts/ProfileContext';
@@ -25,6 +27,8 @@ const VIEWS = {
   sessions: { component: SessionsView, key: 'sessions' },
   logs: { component: LogsView, key: 'logs' },
   diagnostics: { component: DiagnosticsView, key: 'diagnostics' },
+  remote: { component: RemoteSessionsView, key: 'remoteSessionsTitle' },
+  transfers: { component: TransfersView, key: 'transfersTitle' },
   settings: { component: SettingsView, key: 'settings' },
   setup: { component: SetupView, key: 'setupTitle' },
 };

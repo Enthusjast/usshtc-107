@@ -2,6 +2,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { test, expect } = require('@playwright/test');
 const { launch, cleanup, rpc, envelope, scope, waitState, unusedPort, invalidSender, screenshot,
   assertNoExternal, exitNormally, navigate } = require('./helpers.cjs');
@@ -143,6 +144,8 @@ test('real source wizard: skip/resume/back, private CAS, explicit SSH config, TL
       expect.objectContaining({ id: 'local-listener', status: 'passed', code: 'LOCAL_SSH_OK', mode: 'ssh-auth' }),
       expect.objectContaining({ id: 'tls', status: 'passed', code: 'TLS_OK' }),
       expect.objectContaining({ id: 'wss', status: 'passed', code: 'WSS_SHELL_READY' }),
+      expect.objectContaining({ id: 'token', status: 'passed', code: 'TOKEN_OK' }),
+      expect.objectContaining({ id: 'setup', status: 'passed', code: 'SETUP_OK' }),
       expect.objectContaining({ id: 'remote-command', status: 'passed', code: 'REMOTE_COMMAND_OK' }),
     ]));
     await screenshot(context, 'source-verified-wizard');
@@ -315,6 +318,7 @@ test('real source profile options preserve paths and keep remote session feature
     await expect(page.locator('#setting-path')).toHaveValue('');
     await expect(page.locator('#setting-startupCommand')).not.toBeChecked();
     await expect(page.locator('#setting-healthProbeEnabled')).not.toBeChecked();
+    await expect(page.locator('#setting-validateTokenPeriodically')).not.toBeChecked();
     await page.locator('#setting-host').fill('0.0.0.0');
     await expect(page.locator('#setting-host-warning')).toBeVisible();
     await page.locator('#setting-host-warning').scrollIntoViewIfNeeded();
@@ -324,10 +328,11 @@ test('real source profile options preserve paths and keep remote session feature
     await page.locator('#setting-path').fill('/tmp/project with space');
     await page.locator('label[for="setting-startupCommand"]').click();
     await page.locator('label[for="setting-healthProbeEnabled"]').click();
+    await page.locator('label[for="setting-validateTokenPeriodically"]').click();
     await page.getByRole('button', { name: 'Save Settings', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Saved', exact: true })).toBeDisabled();
     expect(await rpc(page, 'getSettings', await scope(page))).toMatchObject({ path: '/tmp/project with space',
-      startupCommand: 'tmux new -A -s usshtc', healthProbeEnabled: true });
+      startupCommand: 'tmux new -A -s usshtc', healthProbeEnabled: true, validateTokenPeriodically: true });
     await page.locator('#setting-startupCommand').scrollIntoViewIfNeeded();
     await screenshot(context, 'source-opt-in-remote-features');
     await navigate(page, 'Dashboard');
@@ -338,11 +343,94 @@ test('real source profile options preserve paths and keep remote session feature
     await expect(page.locator('#setting-path')).toHaveValue('/tmp/project with space');
     await expect(page.locator('#setting-startupCommand')).toBeChecked();
     await expect(page.locator('#setting-healthProbeEnabled')).toBeChecked();
+    await expect(page.locator('#setting-validateTokenPeriodically')).toBeChecked();
+    await page.locator('label[for="setting-validateTokenPeriodically"]').click();
     await page.locator('label[for="setting-startupCommand"]').click();
     await page.locator('label[for="setting-healthProbeEnabled"]').click();
     await page.getByRole('button', { name: 'Save Settings', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Saved', exact: true })).toBeDisabled();
-    expect(await rpc(page, 'getSettings', await scope(page))).toMatchObject({ startupCommand: '', healthProbeEnabled: false });
+    expect(await rpc(page, 'getSettings', await scope(page))).toMatchObject({ startupCommand: '', healthProbeEnabled: false, validateTokenPeriodically: false });
+    await exitNormally(context);
+  } finally { await cleanup(context); }
+});
+
+test('real source official APIs: explicit credential-safe desktop/app actions and native binary transfers without SSH', async ({}, testInfo) => {
+  let context;
+  try {
+    context = await launch(testInfo);
+    const { page, application, root } = context;
+    await skipSetup(context);
+    await login(context, () => page.getByRole('button', { name: 'Login', exact: true }).click());
+    const setups = await application.evaluate(({ app }) => app.__acceptance.portalCalls.filter(path => path === '/api/setup').length);
+    await sshConnection(context, true);
+    await echoSsh(context, 'no additional portal setup per SSH channel');
+    await sshConnection(context, false);
+    await waitState(page, { connectionCount: 0 });
+    expect(await application.evaluate(({ app }) => app.__acceptance.portalCalls.filter(path => path === '/api/setup').length)).toBe(setups);
+    await rpc(page, 'stopProxy', await scope(page));
+    await waitState(page, { proxyStatus: 'stopped', operation: null, cookieValid: true });
+    await navigate(page, 'Desktops & apps', 'Remote desktops and applications');
+    await expect(page.getByRole('heading', { name: 'Fixture desktop', exact: true })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Fixture app session', exact: true })).toBeVisible();
+    expect(await application.evaluate(({ app }) => app.__acceptance.portalLaunches)).toBe(0);
+    await page.getByRole('button', { name: 'Open in browser — Fixture desktop', exact: true }).click();
+    await expect.poll(() => application.evaluate(({ app }) => app.__acceptance.openedLinks.length)).toBe(1);
+    expect(await application.evaluate(({ app }) => {
+      const link = new URL(app.__acceptance.openedLinks[0]);
+      return { origin: link.origin, path: link.pathname, secretPresent: link.searchParams.get('password') === 'fixture-vnc-private' };
+    })).toEqual({ origin: 'https://107.ustc.edu.cn', path: '/vnc/vnc.html', secretPresent: true });
+    await page.getByRole('button', { name: 'Open in browser — Fixture app session', exact: true }).click();
+    await expect.poll(() => application.evaluate(({ app }) => app.__acceptance.openedLinks.length)).toBe(2);
+    await page.getByRole('button', { name: 'Copy connection link — Fixture desktop', exact: true }).click();
+    await expect.poll(() => application.evaluate(({ clipboard }) => {
+      const link = new URL(clipboard.readText());
+      return link.pathname === '/vnc/vnc.html' && link.searchParams.has('password');
+    })).toBe(true);
+    await expect(page.locator('body')).not.toContainText('fixture-vnc-private');
+    await expect(page.locator('body')).not.toContainText('fixture-app-private');
+    await screenshot(context, 'source-official-remote-sessions');
+    const bytes = crypto.randomBytes(1536 * 1024);
+    fs.writeFileSync(path.join(root, 'exports', 'native-upload.bin'), bytes, { mode: 0o600 });
+    await navigate(page, 'File transfers');
+    await page.locator('#transfer-remote-path').fill('/remote/native-api.bin');
+    await control(context, { nextUpload: 'native-upload.bin' });
+    await page.getByRole('button', { name: 'Upload a file…', exact: true }).click();
+    await expect.poll(async () => (await rpc(page, 'listTransfers', { scope: await scope(page) })).items.map(item => item.status)).toEqual(['completed']);
+    expect(await application.evaluate(({ app }) => app.__acceptance.portal.files.get('/remote/native-api.bin').length)).toBe(bytes.length);
+    await control(context, { nextExport: 'native-download.bin' });
+    await page.getByRole('button', { name: 'Download a file…', exact: true }).click();
+    await expect.poll(async () => (await rpc(page, 'listTransfers', { scope: await scope(page) })).items.map(item => item.status)).toEqual(['completed', 'completed']);
+    expect(crypto.createHash('sha256').update(fs.readFileSync(path.join(root, 'exports', 'native-download.bin'))).digest('hex'))
+      .toBe(crypto.createHash('sha256').update(bytes).digest('hex'));
+    await expect(page.getByRole('progressbar', { name: 'Transfer progress — native-api.bin' })).toHaveAttribute('value', '100');
+    await screenshot(context, 'source-official-api-transfers');
+    const safeItems = await rpc(page, 'listTransfers', { scope: await scope(page) });
+    expect(JSON.stringify(safeItems)).not.toMatch(/SCOW_USER|fixture-token|\/exports\/|fixture-vnc-private|fixture-app-private/);
+    await control(context, { nextExport: 'portal-safe.json' });
+    await rpc(page, 'exportDiagnostics', await scope(page));
+    expect(fs.readFileSync(path.join(root, 'exports', 'portal-safe.json'), 'utf8')).not.toMatch(/fixture-vnc-private|fixture-app-private|credential=/);
+    await assertNoExternal(context);
+    await exitNormally(context);
+  } finally { await cleanup(context); }
+});
+
+test('real source REST rejection and setup failure gate new listeners without removing stored credentials', async ({}, testInfo) => {
+  let context;
+  try {
+    context = await launch(testInfo);
+    const { page } = context;
+    await skipSetup(context);
+    await login(context, () => page.getByRole('button', { name: 'Login', exact: true }).click());
+    await rpc(page, 'stopProxy', await scope(page));
+    await control(context, { apiReject: true });
+    expect(await envelope(page, 'startProxy', await scope(page))).toEqual({ ok: false, error: { code: 'AUTH_REQUIRED' } });
+    await waitState(page, { proxyStatus: 'stopped', cookieValid: true, loginStatus: 'success', remoteStatus: 'auth_required', operation: null });
+    await control(context, { apiReject: false, apiSetupFailed: true });
+    expect(await envelope(page, 'startProxy', await scope(page))).toEqual({ ok: false, error: { code: 'PORTAL_NETWORK' } });
+    await waitState(page, { proxyStatus: 'stopped', cookieValid: true, loginStatus: 'success', operation: null });
+    await control(context, { apiSetupFailed: false });
+    await rpc(page, 'startProxy', await scope(page));
+    await waitState(page, { proxyStatus: 'started', cookieValid: true, operation: null });
     await exitNormally(context);
   } finally { await cleanup(context); }
 });

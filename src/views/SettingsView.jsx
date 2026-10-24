@@ -435,6 +435,16 @@ export default function SettingsView({ onDirtyChange, onDraftChange, onBusyChang
             <p id="setting-health-help" className="settings-help">{t('healthProbeEnabledHint')}</p>
             <FieldError id="setting-healthProbeEnabled-error" message={fieldErrors.healthProbeEnabled} />
           </div>
+          <div>
+            <label className="toggle-wrapper" htmlFor="setting-validateTokenPeriodically">
+              <span className="toggle-label">{t('validateTokenPeriodically')}</span>
+              <span className="toggle-switch">
+                <input id="setting-validateTokenPeriodically" type="checkbox" checked={settings.validateTokenPeriodically === true} onChange={(e) => update('validateTokenPeriodically', e.target.checked)} disabled={isSaving} aria-describedby="setting-token-validation-help" />
+                <span className="toggle-slider" aria-hidden="true" />
+              </span>
+            </label>
+            <p id="setting-token-validation-help" className="settings-help">{t('validateTokenPeriodicallyHint')}</p>
+          </div>
           <label className="toggle-wrapper">
             <span className="toggle-label">{t('startMinimized')}</span>
             <span className="toggle-switch">

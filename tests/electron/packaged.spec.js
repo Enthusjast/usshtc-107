@@ -45,6 +45,13 @@ test('actual native package: isolated sandboxed UI/IPC/config/preferences, physi
       if (expectedMode === 'manual') expect(distribution.packageType).toBe('deb');
     }
     expect(update).toMatchObject({ phase: 'idle', installMode: expectedMode, availableVersion: null, progress: null, errorCode: null });
+    await navigate(page, 'Desktops & apps', 'Remote desktops and applications');
+    await expect(page.getByRole('button', { name: 'Sign in again', exact: true })).toBeVisible();
+    await expect(page.getByText('No existing desktops in this cluster. Create desktops in the portal.', { exact: true })).toHaveCount(0);
+    await navigate(page, 'File transfers');
+    await expect(page.getByRole('button', { name: 'Sign in again', exact: true })).toBeVisible();
+    expect((await rpc(page, 'getStatus')).cookieValid).toBe(false);
+    await screenshot(context, 'packaged-api-auth-boundaries');
     await navigate(page, 'Settings');
     await expect(page.locator('#setting-port')).toHaveValue(String(context.port));
     const nextPort = await unusedPort();

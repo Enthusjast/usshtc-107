@@ -12,6 +12,7 @@ const electron = require('electron');
 const { WebSocket, WebSocketServer } = require('ws');
 const { installNetworkGuard } = require('./electron-network-guard.cjs');
 const { createRemoteExecPeer } = require('./remote-exec-peer.cjs');
+const { startNativePortalApi } = require('./portal-native-api.cjs');
 
 const root = fs.realpathSync(process.env.USSHTC107_FIXTURE_ROOT || '');
 if (!path.isAbsolute(root) || root !== process.env.USSHTC107_FIXTURE_ROOT
@@ -26,6 +27,7 @@ const returnUrl = 'https://107.ustc.edu.cn/fixture-return';
 const control = {
   root, authVisits: [], upgradeCookies: [], proxyInstances: [], confirmations: [],
   confirmResponse: 1, exports: [], nextExport: null, holdDns: false, pendingDns: null,
+  portalCalls: [], portalLaunches: 0, openedLinks: [], nextUpload: null, nativeOverwriteResponse: 0,
   releaseDns() { const callback = this.pendingDns; this.pendingDns = null; this.holdDns = false; callback?.(); },
   emitLogs(count) {
     const proxy = this.proxyInstances.at(-1);
@@ -54,9 +56,10 @@ const safeStorage = {
 };
 const dialog = {
   async showMessageBox(parent, options) {
-    if (!parent || parent.isDestroyed() || options.defaultId !== 1 || options.cancelId !== 1) throw new Error('Unsafe confirmation contract');
+    if (!parent || parent.isDestroyed() || options.defaultId !== options.cancelId
+        || ![0, 1].includes(options.cancelId)) throw new Error('Unsafe confirmation contract');
     control.confirmations.push({ ...options, parentId: parent.id });
-    return { response: control.confirmResponse };
+    return { response: options.cancelId === 0 ? control.nativeOverwriteResponse : control.confirmResponse };
   },
   async showSaveDialog(parent, options) {
     if (!parent || parent.isDestroyed()) throw new Error('Export must have a parent');
@@ -67,7 +70,12 @@ const dialog = {
     control.exports.push({ filePath, title: options.title });
     return { canceled: false, filePath };
   },
-  async showOpenDialog() { return { canceled: true, filePaths: [] }; },
+  async showOpenDialog(parent) {
+    if (!parent || parent.isDestroyed()) throw new Error('Upload must have a parent');
+    const filename = control.nextUpload; control.nextUpload = null;
+    return filename ? { canceled: false, filePaths: [path.join(root, 'exports', path.basename(filename))] }
+      : { canceled: true, filePaths: [] };
+  },
 };
 const clock = {
   now: () => performance.now(), wallNow: () => Date.now(), setTimeout: (...args) => setTimeout(...args), clearTimeout,
@@ -135,12 +143,21 @@ const authReady = electron.app.whenReady().then(() => {
   };
   const { ProxyServer } = require('../../electron/proxy-server');
   const { startApplication } = require('../../electron/main');
+const nativeRuntimeReady = startNativePortalApi(control).then(portal => {
+  control.portal = portal;
   control.runtime = startApplication({
     electron: { ...electron, safeStorage, dialog, Notification: { isSupported: () => false },
-      shell: { openExternal: async () => { throw new Error('External browser is disabled in acceptance'); } } },
+      shell: { openExternal: async url => {
+        const target = new URL(url);
+        if (target.origin !== 'https://107.ustc.edu.cn' || !['/vnc/vnc.html', '/api/proxy/'].some(prefix => target.pathname.startsWith(prefix))) {
+          throw new Error('External browser target is outside the fixture contract');
+        }
+        control.openedLinks.push(url);
+      } } },
     clock, log: { info() {}, warn() {}, error() {}, debug() {} },
     sshDirectory: path.join(root, 'home', '.ssh'),
-    portalPreflight: { validate: async () => ({ status: 'valid' }), setup: async () => ({ ok: true }), run: async () => ({ ok: true }) },
+    portalApiOptions: { baseUrl: portal.baseUrl, tlsCa: portal.tlsCa },
+    flush: async () => { if (portal.errors.length) throw new Error('Native portal fixture contract failed'); },
     autostartService: {
       getStatus: async () => ({ supported: false, enabled: false, approvalRequired: false, errorCode: null }),
       setEnabled: async () => { throw new Error('Acceptance must never register OS autostart'); },
@@ -167,8 +184,13 @@ const authReady = electron.app.whenReady().then(() => {
     },
     recoveryAdapters: { tlsCa: certificate, createWebSocket: localWss },
   });
+  return control.runtime.ready;
+});
 installNetworkGuard(electron, { authUrls: [platformUrl, casUrl, returnUrl, shellUrl] });
-control.ready = Promise.all([control.runtime.ready, listeningReady, authReady]).catch((error) => {
+control.ready = Promise.all([nativeRuntimeReady, listeningReady, authReady]).catch((error) => {
   console.error(error); electron.app.exit(1);
 });
-electron.app.once('will-quit', () => { for (const ws of wss.clients) ws.terminate(); wss.close(); server.close(); });
+electron.app.once('will-quit', () => {
+  for (const ws of wss.clients) ws.terminate(); wss.close(); server.close();
+  void control.portal?.dispose();
+});

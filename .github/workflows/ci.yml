@@ -51,13 +51,6 @@ jobs:
       - name: Check Electron source syntax
         run: npm run check:electron
 
-      - name: Provision GNU remote-shell fixture tools on macOS
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          brew list --versions coreutils >/dev/null || brew install coreutils
-          printf '%s/libexec/gnubin\n' "$(brew --prefix coreutils)" >> "$GITHUB_PATH"
-
       - name: Run Node, renderer, and real SSH transport tests
         run: npm test
 

@@ -10,10 +10,14 @@ const { Client, utils: sshUtils } = require('ssh2');
 const { ProxyServer } = require('../../electron/proxy-server');
 const { DEFAULTS } = require('../../electron/constants');
 const { ensureClientKeyPair, ensureProxyHostKey, getSsh2ClientIdentity } = require('../../electron/ssh-key-service');
+const { createPortalApiClient, extractScowToken } = require('../../electron/portal-api/client');
 
 const enabled = process.env.LIVE_SMOKE === '1' && Boolean(process.env.SCOW_TOKEN);
 const skip = enabled ? false : 'Requires LIVE_SMOKE=1 and SCOW_TOKEN';
 const SAFE_CODE = /^[A-Z][A-Z0-9_]{1,79}$/;
+const PORTAL_CODES = new Set(['AUTH_REQUIRED', 'OPERATION_CANCELLED', 'PORTAL_AUTH', 'PORTAL_NETWORK',
+  'PORTAL_TIMEOUT', 'PORTAL_PERMISSION', 'PORTAL_NOT_FOUND', 'PORTAL_UNIMPLEMENTED', 'PORTAL_QUOTA',
+  'PORTAL_UNKNOWN', 'PORTAL_CANCELLED']);
 
 function fail(code) {
   const error = new Error(SAFE_CODE.test(code) ? code : 'LIVE_OPERATION_FAILED');
@@ -22,7 +26,9 @@ function fail(code) {
 }
 function check(condition, code) { if (!condition) fail(code); }
 function sanitized(error, fallback) {
-  return error?.liveSafe === true ? error : Object.assign(new Error(fallback), { liveSafe: true });
+  const code = error?.liveSafe === true && SAFE_CODE.test(error.message) ? error.message
+    : PORTAL_CODES.has(error?.code) ? error.code : fallback;
+  return Object.assign(new Error(code), { liveSafe: true, code });
 }
 function liveTest(name, options, body) {
   if (typeof options === 'function') { body = options; options = {}; }
@@ -34,6 +40,13 @@ function cookie(token) {
   check(typeof token === 'string' && token.length > 0 && !/[\r\n\0]/.test(token), 'LIVE_CREDENTIAL_INVALID');
   // SCOW_TOKEN is the cookie value, never a whole Cookie header.
   return `SCOW_USER=${token}`;
+}
+function portalClient(t, token = process.env.SCOW_TOKEN) {
+  check(enabled, 'LIVE_OPT_IN_REQUIRED');
+  check(process.env.NODE_TLS_REJECT_UNAUTHORIZED !== '0', 'LIVE_TLS_VERIFICATION_REQUIRED');
+  const client = createPortalApiClient({ cookie: cookie(token) });
+  t.after(() => client.dispose());
+  return client;
 }
 function bounded(promise, ms, code, onTimeout = () => {}) {
   let timer;
@@ -61,7 +74,23 @@ function event(emitter, name, { timeout = 15000, predicate = () => true } = {}) 
   return result;
 }
 
-async function harness(t, overrides = {}, { backend = process.env.LIVE_BACKEND || 'proxy' } = {}) {
+function isLocalFixture(overrides, backend) {
+  if (backend !== 'proxy' || !Object.hasOwn(overrides, 'cookie') || !Object.hasOwn(overrides, 'tlsCa')) return false;
+  const ca = overrides.tlsCa;
+  if (!(Buffer.isBuffer(ca) && ca.length > 0) && !(typeof ca === 'string' && ca.trim())) return false;
+  try {
+    const endpoint = new URL(overrides.wssUrl);
+    return endpoint.protocol === 'wss:' && ['127.0.0.1', '[::1]'].includes(endpoint.hostname)
+      && Number(endpoint.port) > 0 && !endpoint.username && !endpoint.password && !endpoint.hash
+      && Boolean(extractScowToken(overrides.cookie));
+  } catch (_) { return false; }
+}
+
+async function harness(t, overrides = {}, { backend = process.env.LIVE_BACKEND || 'proxy', onListening } = {}) {
+  const localFixture = isLocalFixture(overrides, backend);
+  // Endpoint overrides belong only to explicit TLS loopback fixtures. Live runs
+  // use the fixed production endpoint and still require both opt-in variables.
+  check(localFixture || (enabled && !Object.hasOwn(overrides, 'wssUrl')), 'LIVE_OPT_IN_REQUIRED');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'usshtc107-live-'));
   const clients = new Set();
   const channels = new Set();
@@ -83,7 +112,7 @@ async function harness(t, overrides = {}, { backend = process.env.LIVE_BACKEND |
     check(backend === 'proxy' || backend === 'cli', 'LIVE_BACKEND_INVALID');
     const sshDirectory = path.join(root, 'identity');
     const options = {
-      cookie: overrides.cookie ?? cookie(process.env.SCOW_TOKEN || 'loopback-test-only'),
+      cookie: localFixture ? overrides.cookie : overrides.cookie ?? cookie(process.env.SCOW_TOKEN),
       cluster: process.env.SCOW_CLUSTER || DEFAULTS.cluster,
       loginNode: process.env.SCOW_LOGIN_NODE || DEFAULTS.loginNode,
       cols: DEFAULTS.cols, rows: DEFAULTS.rows,
@@ -99,7 +128,13 @@ async function harness(t, overrides = {}, { backend = process.env.LIVE_BACKEND |
       const { startService } = require('../../cli/service.cjs');
       const dataDir = path.join(root, 'service');
       fs.mkdirSync(dataDir, { mode: 0o700 });
-      const service = await startService({ ...options, dataDir, sshDirectory });
+      class ObservedProxy extends ProxyServer {
+        constructor(config) {
+          super(config);
+          this.once('started', () => onListening?.());
+        }
+      }
+      const service = await startService({ ...options, dataDir, sshDirectory }, { ProxyServerClass: ObservedProxy });
       proxy = service.proxy;
       address = { host: service.host, port: service.port };
       identity = service.identity;
@@ -118,6 +153,7 @@ async function harness(t, overrides = {}, { backend = process.env.LIVE_BACKEND |
       proxy.on('error', () => {});
       const started = event(proxy, 'started');
       await proxy.start();
+      onListening?.();
       address = await started;
     }
     check(address.host === '127.0.0.1' && address.port > 0, 'LIVE_LISTENER_INVALID');
@@ -238,4 +274,4 @@ function quantile(values, fraction) {
   return Math.round(sorted[Math.ceil((sorted.length - 1) * fraction)]);
 }
 
-module.exports = { liveTest, enabled, harness, check, fail, cookie, event, bounded, nonce, quantile };
+module.exports = { liveTest, enabled, harness, portalClient, check, fail, cookie, event, bounded, nonce, quantile };

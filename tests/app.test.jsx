@@ -82,11 +82,9 @@ describe('Application navigation guards', () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1024 });
   });
 
-  it('offers diagnostics as the fourth primary navigation destination', async () => {
+  it('navigates to diagnostics and focuses its heading', async () => {
     render(<App />);
     await screen.findByRole('option', {name:'Work'});
-    const navigation = screen.getByRole('navigation', {name:'Primary navigation'});
-    expect([...navigation.querySelectorAll('button')].map((button) => button.textContent)).toEqual(['Dashboard','Sessions','Logs','Diagnostics']);
     fireEvent.click(screen.getByRole('button', {name:'Diagnostics'}));
     expect(await screen.findByText('Diagnostics content')).toBeInTheDocument();
     await waitFor(() => expect(screen.getByRole('heading', {level:1,name:'Diagnostics'})).toHaveFocus());

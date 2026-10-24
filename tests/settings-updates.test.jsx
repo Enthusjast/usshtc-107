@@ -103,8 +103,9 @@ describe('Settings update and draft integration', () => {
     await act(async () => finish({ consumedDraftRevision: 1 }));
     expect(screen.getByLabelText('Password')).toHaveValue('newer draft');
     expect(draft).toHaveBeenLastCalledWith({ dirty: true, draftRevision: 2 });
+    await waitFor(() => expect(screen.getByRole('button', { name: en.updateInstallRestart })).toBeEnabled());
     api.installUpdate.mockResolvedValueOnce({ consumedDraftRevision: 2 });
-    fireEvent.click(screen.getByRole('button', { name: en.updateInstallRestart }));
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: en.updateInstallRestart })); });
     await waitFor(() => expect(screen.getByLabelText('Password')).toHaveValue(''));
     expect(draft).toHaveBeenLastCalledWith({ dirty: false, draftRevision: 2 });
   });

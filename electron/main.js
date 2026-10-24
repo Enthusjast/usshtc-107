@@ -26,6 +26,7 @@ const { createRecoveryController } = require('./recovery-controller');
 const { createHealthProbeService } = require('./health-probe-service');
 const { createUpdateService } = require('./update-service');
 const { createPortalPreflight } = require('./portal-preflight');
+const { createPortalServices } = require('./portal-services');
 
 function startApplication(deps = {}) {
   const electron = deps.electron || require('electron');
@@ -77,6 +78,7 @@ function startApplication(deps = {}) {
   let autostart = null;
   let recovery = null;
   let health = null;
+  let portalServices = null;
   let recoveryOwnerScope = null;
   let updates = null;
   let updatePreference = null;
@@ -97,8 +99,8 @@ function startApplication(deps = {}) {
       if (recoveryNeedsResume) { recoveryNeedsResume = false; recovery.resume(); health?.resume(); }
     });
   };
-  const suspendRecovery = () => { systemSuspended = true; recovery?.suspend(); health?.suspend(); };
-  const resumeRecovery = () => { systemSuspended = false; recoveryNeedsResume = true; queueRecoveryUpdate(); };
+  const suspendRecovery = () => { systemSuspended = true; recovery?.suspend(); health?.suspend(); portalServices?.suspend(); };
+  const resumeRecovery = () => { systemSuspended = false; recoveryNeedsResume = true; portalServices?.resume(); queueRecoveryUpdate(); };
   let allowAppQuit = false;
   let autoConnectTimer = null;
   let preparation = null;
@@ -116,6 +118,7 @@ function startApplication(deps = {}) {
         invalidateDiagnostics(data);
       }
     }
+    if (channel === 'runtime-state') portalServices?.update();
     if (channel === 'runtime-state' && recovery) {
       if (recoveryOwnerScope?.profileId !== data.profileId || recoveryOwnerScope?.epoch !== data.epoch) {
         recovery.cancel('scope_changed');
@@ -193,6 +196,7 @@ function startApplication(deps = {}) {
       if (diagnostics && controller) invalidateDiagnostics(currentScope());
       recovery?.dispose();
       health?.dispose();
+      portalServices?.dispose();
       if (autoConnectTimer !== null) clock.clearTimeout(autoConnectTimer);
       autoConnectTimer = null;
       preparation = controller?.prepareExit(fatalRequested ? 'fatal' : 'app_exit') || Promise.resolve();
@@ -209,6 +213,7 @@ function startApplication(deps = {}) {
     if (diagnostics && controller) invalidateDiagnostics(currentScope());
     recovery?.dispose();
     health?.dispose();
+    portalServices?.dispose();
     preparation = controller?.prepareExit('fatal') || Promise.resolve();
     preparation.catch((cleanupError) => addLog('error', 'app', `Fatal cleanup failed: ${cleanupError.message}`));
     return coordinator.request(1);
@@ -353,6 +358,7 @@ function startApplication(deps = {}) {
         (message) => addLog('error', 'ipc', message)));
       handlers.push(channel);
     };
+    portalServices.register(handle);
     handle('runtime:get-info', () => ({ isElectron: true, platform: process.platform,
       electronVersion: process.versions.electron, nodeVersion: process.versions.node, devMode: isDev,
       logPath: path.join(logsPath, 'main.log'), scope: currentScope(), draftRevision: controller.getDraftRevision() }));
@@ -556,6 +562,7 @@ function startApplication(deps = {}) {
         diagnostics?.dispose();
         recovery?.dispose();
         health?.dispose();
+        portalServices?.dispose();
         tray?.dispose();
         tray = null;
       },
@@ -688,6 +695,17 @@ function startApplication(deps = {}) {
       onRemoteState: (source) => callbacks?.onRemoteState(source),
       adapters: deps.healthAdapters,
     });
+    portalServices = createPortalServices({ clock, portalPreflight, apiOptions: deps.portalApiOptions,
+      getSnapshot: () => controller.getSnapshot(), getAuthGeneration: () => controller.getAuthGeneration(),
+      getCookie: () => login.getCookie(), getPreferences: currentSettings,
+      isUnavailable: () => fatalRequested || allowAppQuit || systemSuspended,
+      dialog, getWindow: () => mainWindow, shell, clipboard, publish,
+      onRemoteState: source => callbacks?.onRemoteState(source),
+      cancelRecovery: () => recovery?.cancel('token_validation'),
+      cancelHealth: () => health?.cancel('token_validation'),
+      notifyAuth: () => tray?.notify('auth', {}),
+    });
+    portalServices.update();
     recoveryOwnerScope = currentScope();
     queueRecoveryUpdate();
     powerMonitor?.on('suspend', suspendRecovery);
@@ -792,6 +810,7 @@ function startApplication(deps = {}) {
       diagnostics?.dispose();
       recovery?.dispose();
       health?.dispose();
+      portalServices?.dispose();
       powerMonitor?.removeListener('suspend', suspendRecovery);
       powerMonitor?.removeListener('resume', resumeRecovery);
       await controller?.dispose();

@@ -1,6 +1,6 @@
 import {
   IconDashboard, IconTerminal, IconScrollText, IconSettings, IconActivity,
-  IconSun, IconMoon, IconGlobe,
+  IconSun, IconMoon, IconGlobe, IconMonitor, IconFileEdit,
 } from './Icons';
 
 const NAV_ITEMS = [
@@ -8,6 +8,8 @@ const NAV_ITEMS = [
   { id: 'sessions',  key: 'sessions',  Icon: IconTerminal },
   { id: 'logs',      key: 'logs',      Icon: IconScrollText },
   { id: 'diagnostics', key: 'diagnostics', Icon: IconActivity },
+  { id: 'remote', key: 'remoteSessionsNav', Icon: IconMonitor },
+  { id: 'transfers', key: 'transfersTitle', Icon: IconFileEdit },
 ];
 
 const BOTTOM_ITEMS = [
