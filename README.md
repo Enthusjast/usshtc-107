@@ -59,6 +59,8 @@ Windows PowerShell 先设置 `$env:APP_EXECUTABLE='C:\absolute\win-unpacked\ussh
 
 source 与 packaged 项目均使用私有 HOME/userData/sessionData/logs/SSH/XDG 目录、关闭自动连接/更新/自启动，并在主进程实查实际路径。测试侧拒绝外网；source 只使用固定本地 TLS/WSS 与隔离 CAS fixture，不代表真实学校登录、OS 密钥环或签名升级证据。packaged 不注入生产测试入口。沙箱保持开启；截图和原生上下文 trace 保存在 `test-results/`，CI 按平台分别保留。
 
+本地执行 CLI 文件传输 fixture 需要 GNU coreutils 来模拟 Linux 远端；macOS 使用 `brew install coreutils` 并把 `$(brew --prefix coreutils)/libexec/gnubin` 加入 PATH，CI/发布检查会显式准备。source 的远端命令 fixture 在 POSIX 使用真实 Python PTY，在 Windows 使用已安装的 Git Bash 执行实际命令，并只对管道模式的终端设置请求做测试侧建模；这不是原生 Windows PTY 或真实学校平台的通过证据。
+
 公开设置的默认值与校验由 `shared/settings-schema.mjs` 统一，renderer 校验仅供交互提示，主进程再次权威验证。IPC 成功响应为 `{ok:true,value}`，业务失败为 `{ok:false,error:{code,fieldErrors?}}`；取消操作是成功的 `{cancelled:true}` 值。前端只显示固定错误码的本地化文案，不显示主进程异常正文；缺少桌面 runtime/API 的动作会明确失败，不再静默成功。
 
 ## 使用
@@ -70,7 +72,7 @@ source 与 packaged 项目均使用私有 HOME/userData/sessionData/logs/SSH/XDG
 1. 点击 **Login**，在隔离登录窗口中手动完成统一认证并进入 Web SSH 页面。向导不要求也不保存密码；需要自动填充时，可在 Settings 的 SSO 区域另行主动保存。
 2. 预览当前档案已保存设置的 SSH 受管配置块，检查后主动生成；已有配置匹配时可直接继续。向导不会自动改写文件。
 3. 启动代理；运行参数与保存参数不一致时，使用 **Restart and apply**，确认后才中断现有连接。
-4. 运行诊断。只有当前 scope/保存配置下的本地 SSH 公钥认证、受管配置现场匹配、运行配置一致和平台 WSS 握手均满足条件，主进程才保存完成状态。诊断不发送远端命令，也不证明平台应用已授权。
+4. 运行诊断。只有当前 scope/保存配置下的本地 SSH 公钥认证、受管配置现场匹配、运行配置一致、平台首条终端数据和随机标记的轻量远端命令证明均满足条件，主进程才保存完成状态。只完成 WebSocket Upgrade 不能通过向导。
 
 **Back/Next** 保存当前步骤；**Skip for now** 保留步骤并记为已跳过，之后可从 Dashboard 或 Settings 的 **Resume setup** 继续。取消或失败不伪造完成状态。连接设置保存后，旧诊断立即失效，需重新验证；向导不会开启 OS 自启动或修改通知偏好。
 
@@ -103,7 +105,7 @@ ssh usshtc107 'cd /path && make build'
 
 Exec 需要远端提供 POSIX `sh`、`stty` 和 `base64 -d`；缺失工具或协议不兼容会明确失败，不回退到提示符猜测或输出裁剪。命令通过 READY 后的 base64 帧提交，输出逐字节保留空格、换行和终端控制字节；远端 stderr 合并到 stdout，SSH stderr 只用于固定本地诊断。Exec 的 stdin 为 `/dev/null`，非空 SSH stdin 会被拒绝；关闭 SSH stdin 不取消命令输出。超时、资源超限和 END 前断连分别返回 124、125 和 255。
 
-交互会话按 channel 独立解码 UTF-8，并转发初始 PTY 尺寸和窗口变化。交互 EOF 在待发送输入排空后发送 disconnect，再进行有期限的输出排空，不承诺远端原生半关闭语义。PKCS#8 主机密钥迁移和诊断所用客户端内存格式转换保留同一个 Ed25519 身份；指纹为完整 SSH 公钥 wire blob 的 SHA-256。
+交互会话按 channel 独立解码 UTF-8，并转发初始 PTY 尺寸和窗口变化。交互 EOF 先排空输入，再进行有上限的输出静默等待，之后才发送 disconnect；不承诺远端原生半关闭或任意慢脚本的完成语义。PKCS#8 主机密钥迁移和诊断所用客户端内存格式转换保留同一个 Ed25519 身份；指纹为完整 SSH 公钥 wire blob 的 SHA-256。
 
 ## 配置与数据安全
 
@@ -133,7 +135,7 @@ Exec 需要远端提供 POSIX `sh`、`stty` 和 `base64 -d`；缺失工具或协
 
 Diagnostics 的本地、DNS/TLS 与握手检查各最多 5 秒，WSS Upgrade 后另给首条有效终端帧 10 秒，远端命令证明最多 15 秒，并受整体 30 秒上限约束，可取消。运行代理使用实际客户端密钥与固定主机指纹：`LOCAL_SSH_OK` 只证明本地 SSH 认证；`WSS_SHELL_READY` 只证明首条终端数据；独立 `remote-command` 检查必须执行随机标记命令、逐字节比对输出且退出码为 0，才返回 `REMOTE_COMMAND_OK`。向导完成同时要求这三项证明、当前认证 generation、匹配的运行配置和有效 SSH Config。停止状态的 bind-only 只证明端口可绑定，不能完成向导；首帧超时失败但不撤销 Cookie，只有 HTTP 401/403 才会撤销。保存相关配置、认证变化、切档案和退出都会使旧证明失效。
 
-日志筛选是大小写不敏感的纯文本匹配，不执行正则。复制和日志 JSON 导出只包含当前匹配项（ISO 时间、级别、来源和脱敏消息）；诊断包则明确包含当前最多 500 条安全日志，不受筛选影响。诊断包为单个 JSON，只含版本/架构、公开连接设置、诊断状态和再次脱敏的日志，替换 HOME/USERDATA 路径；总量最多 8 MiB，必要时逐条裁剪最旧完整日志并记录数量。不会读取原始设置、日志文件或私钥打包，也不包含账号、Cookie、密文、命令或远端输出。保存位置由原生对话框选择，取消不写文件。
+日志筛选是大小写不敏感的纯文本匹配，不执行正则。复制和日志 JSON 导出只包含当前匹配项（ISO 时间、级别、来源和脱敏消息）；诊断包则明确包含当前最多 500 条安全日志，不受筛选影响。诊断包为单个 JSON，只含版本/架构、公开连接设置、诊断状态和再次脱敏的日志，替换 HOME/USERDATA 路径；总量最多 8 MiB，必要时逐条裁剪最旧完整日志并记录数量。不会读取原始设置、日志文件或私钥打包，也不包含账号、Cookie、密文、用户 exec 命令或远端输出；公开的 `startupCommand` 仅允许下述固定 tmux 选项。保存位置由原生对话框选择，取消不写文件。
 
 密钥在所有档案间共享：客户端私钥仍位于 `~/.ssh/usshtc107_ed25519`，主机私钥位于 userData 的 `proxy_host_ed25519`。已初始化身份缺失、损坏或意外变更时不会静默重建；Settings 的密钥面板独立提供状态、完整 SHA256 指纹和恢复步骤，读取失败不影响其他设置。
 
@@ -145,7 +147,11 @@ Rotate 替换选中的可用身份前必须成功导出加密备份；原生确�
 
 自启动仅支持已安装/打包应用，开发和 unpacked 运行明确显示不支持，读取状态不会自动注册。Windows 按同一路径、参数和本应用 launch-item 的实际 enabled 状态读取；macOS 如需 Login Items 批准会如实显示，不能把登录启动来源当作已启用。Linux 只管理用户 XDG autostart 下带 `X-usshtc107-Managed=true` 的文件，不覆盖同名他人文件；Exec 不使用 shell，并按 freedesktop 规则转义。先更改 OS 状态再保存偏好，保存失败会恢复原 OS 状态；SSO/自动连接仍由当前档案独立控制。
 
-恢复遵循 `desiredRunning`：用户 Start/Restart/Login 请求连接，Stop 取消意图；后台检查不改变意图。自动恢复开关关闭会中止探测和 timer，不停止健康 SSH；显式 Retry 仍可执行一轮。退避间隔固定为 1/2/4/8/16/30 秒、最多六次，每次 WSS 握手最多 5 秒；证书、配置、端口和凭据错误不会无限自动重试。只有监听已确实停止且仍有连接意图才启动代理，已有健康监听/会话不重启；停止、切档案、认证撤销、退出和安装准备使旧回调失效。恢复后的旧 SSH 连接需客户端重连，不重放 exec、不重建 channel；可以自行使用 tmux，应用不会自动执行它。
+恢复遵循 `desiredRunning`：用户 Start/Restart/Login 请求连接，Stop 取消意图；后台检查不改变意图。自动恢复开关关闭会中止探测和 timer，不停止健康 SSH；显式 Retry 仍可执行一轮。网络故障按 1/2/4/8/16/30 秒、最多六次退避，每次握手最多 5 秒，Upgrade 后还必须在 10 秒内收到有效终端数据才算可达。首帧超时立即停止该 scope/config/Cookie 的自动恢复，保留凭据并提示验证登录；恢复开关、在线提示或系统 resume 不会绕过此限制，需显式 Retry 或连接/凭据变化。只有 HTTP 401/403 会撤销 Cookie。只有监听确实停止且仍有连接意图才启动代理；不会重启健康监听、重放 exec 或重建旧 channel，停止、切档案、认证撤销和退出均取消迟到结果。
+
+交互会话保持为每档案主动选择：`startupCommand` 只允许空字符串（关闭）或 `tmux new -A -s usshtc`，不接受任意启动脚本。仅在收到首条终端数据后、用户排队输入之前注入交互 shell；先检查 `command -v tmux`，缺少时显示提示并保留普通 shell，exec 一律不注入。tmux 会话名固定为 `usshtc`，因此同一远端账号/节点的启用连接会附加到同一会话。
+
+`healthProbeEnabled` 默认关闭；启用后仅对已运行、空闲且认证可用的代理每 60 秒执行一次只读 `true`，每轮总计最多 15 秒、不重叠，必须收到真实退出码 0 才显示可用。每轮都会建立远端会话并产生平台 `shellLogin` 日志；关闭偏好、切档案、暂停、停止、退出和认证变化会取消旧探测。首帧静默错误也禁止后台健康探测，不会自动删除 Cookie 或启动代理。
 
 新会话、认证失效、网络恢复、更新通知各有独立开关，默认开启；系统通知不含账号、Cookie、命令或远端输出，认证/恢复通知按状态边沿去重。
 
@@ -168,7 +174,29 @@ netsh interface ipv4 show excludedportrange protocol=tcp
 - **Linux**：只有属于当前应用且文件/父目录可写的真实 AppImage 支持应用内安装；保证为 HTTPS + metadata SHA512，不冒充 publisher 签名。安装前预检已启用的 owned XDG 自启动项，镜像改名后仅原子更新其 Desktop Entry 的 Exec；关闭或非本应用管理的条目不改，失败如实报告，不声称旧镜像路径仍有效。
 - **deb / 只读 AppImage**：仅检查和打开官方发布页，手动安装；开发及标准 unpacked 构建不自动请求更新，也不伪造 APPIMAGE 或强制开启开发更新。
 
-检查/下载网络失败可重试；`UPDATE_RESTART_REQUIRED` 表示必须先重启应用，不能在当前进程反复调用原生安装器。可观察到的退出前安装错误会保留 UI，但不承诺恢复退出后或外部安装器静默失败。真实签名 N→N+1 升级需要两个不同版本、连续签名身份及目标 OS 的受保护验收；本次不改版本或发布，不能用本地 fixture 或跨编译替代这些证据。
+检查/下载网络失败可重试；`UPDATE_RESTART_REQUIRED` 表示必须先重启应用，不能在当前进程反复调用原生安装器。可观察到的退出前安装错误会保留 UI，但不承诺恢复退出后或外部安装器静默失败。真实签名 N→N+1 升级需要两个不同版本、连续签名身份及目标 OS 的受保护验收；本地版本更新不代表发布或目标平台验收，不能用本地 fixture 或跨编译替代这些证据。
+
+## Headless CLI 与文件传输
+
+CLI 不依赖 Electron，直接复用代理、设置校验与密钥服务。安装依赖后使用 `npm run cli -- --help` 或 `node cli/main.cjs`；`package.json.bin` 声明的 Node CLI 名为 `usshtc107`，不等同于 Electron 安装后的同名桌面可执行文件，后者不会因此变成无头模式。`serve` 是默认子命令，支持 `--port`、`--host`、`--cluster`、`--login-node`、`--path`、`--startup-command`、`--health-probe` 和 `--config`。默认只监听回环，SIGINT/SIGTERM 会等待代理资源关闭。
+
+短期凭据通过环境变量 `SCOW_TOKEN` 在内存使用，不写入配置或日志；安全输入示例见 live 说明。兼容 `--cookie`，但它会暴露在进程参数中，因此会显示警告，不推荐使用。严格 JSON 配置只接受 `port`、`host`、`cluster`、`loginNode`、`path`、`startupCommand`、`healthProbeEnabled`、`dataDir`、`sshDirectory`、`maxBytes`、`timeoutMs`，拒绝凭据和未知键。客户端身份默认位于 `~/.ssh`，CLI host key 默认位于 `${XDG_DATA_HOME:-~/.local/share}/usshtc107-cli/proxy_host_ed25519`；`--data-dir` 与 `--ssh-directory` 可隔离实例。
+
+```bash
+# 先安全设置 SCOW_TOKEN，不把 token 写在命令行中
+npm run cli -- serve
+# 另一个终端，通过已运行的代理传输
+npm run cli -- put -- ./local.bin /remote/new-file.bin
+npm run cli -- get -- /remote/new-file.bin ./downloaded.bin
+```
+
+`get`/`put` 不另起代理、不需要 token，须与 `serve` 使用相同的 host/port、data-dir 和 ssh-directory；使用既有客户端身份并固定验证本地主机密钥。默认不覆盖已存在的文件、符号链接或目录。远端需要 GNU `base64`、`dd`、`stat`、`sha256sum`、`ln` 和 `rm`；上传块 16 KiB、下载块 512 KiB，SSH exec 请求另限 32 KiB，避免超出协议包界限。单文件默认/最大 64 MiB，默认总时限 10 分钟，可用 `--max-bytes` 缩小上限、`--timeout-ms` 指定时限（最多一小时）。
+
+传输先后计算 SHA-256 并核对内容与大小，局部写入临时文件后以原子 no-clobber hard-link 发布完整目标；本地临时文件在发布前 fsync。中断会移除本地临时文件，并有界地尝试清理远端临时文件；若连接已完全丢失，远端可能残留隐藏 `.usshtc107-<UUID>.part`，但不会把半文件发布到最终路径。不会自动重放失败的数据命令。
+
+不提供完整 SFTP/scp 子系统，不承诺现有 `scp`/`sftp` 客户端兼容；不提供本地/动态/反向端口转发，也不承诺 VS Code Remote-SSH。
+
+回滚边界：P0 的输入门控不修改用户配置或密钥；但新增档案字段一旦写入，旧版 `1.2.2` 的严格 schema 会拒绝多余字段并保持只读，不能宣称任意旧版本都能免配置处理回滚。回滚应按依赖逆序撤销提交，并先备份完整私有 userData；恢复到更早版本时使用对应版本可读取的设置备份，不手工删除秘密字段、私钥或 known_hosts 来绕过保护。新增字段的 v2 缺省补齐本身只发生在内存，不会在只读加载时重写原文件。
 
 ## 打包与发布
 
@@ -187,7 +215,7 @@ GitHub Actions 发布需要以下仓库 Secrets：
 | macOS | `MAC_CSC_LINK`, `MAC_CSC_KEY_PASSWORD`, `APPLE_API_KEY_BASE64`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER` |
 | Windows | `WIN_CSC_LINK`, `WIN_CSC_KEY_PASSWORD` |
 
-`MAC_CSC_LINK` 和 `WIN_CSC_LINK` 可使用 electron-builder 支持的 base64 证书值。`APPLE_API_KEY_BASE64` 是 App Store Connect `.p8` 私钥的 base64 内容。用于签名或发布的标签必须严格等于 `v<package.json version>`，例如当前版本使用 `v1.2.3`，且标签提交必须属于默认分支历史。应在仓库设置中保护 `v*` 标签。
+`MAC_CSC_LINK` 和 `WIN_CSC_LINK` 可使用 electron-builder 支持的 base64 证书值。`APPLE_API_KEY_BASE64` 是 App Store Connect `.p8` 私钥的 base64 内容。用于签名或发布的标签必须严格等于 `v<package.json version>`，例如当前版本使用 `v1.3.0`，且标签提交必须属于默认分支历史。应在仓库设置中保护 `v*` 标签。
 
 发布流水线会验证签名和 macOS 公证，生成产物 SHA-256 校验文件和 GitHub 构建来源证明，并为实际生产依赖生成 CycloneDX SBOM。普通手动构建可以选择单个平台；Linux 可从功能分支构建，使用证书的 macOS/Windows 构建只能从默认分支或匹配版本的标签发起。创建 GitHub Release 时必须构建全部平台。
 

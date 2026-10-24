@@ -12,11 +12,12 @@ function deferred() {
 }
 const turn = () => new Promise((resolve) => setImmediate(resolve));
 class Server extends EventEmitter {
-  constructor(options) { super(); this.options = options; this.accepting = options.acceptingConnections; this.stops = 0; }
+  constructor(options) { super(); this.options = options; this.accepting = options.acceptingConnections; this.stops = 0; this.cookie = options.cookie; this.generation = 0; }
   async start() { this.emit('started', { host: this.options.host, port: this.options.port }); return true; }
   async stop() { this.stops += 1; this.emit('stopped'); }
   setAcceptingConnections(value) { this.accepting = value; }
-  updateCookie(value) { this.cookie = value; }
+  updateCookie(value) { if (this.cookie !== value) this.generation += 1; this.cookie = value; }
+  getCookieGeneration() { return this.generation; }
   getSessions() { return [{ id: 1 }]; }
   getStats() { return { uptimeMs: 100, totalBytesSent: 7, totalBytesReceived: 9, sessions: this.getSessions() }; }
   disconnectSession(id) { return id === 1; }
@@ -33,7 +34,7 @@ function fixture(options = {}) {
     setInterval: (fn, delay) => { const id = ++timerId; timers.set(id, { fn: () => { now += delay; fn(); }, delay, interval: true }); return id; },
     clearInterval: (id) => timers.delete(id),
   };
-  const servers = [], states = [], events = [], auth = [], networkErrors = [];
+  const servers = [], states = [], events = [], auth = [], networkErrors = [], notReady = [];
   const controller = createProxyController({ clock,
     history: options.history,
     createServer: (config) => { const server = new Server(config); servers.push(server); options.configure?.(server); return server; },
@@ -42,11 +43,12 @@ function fixture(options = {}) {
     onState: (patch) => states.push(patch),
     onAuthRequired: (source) => auth.push(source),
     onNetworkError: (source) => networkErrors.push(source),
+    onRemoteNotReady: source => notReady.push(source),
     publish: (name, value) => events.push([name, value]),
   });
   const scope = { profileId: 'default', epoch: 1 };
   controller.setScope(scope);
-  return { controller, servers, states, events, auth, networkErrors, timers, scope };
+  return { controller, servers, states, events, auth, networkErrors, notReady, timers, scope };
 }
 const config = { host: '127.0.0.1', port: 3000, cluster: 'training' };
 
@@ -394,5 +396,28 @@ test('uncommitted candidate network failures never initiate recovery', async () 
     transactionId: 'network-candidate', keyMaterial: { hostKey: 'candidate-only' } });
   f.servers[0].emit('session-close', { sessionId: 1, reason: 'network_error' });
   assert.equal(f.networkErrors.length, 0);
+  await f.controller.dispose();
+});
+
+test('readiness timeout recovery cannot be borrowed by stale cookies, sessions or proxy instances', async () => {
+  const f = fixture();
+  await f.controller.start(config, 'cookie-a', f.scope);
+  const server = f.servers[0];
+  server.emit('session-open', { id: 1 });
+  server.emit('remote-not-ready', { code: 'REMOTE_READY_TIMEOUT', sessionId: 1, cookieGeneration: 0 });
+  assert.equal(f.notReady.length, 1);
+  assert.deepEqual(f.notReady[0].config, config);
+  await f.controller.start(config, 'cookie-b', f.scope);
+  server.emit('remote-not-ready', { code: 'REMOTE_READY_TIMEOUT', sessionId: 1, cookieGeneration: 0 });
+  server.emit('remote-not-ready', { code: 'REMOTE_READY_TIMEOUT', sessionId: 999, cookieGeneration: 1 });
+  assert.equal(f.notReady.length, 1);
+  server.emit('session-open', { id: 2 });
+  server.emit('remote-not-ready', { code: 'REMOTE_READY_TIMEOUT', sessionId: 2, cookieGeneration: 1 });
+  assert.equal(f.notReady.length, 2);
+  await f.controller.stop();
+  await f.controller.start(config, 'cookie-c', f.scope);
+  server.emit('remote-not-ready', { code: 'REMOTE_READY_TIMEOUT', sessionId: 2, cookieGeneration: 1 });
+  assert.equal(f.notReady.length, 2);
+  assert.deepEqual(f.auth, []);
   await f.controller.dispose();
 });

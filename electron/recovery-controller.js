@@ -4,11 +4,12 @@ const { WebSocket } = require('ws');
 const { ServiceError } = require('./ipc-contract');
 const { validateSettingsPatch } = require('../shared/settings-schema.mjs');
 const { buildWssUrl, buildWssOptions } = require('./wss-connection');
+const { REMOTE_READY_TIMEOUT } = require('./constants');
 
 const RETRY_DELAYS_MS = Object.freeze([1000, 2000, 4000, 8000, 16000, 30000]);
 const HANDSHAKE_TIMEOUT_MS = 5000;
 const ONLINE_HINT_INTERVAL_MS = 5000;
-const CONFIG_FIELDS = ['host', 'port', 'cluster', 'loginNode', 'cols', 'rows', 'useRoot'];
+const CONFIG_FIELDS = ['host', 'port', 'cluster', 'loginNode', 'cols', 'rows', 'useRoot', 'path', 'startupCommand'];
 const CERTIFICATE_ERRORS = new Set(['CERT_HAS_EXPIRED', 'CERT_NOT_YET_VALID', 'CERT_REVOKED',
   'DEPTH_ZERO_SELF_SIGNED_CERT', 'SELF_SIGNED_CERT_IN_CHAIN', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
   'UNABLE_TO_GET_ISSUER_CERT', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY', 'ERR_TLS_CERT_ALTNAME_INVALID',
@@ -26,6 +27,7 @@ function createRecoveryController(deps) {
   let enabled = deps.getPreferences().reconnectOnResume !== false;
   let observed = null;
   let blocked = null;
+  let inhibited = null;
   let lastOnline = null;
   let unhealthy = false;
   let remoteState = null;
@@ -39,9 +41,10 @@ function createRecoveryController(deps) {
     const scope = { profileId: snapshot.profileId, epoch: snapshot.epoch };
     const config = deps.getConfig(scope);
     const cookie = deps.getCookie(scope);
-    const key = JSON.stringify([scope.profileId, scope.epoch, snapshot.desiredRunning,
-      snapshot.storageErrorCode, ...CONFIG_FIELDS.map((field) => config?.[field]), config?.wssUrl, cookie]);
-    return { snapshot, scope, config, cookie, key };
+    const transportKey = JSON.stringify([scope.profileId, scope.epoch,
+      ...CONFIG_FIELDS.map((field) => config?.[field]), config?.wssUrl, cookie]);
+    const key = JSON.stringify([transportKey, snapshot.desiredRunning, snapshot.storageErrorCode]);
+    return { snapshot, scope, config, cookie, key, transportKey };
   }
 
   function current(round) {
@@ -155,7 +158,21 @@ function createRecoveryController(deps) {
         socket = createWebSocket(buildWssUrl(round.context.config), buildWssOptions({
           cookie: round.context.cookie, tlsCa: adapters.tlsCa, handshakeTimeoutMs: HANDSHAKE_TIMEOUT_MS,
         }));
-        listen('open', () => finish({ ok: true }));
+        let opened = false;
+        listen('open', () => {
+          if (opened || finished) return;
+          opened = true;
+          clock.clearTimeout(timeout);
+          timeout = clock.setTimeout(() => finish({ code: 'REMOTE_READY_TIMEOUT', terminal: true }),
+            deps.remoteReadyTimeoutMs ?? REMOTE_READY_TIMEOUT);
+          timeout?.unref?.();
+        });
+        listen('message', (raw) => {
+          if (!opened) return;
+          let message;
+          try { message = JSON.parse(raw.toString()); } catch (_) { return; }
+          if (message?.$case === 'data' && typeof message.data?.data === 'string') finish({ ok: true });
+        });
         listen('error', (error) => finish({ code: CERTIFICATE_ERRORS.has(error?.code)
           || String(error?.code || '').startsWith('ERR_TLS_CERT_') ? 'TLS_FAILED' : 'NETWORK_UNAVAILABLE',
         terminal: CERTIFICATE_ERRORS.has(error?.code) || String(error?.code || '').startsWith('ERR_TLS_CERT_') }));
@@ -222,6 +239,7 @@ function createRecoveryController(deps) {
       settle(round, { errorCode: 'AUTH_REQUIRED' });
       return;
     }
+    if (result.code === 'REMOTE_READY_TIMEOUT') inhibited = round.context.transportKey;
     publish(round.context, result.terminal ? 'error' : 'offline', result.code);
     if (!current(round)) { settle(round, { cancelled: true }); return; }
     if (result.terminal || round.attempt === RETRY_DELAYS_MS.length) {
@@ -248,6 +266,8 @@ function createRecoveryController(deps) {
     if (active?.context.key === value.key) return active.promise;
     cancel('SUPERSEDED');
     paused = false;
+    if (manual) inhibited = null;
+    else if (inhibited === value.transportKey) return Promise.resolve({ errorCode: 'REMOTE_READY_TIMEOUT' });
     if (!manual && blocked === value.key) return Promise.resolve({ errorCode: 'RECOVERY_EXHAUSTED' });
     const invalid = validate(value);
     if (invalid) {
@@ -297,6 +317,7 @@ function createRecoveryController(deps) {
     if (changed || disabledNow) cancel(changed ? 'CONTEXT_CHANGED' : 'PREFERENCE_DISABLED');
     if (scopeChanged) { unhealthy = false; remoteState = null; }
     if (changed) blocked = null;
+    if (inhibited !== value.transportKey) inhibited = null;
     if (!enabled || suspended || value.snapshot.desiredRunning !== true) { stopHints(); return; }
     const rearm = rearmWhenIdle && !value.snapshot.operation;
     if (rearm) rearmWhenIdle = false;
@@ -310,6 +331,17 @@ function createRecoveryController(deps) {
 
   return {
     retry,
+    remoteNotReady(event) {
+      if (disposed) return;
+      const value = context();
+      if (!sameScope(event, value.scope) || event.code !== 'REMOTE_READY_TIMEOUT') return;
+      inhibited = value.transportKey;
+      blocked = value.key;
+      unhealthy = true;
+      cancel('REMOTE_READY_TIMEOUT');
+      stopHints();
+      publish(value, 'error', 'REMOTE_READY_TIMEOUT');
+    },
     cancel(reason) {
       rearmWhenIdle = reason === 'user_stop' || reason === 'USER_STOP';
       cancel(reason);
@@ -323,6 +355,7 @@ function createRecoveryController(deps) {
       if (disposed || suspended || !enabled || paused) return;
       const value = context();
       if (event && !sameScope(event, value.scope)) return;
+      if (inhibited === value.transportKey) return;
       if (blocked === value.key) return;
       unhealthy = true;
       publish(value, 'offline', 'NETWORK_UNAVAILABLE');

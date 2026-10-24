@@ -42,6 +42,7 @@ function fixture(options = {}) {
   const sockets = [], states = [], auth = [], recovered = [], starts = [], requests = [], hintReads = [];
   const deps = {
     clock, net: { isOnline: () => { hintReads.push(clock.now()); return online; } },
+    remoteReadyTimeoutMs: options.remoteReadyTimeoutMs,
     getSnapshot: () => snapshot, getConfig: () => config, getCookie: () => cookie, getPreferences: () => preferences,
     onRemoteState: (value) => {
       states.push(value); Object.assign(snapshot, value);
@@ -70,7 +71,11 @@ function fixture(options = {}) {
           assert.equal(response.destroyed, true);
         } else if (options.closeCode) socket.emit('close', options.closeCode, Buffer.from('untrusted private body'));
         else if (options.error) socket.emit('error', Object.assign(new Error('untrusted private error'), { code: options.error }));
-        else { socket.readyState = 1; socket.emit('open'); }
+        else {
+          socket.readyState = 1;
+          socket.emit('open');
+          if (!options.silent) socket.emit('message', Buffer.from(JSON.stringify({ $case: 'data', data: { data: '' } })));
+        }
       });
       return socket;
     } },
@@ -339,6 +344,7 @@ test('real TLS/WSS loopback handshake sends no command, closes and honors certif
     if (status !== 101) { socket.end(`HTTP/1.1 ${status} Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`); return; }
     wss.handleUpgrade(request, socket, head, (ws) => {
       peers.add(ws); ws.on('message', () => { messageCount += 1; }); ws.on('close', () => peers.delete(ws));
+      ws.send(JSON.stringify({ $case: 'data', data: { data: '' } }));
     });
   });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
@@ -375,6 +381,7 @@ test('canceling a pending probe restores stable reachability without immediately
   await f.clock.tick(1000);
   f.sockets[0].readyState = 1;
   f.sockets[0].emit('open');
+  f.sockets[0].emit('message', Buffer.from(JSON.stringify({ $case: 'data', data: { data: '' } })));
   await flush();
   assert.deepEqual(await first, { reachable: true });
   assert.equal(f.snapshot.remoteStatus, 'reachable');
@@ -410,9 +417,111 @@ test('stopped intent leaves no hint or probe timers while explicit Retry still d
   await f.clock.tick(1000);
   f.sockets[1].readyState = 1;
   f.sockets[1].emit('open');
+  f.sockets[1].emit('message', Buffer.from(JSON.stringify({ $case: 'data', data: { data: '' } })));
   await flush();
   assert.deepEqual(await manual, { reachable: true });
   assert.equal(f.starts.length, 0);
   assert.equal(f.clock.timers.size, 0);
   f.controller.dispose();
+});
+
+test('open is not reachable; only a valid data frame including empty data proves readiness', async () => {
+  const f = fixture({ silent: true });
+  const round = f.controller.retry(scopeOf(f));
+  await f.clock.tick(1000);
+  assert.equal(f.snapshot.remoteStatus, 'checking');
+  assert.equal(f.starts.length, 0);
+  for (const raw of ['not-json', '{}', '{"$case":"data","data":{"data":42}}',
+    '{"$case":"exit","exit":{"code":0}}']) f.sockets[0].emit('message', Buffer.from(raw));
+  await f.clock.tick(9999);
+  assert.equal(f.snapshot.remoteStatus, 'checking');
+  f.sockets[0].emit('message', Buffer.from('{"$case":"data","data":{"data":""}}'));
+  await flush();
+  assert.deepEqual(await round, { reachable: true });
+  assert.equal(f.snapshot.remoteStatus, 'reachable');
+  assert.equal(f.starts.length, 1);
+  assert.equal(f.auth.length, 0);
+  f.controller.dispose();
+  assert.equal(f.clock.timers.size, 0);
+});
+
+test('readiness deadline begins after open and silence inhibits retries without revoking Cookie', async () => {
+  const f = fixture({ hang: true });
+  const round = f.controller.retry(scopeOf(f));
+  await f.clock.tick(5999);
+  f.sockets[0].readyState = 1;
+  f.sockets[0].emit('open');
+  await f.clock.tick(9999);
+  assert.equal(f.sockets[0].closed, false);
+  await f.clock.tick(1);
+  assert.deepEqual(await round, { errorCode: 'REMOTE_READY_TIMEOUT' });
+  assert.equal(f.snapshot.remoteStatus, 'error');
+  assert.equal(f.auth.length, 0);
+  assert.equal(f.starts.length, 0);
+  f.controller.resume(); f.controller.online(); f.controller.networkError(scopeOf(f));
+  await f.clock.tick(120000);
+  assert.equal(f.requests.length, 1);
+  const manual = f.controller.retry(scopeOf(f));
+  await f.clock.tick(1000);
+  assert.equal(f.requests.length, 2);
+  f.controller.cancel('USER_STOP');
+  assert.deepEqual(await manual, { cancelled: true });
+  f.controller.dispose();
+});
+
+test('proxy readiness failure inhibits only the matching scope/config/Cookie until explicit action', async () => {
+  const f = fixture({ hang: true });
+  const round = f.controller.retry(scopeOf(f));
+  await f.clock.tick(1000);
+  f.controller.remoteNotReady({ ...scopeOf(f), epoch: 0, code: 'REMOTE_READY_TIMEOUT' });
+  assert.equal(f.sockets[0].closed, false);
+  f.controller.remoteNotReady({ ...scopeOf(f), code: 'REMOTE_READY_TIMEOUT' });
+  assert.deepEqual(await round, { cancelled: true });
+  assert.equal(f.sockets[0].closed, true);
+  assert.equal(f.snapshot.errorCode, 'REMOTE_READY_TIMEOUT');
+  f.snapshot.desiredRunning = false; f.controller.update();
+  f.snapshot.desiredRunning = true; f.controller.update();
+  f.preferences.reconnectOnResume = false; f.controller.update();
+  f.preferences.reconnectOnResume = true; f.controller.update();
+  f.controller.resume(); f.controller.online(); f.controller.networkError(scopeOf(f));
+  await f.clock.tick(120000);
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.auth.length, 0);
+  f.setCookie('session=explicit-login'); f.controller.update();
+  await f.clock.tick(1000);
+  assert.equal(f.requests.length, 2);
+  f.controller.dispose();
+});
+
+test('custom readiness deadline is independent of handshake and is cancelled by context changes', async () => {
+  const f = fixture({ silent: true, remoteReadyTimeoutMs: 25 });
+  const round = f.controller.retry(scopeOf(f));
+  await f.clock.tick(1024);
+  assert.equal(f.snapshot.remoteStatus, 'checking');
+  await f.clock.tick(1);
+  assert.deepEqual(await round, { errorCode: 'REMOTE_READY_TIMEOUT' });
+  assert.equal(f.auth.length, 0);
+  f.controller.dispose();
+  for (const mutate of [
+    (g) => g.setCookie('session=changed'),
+    (g) => g.setConfig({ ...PROFILE_DEFAULTS, port: 4444 }),
+    (g) => { g.snapshot.epoch += 1; },
+    (g) => { g.preferences.reconnectOnResume = false; },
+    (g) => g.controller.suspend(),
+  ]) {
+    const g = fixture({ silent: true });
+    const pending = g.controller.retry(scopeOf(g));
+    await g.clock.tick(1000);
+    mutate(g); g.controller.update();
+    assert.deepEqual(await pending, { cancelled: true });
+    const states = g.states.length;
+    g.sockets[0].emit('message', Buffer.from('{"$case":"data","data":{"data":""}}'));
+    await flush();
+    assert.equal(g.states.length, states);
+    assert.equal(g.starts.length, 0);
+    assert.equal(g.auth.length, 0);
+    assert.equal(g.sockets[0].closed, true);
+    g.controller.dispose();
+    assert.equal(g.clock.timers.size, 0);
+  }
 });

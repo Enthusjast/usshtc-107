@@ -1,4 +1,4 @@
-import { APP_DEFAULTS, PROFILE_DEFAULTS, PROFILE_SETTING_KEYS, validateSettingsPatch } from '../../shared/settings-schema.mjs';
+import { APP_DEFAULTS, PROFILE_DEFAULTS, PROFILE_SETTING_KEYS, TMUX_STARTUP_COMMAND, validateSettingsPatch } from '../../shared/settings-schema.mjs';
 import { formatApiError, formatValidationError } from '../lib/api-errors';
 import { useState, useEffect, useCallback, useRef } from 'react';
 import {
@@ -21,7 +21,7 @@ import { useRuntime, sameScope } from '../contexts/RuntimeContext';
 const SETTINGS_DEFAULTS = { ...APP_DEFAULTS, ...PROFILE_DEFAULTS };
 const APP_PREFERENCE_KEYS = ['startMinimized', 'reconnectOnResume', 'autoCheckUpdates', 'notifyConnections', 'notifyAuth', 'notifyRecovery', 'notifyUpdates'];
 const EDITABLE_SETTING_KEYS = [...PROFILE_SETTING_KEYS, ...APP_PREFERENCE_KEYS];
-const CONNECTION_SETTING_KEYS = ['host', 'port', 'cluster', 'loginNode', 'cols', 'rows', 'useRoot', 'sshAlias'];
+const CONNECTION_SETTING_KEYS = ['host', 'port', 'cluster', 'loginNode', 'path', 'startupCommand', 'cols', 'rows', 'useRoot', 'sshAlias'];
 
 function FieldError({ id, message }) {
   if (!message) return null;
@@ -71,6 +71,7 @@ export default function SettingsView({ onDirtyChange, onDraftChange, onBusyChang
   const isSaving = saveState === 'saving';
   const busy = isSaving || generating || clearingCredentials || autostartBusy || keyBusy || updateBusy || consumingDraft;
   const canClearCredentials = hasStoredPassword || Boolean(ssoUsername);
+  const nonLoopbackBinding = !['127.0.0.1', '::1', 'localhost'].includes(settings.host.trim().toLowerCase());
   const currentScope = () => getScope?.() ?? scopeRef.current;
   const accepts = (origin) => alive.current && sameScope(currentScope(), origin);
 
@@ -346,8 +347,9 @@ export default function SettingsView({ onDirtyChange, onDraftChange, onBusyChang
         <div className="settings-grid">
           <div>
             <label className="form-label" htmlFor="setting-host">{t('host')}</label>
-            <input id="setting-host" className="form-input" value={settings.host} onChange={(e) => update('host', e.target.value)} aria-invalid={Boolean(fieldErrors.host)} aria-describedby={fieldErrors.host ? 'setting-host-error' : undefined} disabled={isSaving || generating} />
+            <input id="setting-host" className="form-input" value={settings.host} onChange={(e) => update('host', e.target.value)} aria-invalid={Boolean(fieldErrors.host)} aria-describedby={[fieldErrors.host && 'setting-host-error', nonLoopbackBinding && 'setting-host-warning'].filter(Boolean).join(' ') || undefined} disabled={isSaving || generating} />
             <FieldError id="setting-host-error" message={fieldErrors.host} />
+            {nonLoopbackBinding && <p id="setting-host-warning" className="settings-warning" role="status">{t('nonLoopbackBindingWarning')}</p>}
           </div>
           <div>
             <label className="form-label" htmlFor="setting-port">{t('portLabel')}</label>
@@ -373,6 +375,12 @@ export default function SettingsView({ onDirtyChange, onDraftChange, onBusyChang
             <FieldError id="setting-login-node-error" message={fieldErrors.loginNode} />
           </div>
           <div>
+            <label className="form-label" htmlFor="setting-path">{t('startingDirectory')}</label>
+            <input id="setting-path" className="form-input" value={settings.path} maxLength={1024} onChange={(e) => update('path', e.target.value)} aria-invalid={Boolean(fieldErrors.path)} aria-describedby={['setting-path-help', fieldErrors.path && 'setting-path-error'].filter(Boolean).join(' ')} disabled={isSaving} />
+            <p id="setting-path-help" className="settings-help">{t('startingDirectoryHint')}</p>
+            <FieldError id="setting-path-error" message={fieldErrors.path} />
+          </div>
+          <div>
             <label className="form-label" htmlFor="setting-cols">{t('colsLabel')}</label>
             <input id="setting-cols" className="form-input" type="number" min={40} max={500} value={settings.cols} onChange={(e) => update('cols', e.target.value)} aria-invalid={Boolean(fieldErrors.cols)} aria-describedby={fieldErrors.cols ? 'setting-cols-error' : undefined} disabled={isSaving} />
             <FieldError id="setting-cols-error" message={fieldErrors.cols} />
@@ -386,10 +394,11 @@ export default function SettingsView({ onDirtyChange, onDraftChange, onBusyChang
         <label className="toggle-wrapper settings-toggle-row">
           <span className="toggle-label">{t('useRoot')}</span>
           <span className="toggle-switch">
-            <input type="checkbox" checked={Boolean(settings.useRoot)} onChange={(e) => update('useRoot', e.target.checked)} disabled={isSaving} />
+            <input type="checkbox" checked={Boolean(settings.useRoot)} onChange={(e) => update('useRoot', e.target.checked)} disabled={isSaving} aria-describedby="setting-root-help" />
             <span className="toggle-slider" aria-hidden="true" />
           </span>
         </label>
+        <p id="setting-root-help" className="settings-help">{t('useRootHint')}</p>
       </section>
 
       <section className="card" aria-labelledby="behavior-settings-heading">
@@ -404,6 +413,28 @@ export default function SettingsView({ onDirtyChange, onDraftChange, onBusyChang
               <span className="toggle-slider" aria-hidden="true" />
             </span>
           </label>
+          <div>
+            <label className="toggle-wrapper" htmlFor="setting-startupCommand">
+              <span className="toggle-label">{t('keepTmuxSession')}</span>
+              <span className="toggle-switch">
+                <input id="setting-startupCommand" type="checkbox" checked={settings.startupCommand === TMUX_STARTUP_COMMAND} onChange={(e) => update('startupCommand', e.target.checked ? TMUX_STARTUP_COMMAND : '')} disabled={isSaving} aria-invalid={Boolean(fieldErrors.startupCommand)} aria-describedby={['setting-tmux-help', fieldErrors.startupCommand && 'setting-startupCommand-error'].filter(Boolean).join(' ')} />
+                <span className="toggle-slider" aria-hidden="true" />
+              </span>
+            </label>
+            <p id="setting-tmux-help" className="settings-help">{t('keepTmuxSessionHint')}</p>
+            <FieldError id="setting-startupCommand-error" message={fieldErrors.startupCommand} />
+          </div>
+          <div>
+            <label className="toggle-wrapper" htmlFor="setting-healthProbeEnabled">
+              <span className="toggle-label">{t('healthProbeEnabled')}</span>
+              <span className="toggle-switch">
+                <input id="setting-healthProbeEnabled" type="checkbox" checked={settings.healthProbeEnabled === true} onChange={(e) => update('healthProbeEnabled', e.target.checked)} disabled={isSaving} aria-invalid={Boolean(fieldErrors.healthProbeEnabled)} aria-describedby={['setting-health-help', fieldErrors.healthProbeEnabled && 'setting-healthProbeEnabled-error'].filter(Boolean).join(' ')} />
+                <span className="toggle-slider" aria-hidden="true" />
+              </span>
+            </label>
+            <p id="setting-health-help" className="settings-help">{t('healthProbeEnabledHint')}</p>
+            <FieldError id="setting-healthProbeEnabled-error" message={fieldErrors.healthProbeEnabled} />
+          </div>
           <label className="toggle-wrapper">
             <span className="toggle-label">{t('startMinimized')}</span>
             <span className="toggle-switch">

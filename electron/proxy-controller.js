@@ -144,6 +144,12 @@ function createProxyController(deps) {
         deps.onAuthRequired?.({ ...record.scope, instanceId: record.id, statusCode });
       }
     });
+    server.on('remote-not-ready', ({ code, sessionId, cookieGeneration }) => {
+      if (!visible(record) || record.cancelled || record.stopRequested || record.historyClosed
+          || code !== 'REMOTE_READY_TIMEOUT' || !record.sessions.has(sessionId)
+          || !Number.isSafeInteger(cookieGeneration) || cookieGeneration !== server.getCookieGeneration?.()) return;
+      deps.onRemoteNotReady?.({ ...record.scope, code, sessionId, instanceId: record.id, config: { ...record.config } });
+    });
     server.on('session-open', (session) => {
       if (!owns(record) || record.candidate || record.cancelled || record.historyClosed) return;
       const sessionKey = `${record.id}:${session.id}`;

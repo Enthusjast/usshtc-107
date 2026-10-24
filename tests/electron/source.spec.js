@@ -304,3 +304,45 @@ test('real source saved/running settings, clipboard/restart confirmations, scope
     await exitNormally(context);
   } finally { await cleanup(context); }
 });
+
+test('real source profile options preserve paths and keep remote session features explicitly opt-in', async ({}, testInfo) => {
+  let context;
+  try {
+    context = await launch(testInfo);
+    const { page } = context;
+    await skipSetup(context);
+    await navigate(page, 'Settings');
+    await expect(page.locator('#setting-path')).toHaveValue('');
+    await expect(page.locator('#setting-startupCommand')).not.toBeChecked();
+    await expect(page.locator('#setting-healthProbeEnabled')).not.toBeChecked();
+    await page.locator('#setting-host').fill('0.0.0.0');
+    await expect(page.locator('#setting-host-warning')).toBeVisible();
+    await page.locator('#setting-host-warning').scrollIntoViewIfNeeded();
+    await screenshot(context, 'source-nonloopback-warning');
+    await page.locator('#setting-host').fill('127.0.0.1');
+    await expect(page.locator('#setting-host-warning')).toHaveCount(0);
+    await page.locator('#setting-path').fill('/tmp/project with space');
+    await page.locator('label[for="setting-startupCommand"]').click();
+    await page.locator('label[for="setting-healthProbeEnabled"]').click();
+    await page.getByRole('button', { name: 'Save Settings', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Saved', exact: true })).toBeDisabled();
+    expect(await rpc(page, 'getSettings', await scope(page))).toMatchObject({ path: '/tmp/project with space',
+      startupCommand: 'tmux new -A -s usshtc', healthProbeEnabled: true });
+    await page.locator('#setting-startupCommand').scrollIntoViewIfNeeded();
+    await screenshot(context, 'source-opt-in-remote-features');
+    await navigate(page, 'Dashboard');
+    await login(context, () => page.getByRole('button', { name: 'Login', exact: true }).click());
+    await expect.poll(() => rpc(page, 'getStatus'), { timeout: 75_000 }).toMatchObject({ remoteStatus: 'reachable', errorCode: null });
+    await screenshot(context, 'source-real-read-only-health');
+    await navigate(page, 'Settings');
+    await expect(page.locator('#setting-path')).toHaveValue('/tmp/project with space');
+    await expect(page.locator('#setting-startupCommand')).toBeChecked();
+    await expect(page.locator('#setting-healthProbeEnabled')).toBeChecked();
+    await page.locator('label[for="setting-startupCommand"]').click();
+    await page.locator('label[for="setting-healthProbeEnabled"]').click();
+    await page.getByRole('button', { name: 'Save Settings', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Saved', exact: true })).toBeDisabled();
+    expect(await rpc(page, 'getSettings', await scope(page))).toMatchObject({ startupCommand: '', healthProbeEnabled: false });
+    await exitNormally(context);
+  } finally { await cleanup(context); }
+});

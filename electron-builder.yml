@@ -9,6 +9,7 @@ directories:
 files:
   - electron/**/*
   - shared/**/*
+  - cli/**/*
   - dist/**/*
   - LICENSE
   - '!node_modules/{buildcheck,cpu-features,nan}/**/*'

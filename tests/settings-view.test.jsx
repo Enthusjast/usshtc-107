@@ -4,6 +4,9 @@ import { beforeEach, it, expect, vi } from 'vitest';
 import SettingsView from '../src/views/SettingsView';
 import { LocaleProvider } from '../src/i18n/LocaleContext';
 import { ToastProvider } from '../src/components/Toast';
+import en from '../src/i18n/en';
+import zh from '../src/i18n/zh';
+import { formatApiError, formatValidationError } from '../src/lib/api-errors';
 const mocks = vi.hoisted(() => ({ retryLoadSettings:vi.fn(),exportKeyBackup:vi.fn(),importKeyBackup:vi.fn(),rotateSshKeys:vi.fn(),rebuildSshKeys:vi.fn(),getAutostart:vi.fn(),setAutostart:vi.fn(),getSettings:vi.fn(),saveSettings:vi.fn(),saveAppSettings:vi.fn(),getRuntimeInfo:vi.fn(),previewSshConfig:vi.fn(),generateSshConfig:vi.fn(),saveSsoCredentials:vi.fn(),getSsoCredentials:vi.fn(),clearSsoCredentials:vi.fn(),getSshKeyInfo:vi.fn(),copyToClipboard:vi.fn(),setAppLocale:vi.fn(),restartProxy:vi.fn(),getStatus:vi.fn(),onRuntimeState:vi.fn() }));
 const runtime = vi.hoisted(() => ({scope:{profileId:'default',epoch:1},snapshot:{needsRestart:false},flushDraft:vi.fn(),retry:vi.fn(),getScope:vi.fn(),getSnapshot:vi.fn()}));
 vi.mock('../src/lib/electron',async (importOriginal)=>({...await importOriginal(),...mocks}));
@@ -25,6 +28,113 @@ beforeEach(()=>{
  mocks.saveSettings.mockResolvedValue({}); mocks.saveAppSettings.mockResolvedValue({}); mocks.saveSsoCredentials.mockResolvedValue({});
  mocks.previewSshConfig.mockResolvedValue(preview);
  mocks.generateSshConfig.mockResolvedValue({...preview,changed:false,path:'/tmp/config'});
+});
+
+it('keeps path empty and tmux and health probes off for older settings until explicitly saved', async () => {
+ const draft = vi.fn(); mount(draft);
+ const path = await screen.findByLabelText('Starting directory');
+ expect(path).toHaveValue(''); expect(path).toHaveAttribute('maxlength', '1024');
+ expect(screen.getByLabelText('Keep interactive sessions with tmux')).not.toBeChecked();
+ expect(screen.getByLabelText('Enable read-only health probes')).not.toBeChecked();
+ expect(screen.getByLabelText('Enable read-only health probes')).toHaveAccessibleDescription(/Each periodic read-only command opens a remote session.*shellLogin/);
+ expect(screen.getByLabelText('Use Root')).toHaveAccessibleDescription(/additional authorization.*ordinary account will fail/);
+ expect(mocks.saveSettings).not.toHaveBeenCalled();
+ fireEvent.change(path, { target: { value: ' /home/research data/目录 &% ' } });
+ fireEvent.click(screen.getByLabelText('Keep interactive sessions with tmux'));
+ fireEvent.click(screen.getByLabelText('Enable read-only health probes'));
+ expect(draft).toHaveBeenLastCalledWith({ dirty: true, draftRevision: 3 });
+ fireEvent.click(screen.getByRole('button', { name: 'Save Settings' }));
+ await waitFor(() => expect(mocks.saveSettings).toHaveBeenCalledExactlyOnceWith({ scope: runtime.scope, patch: { path: ' /home/research data/目录 &% ', startupCommand: 'tmux new -A -s usshtc', healthProbeEnabled: true } }));
+ await waitFor(() => expect(draft).toHaveBeenLastCalledWith({ dirty: false, draftRevision: 3 }));
+ expect(mocks.saveAppSettings).not.toHaveBeenCalled();
+ expect(mocks.restartProxy).not.toHaveBeenCalled();
+});
+
+it('retains saved path and opt-ins and resets them to unsaved conservative defaults', async () => {
+ mocks.getSettings.mockResolvedValue({ ...settings, path: '/work dir', startupCommand: 'tmux new -A -s usshtc', healthProbeEnabled: true });
+ const draft = vi.fn(); mount(draft);
+ expect(await screen.findByLabelText('Starting directory')).toHaveValue('/work dir');
+ expect(screen.getByLabelText('Keep interactive sessions with tmux')).toBeChecked();
+ expect(screen.getByLabelText('Enable read-only health probes')).toBeChecked();
+ fireEvent.click(screen.getByRole('button', { name: 'Reset to defaults' }));
+ expect(screen.getByLabelText('Starting directory')).toHaveValue('');
+ expect(screen.getByLabelText('Keep interactive sessions with tmux')).not.toBeChecked();
+ expect(screen.getByLabelText('Enable read-only health probes')).not.toBeChecked();
+ expect(draft).toHaveBeenLastCalledWith({ dirty: true, draftRevision: 1 });
+ expect(mocks.saveSettings).not.toHaveBeenCalled();
+ fireEvent.click(screen.getByRole('button', { name: 'Save Settings' }));
+ await waitFor(() => expect(mocks.saveSettings).toHaveBeenCalled());
+ expect(mocks.saveSettings.mock.calls[0][0].patch).toMatchObject({ path: '', startupCommand: '', healthProbeEnabled: false });
+});
+
+it.each(['0.0.0.0', '::', '192.0.2.1', '127.0.0.2', 'example.com'])('warns meaningfully before saving a non-loopback binding %s', async (host) => {
+ mount(); const input = await screen.findByLabelText('Host');
+ fireEvent.change(input, { target: { value: host } });
+ expect(input).toHaveAccessibleDescription(/Other machines may reach the local SSH proxy.*firewall/);
+ expect(screen.getByText(/Warning: this address is not loopback/)).toHaveAttribute('role', 'status');
+ expect(mocks.saveSettings).not.toHaveBeenCalled();
+});
+
+it.each(['127.0.0.1', '::1', 'localhost', 'LOCALHOST', ' localhost '])('does not warn for the supported loopback binding %s', async (host) => {
+ mocks.getSettings.mockResolvedValue({ ...settings, host }); mount();
+ await screen.findByLabelText('Host');
+ expect(screen.queryByText(/Warning: this address is not loopback/)).not.toBeInTheDocument();
+});
+
+it('shows path validation at its field and never saves an overlong draft', async () => {
+ const draft = vi.fn(); mount(draft); const path = await screen.findByLabelText('Starting directory');
+ fireEvent.change(path, { target: { value: 'a'.repeat(1025) } });
+ fireEvent.click(screen.getByRole('button', { name: 'Save Settings' }));
+ expect(await screen.findByText(en.validation_invalid_path)).toBeInTheDocument();
+ expect(path).toHaveAttribute('aria-invalid', 'true');
+ expect(path).toHaveAccessibleDescription(new RegExp('Use at most 1,024 characters'));
+ expect(mocks.saveSettings).not.toHaveBeenCalled();
+ expect(draft).toHaveBeenLastCalledWith({ dirty: true, draftRevision: 1 });
+});
+
+it('saves the health-only profile preference without invalidating an existing SSH config preview', async () => {
+ mount(); await screen.findByLabelText('Host');
+ fireEvent.click(screen.getByRole('button', { name: 'Preview saved SSH config' }));
+ await screen.findByLabelText('Managed SSH config block preview');
+ fireEvent.click(screen.getByLabelText('Enable read-only health probes'));
+ expect(screen.getByLabelText('Managed SSH config block preview')).toBeInTheDocument();
+ fireEvent.click(screen.getByRole('button', { name: 'Save Settings' }));
+ await waitFor(() => expect(mocks.saveSettings).toHaveBeenCalledExactlyOnceWith({ scope: runtime.scope, patch: { healthProbeEnabled: true } }));
+ expect(mocks.restartProxy).not.toHaveBeenCalled();
+ expect(mocks.saveAppSettings).not.toHaveBeenCalled();
+});
+
+it('disables the tmux opt-in with an explicit empty command and invalidates the connection preview', async () => {
+ mocks.getSettings.mockResolvedValue({ ...settings, startupCommand: 'tmux new -A -s usshtc' });
+ const draft = vi.fn(); mount(draft); await screen.findByLabelText('Host');
+ fireEvent.click(screen.getByRole('button', { name: 'Preview saved SSH config' }));
+ await screen.findByLabelText('Managed SSH config block preview');
+ fireEvent.click(screen.getByLabelText('Keep interactive sessions with tmux'));
+ expect(screen.queryByLabelText('Managed SSH config block preview')).not.toBeInTheDocument();
+ expect(draft).toHaveBeenLastCalledWith({ dirty: true, draftRevision: 1 });
+ fireEvent.click(screen.getByRole('button', { name: 'Save Settings' }));
+ await waitFor(() => expect(mocks.saveSettings).toHaveBeenCalledExactlyOnceWith({ scope: runtime.scope, patch: { startupCommand: '' } }));
+});
+
+it('loads each profile’s remote preferences without carrying over another profile’s opt-ins', async () => {
+ mocks.getSettings.mockResolvedValue({ ...settings, path: '/profile-a', startupCommand: 'tmux new -A -s usshtc', healthProbeEnabled: true });
+ const view = mount(); expect(await screen.findByLabelText('Starting directory')).toHaveValue('/profile-a');
+ runtime.scope = { profileId: 'b', epoch: 2 };
+ mocks.getSettings.mockResolvedValue({ ...settings, path: '/profile b', startupCommand: '', healthProbeEnabled: false });
+ mocks.getSsoCredentials.mockResolvedValue({ profileId: 'b', username: '', hasPassword: false, storageAvailable: true });
+ view.rerender(<LocaleProvider><ToastProvider><SettingsView key="b" /></ToastProvider></LocaleProvider>);
+ expect(await screen.findByLabelText('Starting directory')).toHaveValue('/profile b');
+ expect(screen.getByLabelText('Keep interactive sessions with tmux')).not.toBeChecked();
+ expect(screen.getByLabelText('Enable read-only health probes')).not.toBeChecked();
+ expect(mocks.saveSettings).not.toHaveBeenCalled();
+});
+
+it.each([en, zh])('localizes readiness and conservative validation without rendering backend messages', (messages) => {
+ const t = (key) => messages[key];
+ expect(formatApiError({ code: 'REMOTE_READY_TIMEOUT', message: 'private backend message' }, t)).toBe(messages.error_REMOTE_READY_TIMEOUT);
+ expect(formatValidationError('invalid_path', t)).toBe(messages.validation_invalid_path);
+ expect(formatValidationError('invalid_startup_command', t)).toBe(messages.validation_invalid_startup_command);
+ for (const key of ['diagnostic_WSS_SHELL_READY', 'diagnostic_REMOTE_COMMAND_OK', 'diagnostic_REMOTE_READY_TIMEOUT', 'diagnosticsCheck_remote-command', 'keepTmuxSessionHint', 'healthProbeEnabledHint', 'nonLoopbackBindingWarning', 'useRootHint']) expect(messages[key]).toBeTruthy();
 });
 it('retains a saved false auto-check preference and saves only an explicit toggle as an app patch', async () => {
  mocks.getSettings.mockResolvedValue({ ...settings, autoCheckUpdates: false });
@@ -217,7 +327,7 @@ it('requires a saved-profile preview and sends only its optimistic tokens when g
  expect(mocks.saveSettings).not.toHaveBeenCalled(); expect(confirm).not.toHaveBeenCalled();
 });
 
-it.each([['Host','localhost'],['Port (1–65535)','4000'],['SSH Alias','research'],['Cluster','new-cluster'],['Login Node IP','localhost'],['Cols (40–500)','120'],['Rows (10–200)','40']])('invalidates the preview after editing %s and requires an explicit save',async(label,value)=>{
+it.each([['Host','localhost'],['Port (1–65535)','4000'],['SSH Alias','research'],['Cluster','new-cluster'],['Login Node IP','localhost'],['Starting directory','/work dir'],['Cols (40–500)','120'],['Rows (10–200)','40']])('invalidates the preview after editing %s and requires an explicit save',async(label,value)=>{
  mount(); await screen.findByLabelText('Host');
  fireEvent.click(screen.getByRole('button',{name:'Preview saved SSH config'}));
  await screen.findByLabelText('Managed SSH config block preview');

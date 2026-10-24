@@ -10,6 +10,7 @@ const { StringDecoder } = require('string_decoder');
 const { quotePosix, buildExecBootstrap, createExecParser } = require('./exec-codec');
 const { validateCookie } = require('./credential-store');
 const { buildWssUrl, buildWssOptions } = require('./wss-connection');
+const { validateSettingsPatch } = require('../shared/settings-schema.mjs');
 const {
   WSS_HANDSHAKE_TIMEOUT,
   REMOTE_READY_TIMEOUT,
@@ -126,6 +127,10 @@ class ProxyServer extends EventEmitter {
     this.port = options.port ?? 3000;
     this.host = typeof options.host === 'string' && options.host ? options.host : '127.0.0.1';
     this.cookie = validateCookie(options.cookie === undefined ? '' : options.cookie);
+    this._cookieGeneration = 0;
+    const startup = validateSettingsPatch({ startupCommand: options.startupCommand === undefined ? '' : options.startupCommand }, {});
+    if (!startup.ok) throw new TypeError('Invalid interactive startup command');
+    this.startupCommand = startup.value.startupCommand;
     this._acceptingConnections = options.acceptingConnections !== false;
     this.wssUrl = buildWssUrl(options);
 
@@ -340,6 +345,7 @@ class ProxyServer extends EventEmitter {
     const self = this;
     const exec = command !== undefined;
     const commandText = typeof command === 'string' ? command : '';
+    const cookieGeneration = this._cookieGeneration;
     function rejectEarly(code, diagnostic) {
       try { channel.stderr?.write(diagnostic); } catch (_) {}
       try { channel.exit(code); } catch (_) {}
@@ -612,13 +618,16 @@ class ProxyServer extends EventEmitter {
       });
       enqueue(`exec sh -c ${quotePosix(buildExecBootstrap(nonce))}\n`);
     }
+    if (!exec && this.startupCommand) {
+      enqueue(`if command -v tmux >/dev/null 2>&1; then ${this.startupCommand}; else printf '%s\\n' 'tmux is not installed; continuing without session persistence.' >&2; fi\n`);
+    }
     ws.on('open', () => {
       if (closed || finishCode !== null) return;
       ready = true;
       // Upgrade succeeds even for silent, invalid-token portal sessions. Only a
       // terminal data frame opens the input gate; silence cannot revoke a cookie.
       firstDataTimer = self._schedule(timers, () => {
-        self.emit('remote-not-ready', { code: 'REMOTE_READY_TIMEOUT', sessionId: session.id });
+        self.emit('remote-not-ready', { code: 'REMOTE_READY_TIMEOUT', sessionId: session.id, cookieGeneration });
         complete(255, 'REMOTE_READY_TIMEOUT: Remote shell did not become ready; verify the connection or log in again.\n', 'remote_not_ready');
       }, self.remoteReadyTimeoutMs);
       if (ptyState.cols !== initialSize.cols || ptyState.rows !== initialSize.rows) {
@@ -654,7 +663,7 @@ class ProxyServer extends EventEmitter {
         remoteReady = true;
         cancel(firstDataTimer);
         firstDataTimer = null;
-        self.emit('remote-ready', { sessionId: session.id });
+        self.emit('remote-ready', { sessionId: session.id, cookieGeneration });
         flushInput();
       }
       if (exec) {
@@ -1184,8 +1193,14 @@ class ProxyServer extends EventEmitter {
     }
   }
 
+  getCookieGeneration() {
+    return this._cookieGeneration;
+  }
+
   updateCookie(cookieString) {
-    this.cookie = validateCookie(cookieString);
+    const cookie = validateCookie(cookieString);
+    if (cookie !== this.cookie) this._cookieGeneration += 1;
+    this.cookie = cookie;
   }
 }
 

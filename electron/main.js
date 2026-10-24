@@ -23,6 +23,7 @@ const { createDiagnosticExportService } = require('./diagnostic-export-service')
 const { buildWssUrl } = require('./wss-connection');
 const { createAutostartService } = require('./autostart-service');
 const { createRecoveryController } = require('./recovery-controller');
+const { createHealthProbeService } = require('./health-probe-service');
 const { createUpdateService } = require('./update-service');
 
 function startApplication(deps = {}) {
@@ -73,6 +74,7 @@ function startApplication(deps = {}) {
   let validDiagnosticRunId = null;
   let autostart = null;
   let recovery = null;
+  let health = null;
   let recoveryOwnerScope = null;
   let updates = null;
   let updatePreference = null;
@@ -89,10 +91,11 @@ function startApplication(deps = {}) {
       recoveryUpdateQueued = false;
       if (!recovery || systemSuspended || recoveryHeldForExclusive) return;
       recovery.update();
-      if (recoveryNeedsResume) { recoveryNeedsResume = false; recovery.resume(); }
+      health?.update();
+      if (recoveryNeedsResume) { recoveryNeedsResume = false; recovery.resume(); health?.resume(); }
     });
   };
-  const suspendRecovery = () => { systemSuspended = true; recovery?.suspend(); };
+  const suspendRecovery = () => { systemSuspended = true; recovery?.suspend(); health?.suspend(); };
   const resumeRecovery = () => { systemSuspended = false; recoveryNeedsResume = true; queueRecoveryUpdate(); };
   let allowAppQuit = false;
   let autoConnectTimer = null;
@@ -120,6 +123,7 @@ function startApplication(deps = {}) {
       if (hold) {
         recoveryHeldForExclusive = true;
         recovery.cancel(data.operation);
+        health?.cancel(data.operation);
       } else if (recoveryHeldForExclusive) {
         recoveryHeldForExclusive = false;
         recoveryNeedsResume = true;
@@ -186,6 +190,7 @@ function startApplication(deps = {}) {
       updates?.dispose();
       if (diagnostics && controller) invalidateDiagnostics(currentScope());
       recovery?.dispose();
+      health?.dispose();
       if (autoConnectTimer !== null) clock.clearTimeout(autoConnectTimer);
       autoConnectTimer = null;
       preparation = controller?.prepareExit(fatalRequested ? 'fatal' : 'app_exit') || Promise.resolve();
@@ -201,6 +206,7 @@ function startApplication(deps = {}) {
     updates?.dispose();
     if (diagnostics && controller) invalidateDiagnostics(currentScope());
     recovery?.dispose();
+    health?.dispose();
     preparation = controller?.prepareExit('fatal') || Promise.resolve();
     preparation.catch((cleanupError) => addLog('error', 'app', `Fatal cleanup failed: ${cleanupError.message}`));
     return coordinator.request(1);
@@ -516,6 +522,13 @@ function startApplication(deps = {}) {
       onAuthRequired: (source) => callbacks?.onAuthRequired(source),
       onSession: (kind, data) => tray?.notify(kind, data),
       onNetworkError: (source) => recovery?.networkError(source),
+      onRemoteNotReady: (source) => {
+        const value = controller?.getSnapshot();
+        if (!value || value.profileId !== source.profileId || value.epoch !== source.epoch
+            || Object.entries(source.config).some(([key, saved]) => value.desiredConfig[key] !== saved)) return;
+        recovery?.remoteNotReady(source);
+        health?.cancel('REMOTE_READY_TIMEOUT');
+      },
     });
     const login = createLoginController({ clock, log: addLog,
       getSession: (partition) => session.fromPartition(partition),
@@ -539,6 +552,7 @@ function startApplication(deps = {}) {
         if (diagnostics) invalidateDiagnostics(currentScope());
         diagnostics?.dispose();
         recovery?.dispose();
+        health?.dispose();
         tray?.dispose();
         tray = null;
       },
@@ -552,7 +566,7 @@ function startApplication(deps = {}) {
       },
       getAutostartStatus: () => autostart.getStatus(),
       setAutostartEnabled: (enabled) => autostart.setEnabled(enabled),
-      cancelRecovery: (reason) => recovery?.cancel(reason),
+      cancelRecovery: (reason) => { recovery?.cancel(reason); health?.cancel(reason); },
       forgetCredentialStore: (id) => credentialStores.delete(id), initializeKeys,
       assertKeys: () => {
         const errorCode = initializeKeys();
@@ -654,6 +668,19 @@ function startApplication(deps = {}) {
         if (value.profileId === scope.profileId && value.epoch === scope.epoch) tray?.notify('recovery', {});
       },
       adapters: deps.recoveryAdapters,
+    });
+    health = deps.healthProbeService || createHealthProbeService({
+      clock,
+      getSnapshot: () => controller.getSnapshot(), getPreferences: currentSettings,
+      getConfig: (scope) => { assertScope(scope); const saved = currentSettings(); return { ...saved, wssUrl: buildWssUrl(saved) }; },
+      getCookie: (scope) => {
+        const value = controller.getSnapshot();
+        return value.profileId === scope.profileId && value.epoch === scope.epoch && value.cookieValid ? login.getCookie() : '';
+      },
+      getKeys: (scope) => { assertScope(scope); return inspectKeys(); },
+      getClientIdentity: (scope) => { assertScope(scope); return getSsh2ClientIdentity({ sshDirectory }); },
+      onRemoteState: (source) => callbacks?.onRemoteState(source),
+      adapters: deps.healthAdapters,
     });
     recoveryOwnerScope = currentScope();
     queueRecoveryUpdate();
@@ -758,6 +785,7 @@ function startApplication(deps = {}) {
       activeDiagnostic?.abort.abort();
       diagnostics?.dispose();
       recovery?.dispose();
+      health?.dispose();
       powerMonitor?.removeListener('suspend', suspendRecovery);
       powerMonitor?.removeListener('resume', resumeRecovery);
       await controller?.dispose();

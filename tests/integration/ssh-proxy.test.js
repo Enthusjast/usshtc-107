@@ -6,7 +6,7 @@ const path = require('node:path');
 const https = require('node:https');
 const crypto = require('node:crypto');
 const { once } = require('node:events');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const readline = require('node:readline');
 const { Client, utils: sshUtils } = require('ssh2');
 const { WebSocketServer } = require('ws');
@@ -25,7 +25,7 @@ async function until(predicate) {
   }
 }
 
-async function fixture(t, { mode = 'echo', status = 101, acceptingConnections = true } = {}) {
+async function fixture(t, { mode = 'echo', status = 101, acceptingConnections = true, startupCommand = '' } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'usshtc107-transport-'));
   const sshDirectory = path.join(root, '.ssh');
   const diskIdentity = ensureClientKeyPair({ sshDirectory });
@@ -46,6 +46,7 @@ async function fixture(t, { mode = 'echo', status = 101, acceptingConnections = 
     await proxy?.stop();
     for (const peer of peers) peer.ws.terminate();
     for (const child of children) child.kill();
+    if (startupCommand) spawnSync('tmux', ['kill-server'], { env: { ...process.env, TMUX_TMPDIR: root }, timeout: 5000 });
     await new Promise((resolve) => wss.close(resolve));
     await new Promise((resolve) => server.close(resolve));
     fs.rmSync(root, { recursive: true, force: true });
@@ -66,7 +67,9 @@ async function fixture(t, { mode = 'echo', status = 101, acceptingConnections = 
     if (mode !== 'pty') ws.send(JSON.stringify({ $case: 'data', data: { data: '' } }));
     let child;
     if (mode === 'pty') {
-      child = spawn('python3', [path.join(__dirname, '../fixtures/pty-peer.py')], { stdio: ['pipe', 'pipe', 'pipe'] });
+      child = spawn('python3', [path.join(__dirname, '../fixtures/pty-peer.py')], {
+        stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, TERM: 'xterm-256color', TMUX_TMPDIR: root },
+      });
       children.add(child);
       child.on('error', () => ws.terminate());
       child.stdin.on('error', () => {});
@@ -98,7 +101,7 @@ async function fixture(t, { mode = 'echo', status = 101, acceptingConnections = 
     wssUrl: `wss://127.0.0.1:${server.address().port}/shell?cluster=test-only`,
     tlsCa: certificate, hostKey, authorizedKey: Buffer.from(diskIdentity.publicKeyRaw, 'base64'),
     authorizedKeyOpenSSH: diskIdentity.publicKey, cols: 80, rows: 24,
-    acceptingConnections, execTimeoutMs: 5000, shutdownTimeoutMs: 1000,
+    acceptingConnections, startupCommand, execTimeoutMs: 5000, shutdownTimeoutMs: 1000,
   });
   let address;
   proxy.on('started', (value) => { address = value; });
@@ -279,4 +282,26 @@ test('fresh command proof executes through pinned SSH, WSS and a real remote PTY
   const { probeRemoteCommand } = require('../../electron/remote-command-probe');
   assert.equal(await probeRemoteCommand({ config: f.address, identity: f.identity, hostFingerprint }), 'REMOTE_COMMAND_OK');
   assert.equal(await probeRemoteCommand({ config: f.address, identity: f.identity, hostFingerprint, command: 'true' }), 'REMOTE_COMMAND_OK');
+});
+
+test('opted-in tmux preserves shell state across real SSH/WSS disconnect and reattach', {
+  skip: process.platform === 'win32' || spawnSync('tmux', ['-V']).status !== 0 ? 'POSIX PTY and tmux required' : false,
+  timeout: 20000,
+}, async t => {
+  const f = await fixture(t, { mode: 'pty', startupCommand: 'tmux new -A -s usshtc' });
+  const client = await f.connect();
+  const first = await shell(client);
+  const marker = crypto.randomBytes(12).toString('hex');
+  let firstText = '';
+  first.on('data', chunk => { firstText += chunk.toString(); });
+  first.write(`USSHTC_PROOF=$(printf '%s%s' '${marker.slice(0, 12)}' '${marker.slice(12)}'); printf '\\n%s\\n' "$USSHTC_PROOF"\r`);
+  await until(() => firstText.includes(marker));
+  const closed = once(first, 'close'); first.close(); await closed;
+  const second = await shell(client);
+  const next = crypto.randomBytes(12).toString('hex');
+  let secondText = '';
+  second.on('data', chunk => { secondText += chunk.toString(); });
+  second.write(`printf '\\n%s%s:%s\\n' '${next.slice(0, 12)}' '${next.slice(12)}' "$USSHTC_PROOF"\r`);
+  await until(() => secondText.includes(`${next}:${marker}`));
+  second.close();
 });

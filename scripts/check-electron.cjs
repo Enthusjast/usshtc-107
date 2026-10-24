@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
-const files = [['electron', '.js'], ['shared', '.mjs']].flatMap(([directory, extension]) => {
+const files = [['electron', '.js'], ['shared', '.mjs'], ['cli', '.cjs']].flatMap(([directory, extension]) => {
   if (!fs.existsSync(directory)) return [];
   return fs.readdirSync(directory, { withFileTypes: true })
     .filter(entry => entry.isFile() && entry.name.endsWith(extension))

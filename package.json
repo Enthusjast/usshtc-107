@@ -1,6 +1,6 @@
 {
   "name": "usshtc107",
-  "version": "1.2.3",
+  "version": "1.3.0",
   "description": "USTC computing platform SSH proxy client",
   "author": "Enthusjast <enthusjast@outlook.com>",
   "license": "MIT",
@@ -12,6 +12,7 @@
   "desktopName": "usshtc107.desktop",
   "packageManager": "npm@11.18.0",
   "main": "electron/main.js",
+  "bin": { "usshtc107": "cli/main.cjs" },
   "engines": {
     "node": ">=22.12.0",
     "npm": ">=11.18.0"
@@ -23,13 +24,15 @@
     "check:electron": "node scripts/check-electron.cjs",
     "test": "npm run test:node && npm run test:ui",
     "test:node": "node scripts/run-node-tests.cjs",
-    "test:node:coverage": "node scripts/run-node-tests.cjs --experimental-test-coverage --test-coverage-include=electron/*.js --test-coverage-include=shared/*.mjs --test-coverage-exclude=electron/main.js --test-coverage-exclude=electron/preload.js --test-coverage-lines=80 --test-coverage-branches=60 --test-coverage-functions=78",
+    "test:node:coverage": "node scripts/run-node-tests.cjs --experimental-test-coverage --test-coverage-include=electron/*.js --test-coverage-include=shared/*.mjs --test-coverage-include=cli/*.cjs --test-coverage-exclude=electron/main.js --test-coverage-exclude=electron/preload.js --test-coverage-lines=80 --test-coverage-branches=60 --test-coverage-functions=78",
     "test:ui": "vitest run",
     "test:ui:coverage": "vitest run --coverage",
     "test:electron": "playwright test --project=source",
     "test:electron:packaged": "playwright test --project=packaged",
+    "test:live": "node --test --test-concurrency=1 tests/live/exec.live.cjs tests/live/interactive.live.cjs tests/live/auth.live.cjs tests/live/concurrency.live.cjs",
     "test:coverage": "npm run test:node:coverage && npm run test:ui:coverage",
     "start": "electron .",
+    "cli": "node cli/main.cjs",
     "build:mac-icon": "set -eu; iconset=build/icon.iconset; mkdir -p \"$iconset\"; for size in 16 32 128 256 512; do double=$((size * 2)); sips -z \"$size\" \"$size\" build/icon.png --out \"$iconset/icon_${size}x${size}.png\" >/dev/null; sips -z \"$double\" \"$double\" build/icon.png --out \"$iconset/icon_${size}x${size}@2x.png\" >/dev/null; done; iconutil -c icns \"$iconset\" -o build/icon.icns",
     "package:smoke": "npm run build && electron-builder --linux --dir --publish never",
     "dist": "vite build && electron-builder --publish never",

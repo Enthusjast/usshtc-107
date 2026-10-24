@@ -1279,3 +1279,31 @@ test('EOF drains output until quiet without extending its absolute upper bound',
     await nextTurn();
   }
 });
+
+test('tmux startup is explicit, readiness-gated, absent for exec, and missing tmux leaves a usable shell', async () => {
+  const { spawnSync } = require('node:child_process');
+  for (const kind of ['shell', 'exec']) {
+    const ws = new FakeWebSocket();
+    const proxy = makeProxy({ webSocketFactory: () => ws, startupCommand: 'tmux new -A -s usshtc' });
+    const channel = new FakeChannel();
+    if (kind === 'exec') proxy._bridgeExecToWss(channel, 'fixture', 'true');
+    else proxy._bridgeSshToWss(channel, 'fixture');
+    ws.open({ withPrompt: false });
+    assert.equal(dataText(ws), '');
+    ws.message('');
+    const bootstrap = dataText(ws);
+    if (kind === 'exec') assert.ok(bootstrap.startsWith('exec sh -c '));
+    else {
+      assert.ok(bootstrap.startsWith('if command -v tmux '));
+      if (process.platform !== 'win32') {
+        const result = spawnSync('/bin/sh', ['-c', `${bootstrap}printf 'NORMAL_SHELL'`], { env: { ...process.env, PATH: '' } });
+        assert.equal(result.status, 0);
+        assert.equal(result.stdout.toString(), 'NORMAL_SHELL');
+        assert.match(result.stderr.toString(), /tmux/);
+      }
+    }
+    channel.close();
+    await nextTurn();
+  }
+  assert.throws(() => makeProxy({ startupCommand: 'tmux; arbitrary_command' }), TypeError);
+});
