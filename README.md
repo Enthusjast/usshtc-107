@@ -231,7 +231,7 @@ GitHub Actions 发布需要以下仓库 Secrets：
 | macOS | `MAC_CSC_LINK`, `MAC_CSC_KEY_PASSWORD`, `APPLE_API_KEY_BASE64`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER` |
 | Windows | `WIN_CSC_LINK`, `WIN_CSC_KEY_PASSWORD` |
 
-`MAC_CSC_LINK` 和 `WIN_CSC_LINK` 可使用 electron-builder 支持的 base64 证书值。`APPLE_API_KEY_BASE64` 是 App Store Connect `.p8` 私钥的 base64 内容。用于签名或发布的标签必须严格等于 `v<package.json version>`，例如当前版本使用 `v1.3.0`，且标签提交必须属于默认分支历史。应在仓库设置中保护 `v*` 标签。
+`MAC_CSC_LINK` 和 `WIN_CSC_LINK` 可使用 electron-builder 支持的 base64 证书值。`APPLE_API_KEY_BASE64` 是 App Store Connect `.p8` 私钥的 base64 内容。用于签名或发布的标签必须严格等于 `v<package.json version>`，例如当前版本使用 `v1.3.1`，且标签提交必须属于默认分支历史。应在仓库设置中保护 `v*` 标签。
 
 发布流水线会验证签名和 macOS 公证，生成产物 SHA-256 校验文件和 GitHub 构建来源证明，并为实际生产依赖生成 CycloneDX SBOM。普通手动构建可以选择单个平台；Linux 可从功能分支构建，使用证书的 macOS/Windows 构建只能从默认分支或匹配版本的标签发起。创建 GitHub Release 时必须构建全部平台。
 
