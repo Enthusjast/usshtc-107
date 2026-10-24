@@ -32,9 +32,11 @@ class FakeWebSocket extends EventEmitter {
     this.paused = false;
   }
 
-  open() {
+  open({ withPrompt = true } = {}) {
     this.readyState = 1;
     this.emit('open');
+    // Portal terminal readiness is separate from a successful HTTP upgrade.
+    if (withPrompt) this.message('');
   }
 
   send(data, callback) {
@@ -1178,4 +1180,75 @@ test('SSH socket timeout/error remains attributable after the socket ownership m
     assert.equal(terminal.exitCode, null);
     client.emit('close');
   }
+});
+
+test('shell input is held until the first remote frame and then flushed', async () => {
+  const ws = new FakeWebSocket();
+  const proxy = makeProxy({ webSocketFactory: () => ws, remoteReadyTimeoutMs: 1000 });
+  const channel = new FakeChannel();
+  proxy._bridgeSshToWss(channel, 'fixture');
+  channel.emit('data', Buffer.from('hostname\n'));
+  ws.open({ withPrompt: false });
+  assert.equal(ws.sent.length, 0);
+  assert.equal(channel.paused, true);
+  ws.message('$ ');
+  assert.ok(ws.sent.map(JSON.parse).some(message => message.data?.data === 'hostname\n'));
+  assert.equal(channel.paused, false);
+  channel.close();
+  await nextTurn();
+});
+
+test('silent shell and exec sessions fail within the readiness deadline without revoking cookies or disclosing input', async () => {
+  for (const exec of [false, true]) {
+    const ws = new FakeWebSocket();
+    const proxy = makeProxy({ cookie: 'SECRET_COOKIE', webSocketFactory: () => ws, remoteReadyTimeoutMs: 25 });
+    const channel = new FakeChannel();
+    const diagnostics = [];
+    channel.stderr = { write: value => diagnostics.push(value) };
+    const logs = [], authErrors = [], notReady = [];
+    proxy.on('proxy-log', (...args) => logs.push(args.join(' ')));
+    proxy.on('auth-error', value => authErrors.push(value));
+    proxy.on('remote-not-ready', value => notReady.push(value));
+    let terminal;
+    proxy.on('session-close', value => { terminal = value; });
+    if (exec) proxy._bridgeExecToWss(channel, 'fixture', 'SECRET_COMMAND');
+    else { proxy._bridgeSshToWss(channel, 'fixture'); channel.emit('data', Buffer.from('SECRET_COMMAND\n')); }
+    ws.open({ withPrompt: false });
+    assert.deepEqual(ws.sent, []);
+    await delay(60);
+    assert.deepEqual(channel.exitCodes, [255]);
+    assert.equal(terminal.reason, 'remote_not_ready');
+    assert.equal(notReady[0].code, 'REMOTE_READY_TIMEOUT');
+    assert.equal(notReady[0].sessionId, terminal.sessionId);
+    assert.deepEqual(authErrors, []);
+    assert.equal(proxy.cookie, 'SECRET_COOKIE');
+    assert.equal(proxy.getSessions().length, 0);
+    assert.match(diagnostics.join(''), /^REMOTE_READY_TIMEOUT:/);
+    assert.doesNotMatch([...logs, ...diagnostics].join(''), /SECRET_COOKIE|SECRET_COMMAND/);
+    ws.message('late');
+    assert.deepEqual(ws.sent, []);
+  }
+});
+
+test('exec bootstrap and resize wait for valid terminal data including empty frames', async () => {
+  const ws = new FakeWebSocket();
+  const proxy = makeProxy({ webSocketFactory: () => ws, remoteReadyTimeoutMs: 25 });
+  const channel = new FakeChannel();
+  const ready = [];
+  proxy.on('remote-ready', value => ready.push(value));
+  const bridge = proxy._bridgeExecToWss(channel, 'fixture', 'true');
+  bridge.resize(100, 40);
+  ws.open({ withPrompt: false });
+  ws.emit('message', Buffer.from('{"$case":"data","data":{"data":42}}'));
+  ws.emit('message', Buffer.from('{"$case":"ping"}'));
+  assert.deepEqual(ws.sent, []);
+  ws.message('');
+  assert.equal(ready.length, 1);
+  assert.ok(ws.sent.map(JSON.parse).some(message => message.data?.data.startsWith('exec sh -c ')));
+  assert.ok(ws.sent.map(JSON.parse).some(message => message.resize?.cols === 100));
+  assert.equal(proxy.getSessions()[0].bytesReceived, 0);
+  await delay(45);
+  assert.deepEqual(channel.exitCodes, []);
+  channel.close();
+  await nextTurn();
 });

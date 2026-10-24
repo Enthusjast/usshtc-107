@@ -62,6 +62,8 @@ async function fixture(t, { mode = 'echo', status = 101, acceptingConnections = 
   wss.on('connection', (ws, request) => {
     const peer = { ws, url: new URL(request.url, 'https://localhost'), messages: [] };
     peers.push(peer);
+    // Echo fixtures model a terminal-ready frame; the real PTY emits its prompt.
+    if (mode !== 'pty') ws.send(JSON.stringify({ $case: 'data', data: { data: '' } }));
     let child;
     if (mode === 'pty') {
       child = spawn('python3', [path.join(__dirname, '../fixtures/pty-peer.py')], { stdio: ['pipe', 'pipe', 'pipe'] });

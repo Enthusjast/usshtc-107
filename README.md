@@ -232,6 +232,8 @@ tests/                    核心代理、安全服务和前端交互测试
 
 动作的成功回复可能早于最终运行事件。设置页消耗草稿确认前会先刷新权威 scope，再读取保存值；只有读取确实应用且 revision 未变化才清理对应草稿。刷新期间禁用冲突动作，后来发生的编辑或读取失败不会被误判为已清理。
 
+代理只在收到首条有效终端 `data` 帧后发送输入（包括 exec bootstrap 和 resize），空字符串帧也视为就绪。WSS Upgrade 成功不代表远端 shell 可用；连接建立后 10 秒没有终端数据会以 `REMOTE_READY_TIMEOUT` 和退出码 255 结束该会话，保留 Cookie，并提示检查连接或重新登录。只有握手 HTTP 401/403 才会使 Cookie 失效。
+
 隔离运行可传 `--user-data-dir=<绝对路径>`，应用在访问设置、日志和登录 session 前创建私有目录并设置 userData/sessionData/logs；空值或相对路径被拒绝。主进程 fixture 可导入 `startApplication(deps)` 注入本地适配器，不提供 renderer 任意 URL 或凭据注入入口。
 
 ## License

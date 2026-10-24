@@ -9,6 +9,7 @@ const { validateCookie } = require('./credential-store');
 const { buildWssUrl, buildWssOptions } = require('./wss-connection');
 const {
   WSS_HANDSHAKE_TIMEOUT,
+  REMOTE_READY_TIMEOUT,
   PING_INTERVAL,
   PING_TIMEOUT,
   SSH_HANDSHAKE_TIMEOUT,
@@ -144,6 +145,7 @@ class ProxyServer extends EventEmitter {
       options.wssHandshakeTimeoutMs,
       WSS_HANDSHAKE_TIMEOUT
     );
+    this.remoteReadyTimeoutMs = positiveInteger(options.remoteReadyTimeoutMs, REMOTE_READY_TIMEOUT);
     this.sshHandshakeTimeoutMs = positiveInteger(
       options.sshHandshakeTimeoutMs,
       SSH_HANDSHAKE_TIMEOUT
@@ -365,6 +367,8 @@ class ProxyServer extends EventEmitter {
     let finishCode = null;
     let finishReason = 'interrupted';
     let ready = false;
+    let remoteReady = false;
+    let firstDataTimer = null;
     let inputEnded = false;
     let disconnectSent = false;
     let pendingResize = null;
@@ -464,6 +468,7 @@ class ProxyServer extends EventEmitter {
       finishCode = code;
       finishReason = reason;
       cancel(execTimer);
+      cancel(firstDataTimer);
       cancel(sendDeadline);
       cancel(pollTimer);
       clearInterval(pingTimer);
@@ -504,7 +509,7 @@ class ProxyServer extends EventEmitter {
       return !closed && finishCode === null;
     }
     function flushInput() {
-      if (closed || finishCode !== null || !ready || ws.readyState !== WS_OPEN) return;
+      if (closed || finishCode !== null || !ready || !remoteReady || ws.readyState !== WS_OPEN) return;
       while (pending.length) {
         const item = pending[0];
         let frame;
@@ -553,7 +558,7 @@ class ProxyServer extends EventEmitter {
       const text = decoder.write(data);
       const carry = decoder.lastNeed ? decoder.lastTotal - decoder.lastNeed : 0;
       enqueue(text, data.length + oldCarry - carry);
-      if (!ready) pauseInput();
+      if (!ready || !remoteReady) pauseInput();
       flushInput();
     }
     function onInputEnd() {
@@ -588,6 +593,12 @@ class ProxyServer extends EventEmitter {
     ws.on('open', () => {
       if (closed || finishCode !== null) return;
       ready = true;
+      // Upgrade succeeds even for silent, invalid-token portal sessions. Only a
+      // terminal data frame opens the input gate; silence cannot revoke a cookie.
+      firstDataTimer = self._schedule(timers, () => {
+        self.emit('remote-not-ready', { code: 'REMOTE_READY_TIMEOUT', sessionId: session.id });
+        complete(255, 'REMOTE_READY_TIMEOUT: Remote shell did not become ready; verify the connection or log in again.\n', 'remote_not_ready');
+      }, self.remoteReadyTimeoutMs);
       if (ptyState.cols !== initialSize.cols || ptyState.rows !== initialSize.rows) {
         pendingResize = { cols: ptyState.cols, rows: ptyState.rows };
       }
@@ -617,6 +628,13 @@ class ProxyServer extends EventEmitter {
         return;
       }
       if (result.type !== 'data') return;
+      if (!remoteReady) {
+        remoteReady = true;
+        cancel(firstDataTimer);
+        firstDataTimer = null;
+        self.emit('remote-ready', { sessionId: session.id });
+        flushInput();
+      }
       if (exec) {
         try { parser.write(result.payload); } catch (error) {
           const limited = error?.code === 'EXEC_OUTPUT_LIMIT';
@@ -647,7 +665,7 @@ class ProxyServer extends EventEmitter {
         ptyState.rows = rows;
         pendingResize = { cols, rows };
         // One latest-size record per tick, including while WSS is blocked.
-        if (ready) scheduleFlush();
+        if (ready && remoteReady) scheduleFlush();
       },
     };
   }

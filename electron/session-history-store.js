@@ -9,7 +9,7 @@ const MAX_HISTORY_SESSIONS = 1000;
 const HISTORY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const HISTORY_ERROR = 'HISTORY_STORAGE_FAILED';
 const HISTORY_REASONS = Object.freeze([
-  'completed', 'user_disconnect', 'proxy_stop', 'network_error', 'auth_error',
+  'completed', 'user_disconnect', 'proxy_stop', 'network_error', 'auth_error', 'remote_not_ready',
   'timeout', 'output_limit', 'app_exit', 'interrupted',
 ]);
 const RECORD_FIELDS = ['id', 'profileId', 'kind', 'startedAt', 'endedAt', 'bytesSent', 'bytesReceived', 'exitCode', 'reason'];
