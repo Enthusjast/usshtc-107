@@ -251,12 +251,12 @@ test('WSS options enforce TLS verification, custom CA, and a payload cap', async
   proxy.on('proxy-log', (...args) => logs.push(args.join(' ')));
   const channel = new FakeChannel();
 
-  proxy._bridgeSshToWss(channel, {}, '127.0.0.1:1');
+  proxy._bridgeSshToWss(channel, '127.0.0.1:1');
   const [session] = proxy.getSessions();
   assert.ok(session);
   assert.equal(capturedOptions.rejectUnauthorized, true);
   assert.equal(capturedOptions.maxPayload, 4096);
-  assert.equal(capturedOptions.ca, ca);
+  assert.deepEqual(capturedOptions.ca, [...require('node:tls').rootCertificates, ca]);
   assert.equal(logs.join('\n').includes('SECRET_COOKIE_VALUE'), false);
 
   assert.equal(proxy.disconnectSession(session.id), true);
@@ -557,7 +557,6 @@ test('exec timeout returns 124 and never logs command, output, or cookie', async
   const secretCommand = 'echo SECRET_COMMAND_TOKEN';
   const proxy = makeProxy({
     cookie: 'SECRET_COOKIE_TOKEN',
-    execInitialDelayMs: 0,
     execTimeoutMs: 15,
     webSocketFactory: () => ws,
   });
@@ -565,7 +564,7 @@ test('exec timeout returns 124 and never logs command, output, or cookie', async
   proxy.on('proxy-log', (...args) => logs.push(args.join(' ')));
   const channel = new FakeChannel();
 
-  proxy._bridgeExecToWss(channel, {}, '127.0.0.1:2', secretCommand);
+  proxy._bridgeExecToWss(channel, '127.0.0.1:2', secretCommand);
   ws.open();
   await delay(35);
 
@@ -576,70 +575,76 @@ test('exec timeout returns 124 and never logs command, output, or cookie', async
   assert.equal(proxy.getSessions().length, 0);
 });
 
-test('exec completion marker is detected across WSS messages with accurate status', async () => {
+function execNonce(ws) {
+  const bootstrap = ws.sent.map((message) => JSON.parse(message))
+    .filter((message) => message.$case === 'data').map((message) => message.data.data).join('');
+  const nonce = bootstrap.match(/USSHTC_([a-f0-9]{64}):READY/)?.[1];
+  assert.ok(nonce, 'exec bootstrap contains the random protocol nonce');
+  return nonce;
+}
+
+function startExec(ws) {
+  const nonce = execNonce(ws);
+  ws.message(`\x1eUSSHTC_${nonce}:READY\x1f`);
+  ws.message(`\x1eUSSHTC_${nonce}:START\x1f`);
+  return nonce;
+}
+
+function completeExec(ws, nonce, output, code = 0) {
+  const record = Buffer.from(`\x1eUSSHTC_${nonce}:END:${code}\x1f`);
+  ws.message(Buffer.concat([Buffer.from(output), record]).toString('base64'));
+}
+
+test('exec READY gates command and incremental base64 preserves exact bytes/status', async () => {
   const ws = new FakeWebSocket();
-  const proxy = makeProxy({
-    execInitialDelayMs: 0,
-    execTimeoutMs: 1000,
-    webSocketFactory: () => ws,
-  });
+  const proxy = makeProxy({ webSocketFactory: () => ws });
   const logs = [];
   proxy.on('proxy-log', (...args) => logs.push(args.join(' ')));
   const channel = new FakeChannel();
-
-  proxy._bridgeExecToWss(channel, {}, '127.0.0.1:3', 'printf hello');
+  const command = "printf '中文🙂'\n\n";
+  proxy._bridgeExecToWss(channel, 'fixture', command);
   ws.open();
-  await delay(5);
-
+  assert.equal(ws.sent.length, 1);
+  const nonce = execNonce(ws);
+  const ready = `\x1eUSSHTC_${nonce}:READY\x1f`;
+  for (const char of ready) ws.message(char);
   assert.equal(ws.sent.length, 2);
-  const markerMessage = JSON.parse(ws.sent[1]).data.data;
-  const markerId = markerMessage.match(/DONE_([a-f0-9]+)/)?.[1];
-  assert.ok(markerId);
-  ws.message(`printf hello\r\nhello\nDONE_${markerId} 7`);
-  assert.deepEqual(channel.exitCodes, []);
-  ws.message('0\r\n');
+  assert.equal(Buffer.from(JSON.parse(ws.sent[1]).data.data.trim(), 'base64').toString(), command);
+  const start = `\x1eUSSHTC_${nonce}:START\x1f`;
+  for (const char of start) ws.message(char);
+  const expected = Buffer.from('  x\t\r\n中文🙂\x1b[31m\x00\n\n');
+  const encoded = Buffer.concat([expected, Buffer.from(`\x1eUSSHTC_${nonce}:END:70\x1f`)]).toString('base64');
+  for (const char of encoded) ws.message(char);
   await nextTurn();
-
   assert.deepEqual(channel.exitCodes, [70]);
-  assert.equal(Buffer.concat(channel.writes).toString(), 'hello\n');
-  assert.equal(logs.join('\n').includes('printf hello'), false);
-  assert.equal(logs.join('\n').includes('hello\n'), false);
+  assert.deepEqual(Buffer.concat(channel.writes), expected);
+  assert.equal(logs.join('\n').includes(command), false);
   assert.equal(proxy.getSessions().length, 0);
 });
 
-test('exec output is bounded and reports a distinct nonzero status', async () => {
+test('exec decoded output cap returns 125 without normalizing output', async () => {
   const ws = new FakeWebSocket();
-  const proxy = makeProxy({
-    execInitialDelayMs: 0,
-    execTimeoutMs: 1000,
-    maxExecOutputBytes: 4,
-    webSocketFactory: () => ws,
-  });
+  const proxy = makeProxy({ maxExecOutputBytes: 4, webSocketFactory: () => ws });
   const channel = new FakeChannel();
-
-  proxy._bridgeExecToWss(channel, {}, '127.0.0.1:8', 'echo output');
+  proxy._bridgeExecToWss(channel, 'fixture', 'echo output');
   ws.open();
-  ws.message('12345');
+  completeExec(ws, startExec(ws), '12345');
   await nextTurn();
-
   assert.deepEqual(channel.exitCodes, [125]);
   assert.equal(proxy.getSessions().length, 0);
 });
 
-test('disconnectSession closes only its channel, not the SSH client', async () => {
+test('disconnectSession completes the requested bridge and removes its record', async () => {
   const ws = new FakeWebSocket();
   const proxy = makeProxy({ webSocketFactory: () => ws });
   const channel = new FakeChannel();
-  let clientEnds = 0;
-  const client = { end: () => { clientEnds += 1; } };
 
-  proxy._bridgeSshToWss(channel, client, '127.0.0.1:4');
+  proxy._bridgeSshToWss(channel, '127.0.0.1:4');
   const [session] = proxy.getSessions();
   assert.equal(proxy.disconnectSession(session.id), true);
   await nextTurn();
 
-  assert.equal(channel.closeCalled, true);
-  assert.equal(clientEnds, 0);
+  assert.equal(channel.endCalled, true);
   assert.equal(proxy.getSessions().length, 0);
 });
 
@@ -650,14 +655,14 @@ test('WSS close 1011 fails the session but does not invalidate authentication', 
   let authErrors = 0;
   proxy.on('auth-error', () => { authErrors += 1; });
 
-  proxy._bridgeSshToWss(channel, {}, '127.0.0.1:5');
+  proxy._bridgeSshToWss(channel, '127.0.0.1:5');
   ws.open();
   ws.readyState = 3;
   ws.emit('close', 1011);
   await nextTurn();
 
   assert.equal(authErrors, 0);
-  assert.deepEqual(channel.exitCodes, [1]);
+  assert.deepEqual(channel.exitCodes, [255]);
   assert.equal(proxy.getSessions().length, 0);
 });
 
@@ -745,7 +750,7 @@ test('pending SSH input is bounded while WSS is connecting', async () => {
   });
   const channel = new FakeChannel();
 
-  proxy._bridgeSshToWss(channel, {}, '127.0.0.1:6');
+  proxy._bridgeSshToWss(channel, '127.0.0.1:6');
   channel.emit('data', Buffer.from('12345'));
   await nextTurn();
 
@@ -764,7 +769,7 @@ test('interactive bridge applies backpressure in both directions', async () => {
   });
   const channel = new FakeChannel();
 
-  proxy._bridgeSshToWss(channel, {}, '127.0.0.1:7');
+  proxy._bridgeSshToWss(channel, '127.0.0.1:7');
   ws.open();
   ws.bufferedAmount = 64;
   channel.emit('data', Buffer.from('input'));
@@ -786,4 +791,391 @@ test('interactive bridge applies backpressure in both directions', async () => {
   proxy.disconnectSession(session.id);
   await nextTurn();
   assert.equal(proxy.getSessions().length, 0);
+});
+
+function dataText(ws) {
+  return ws.sent.map((message) => JSON.parse(message)).filter((message) => message.$case === 'data')
+    .map((message) => message.data.data).join('');
+}
+
+test('all UTF8 byte splits survive connecting, backpressure, Unicode wire framing and EOF', async () => {
+  const expected = '中文🙂é\n\t"\\\x00';
+  const input = Buffer.from(expected);
+  for (const mode of ['connecting', 'open', 'blocked']) {
+    for (let split = 0; split <= input.length; split += 1) {
+      const ws = new FakeWebSocket();
+      const proxy = makeProxy({ webSocketFactory: () => ws, maxWsBufferedBytes: 52, backpressurePollMs: 1 });
+      const channel = new FakeChannel();
+      proxy._bridgeSshToWss(channel, 'fixture');
+      if (mode !== 'connecting') ws.open();
+      if (mode === 'blocked') ws.bufferedAmount = 52;
+      channel.emit('data', input.subarray(0, split));
+      channel.emit('data', input.subarray(split));
+      channel.emit('end');
+      channel.emit('end'); // decoder.end() must run only once.
+      if (mode === 'connecting') ws.open();
+      ws.bufferedAmount = 0;
+      if (mode === 'blocked') await delay(5);
+      assert.equal(dataText(ws), expected, `${mode} split ${split}`);
+      for (const wire of ws.sent) {
+        assert.ok(Buffer.byteLength(wire) <= 52);
+        const text = JSON.parse(wire).data?.data;
+        if (text) assert.doesNotMatch(text, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u);
+      }
+      assert.equal(JSON.parse(ws.sent.at(-1)).$case, 'disconnect');
+      assert.equal(ws.sent.filter((wire) => JSON.parse(wire).$case === 'disconnect').length, 1);
+      assert.equal(channel.endCalled, false, 'EOF still permits remote output');
+      ws.message('after EOF');
+      assert.equal(Buffer.concat(channel.writes).toString(), 'after EOF');
+      channel.close();
+      await nextTurn();
+    }
+  }
+});
+
+test('per-channel decoders and carry are isolated, counted, and flushed once', async () => {
+  const sockets = [new FakeWebSocket(), new FakeWebSocket()];
+  const proxy = makeProxy({ maxPendingBytes: 4, webSocketFactory: () => sockets.shift() });
+  const firstWs = sockets[0];
+  const secondWs = sockets[1];
+  const first = new FakeChannel();
+  const second = new FakeChannel();
+  proxy._bridgeSshToWss(first, 'one');
+  proxy._bridgeSshToWss(second, 'two');
+  const emoji = Buffer.from('🙂');
+  first.emit('data', emoji.subarray(0, 3));
+  second.emit('data', Buffer.from('中'));
+  firstWs.open(); secondWs.open();
+  first.emit('data', emoji.subarray(3));
+  assert.equal(dataText(firstWs), '🙂');
+  assert.equal(dataText(secondWs), '中');
+  second.emit('data', Buffer.from([0xe4, 0xb8]));
+  second.emit('end'); second.emit('end');
+  assert.equal(dataText(secondWs), '中�');
+  first.close(); second.close();
+  await nextTurn();
+  const overflowWs = new FakeWebSocket();
+  const overflow = makeProxy({ maxPendingBytes: 3, webSocketFactory: () => overflowWs });
+  const channel = new FakeChannel();
+  overflow._bridgeSshToWss(channel, 'carry-limit');
+  channel.emit('data', emoji.subarray(0, 3));
+  channel.emit('data', emoji.subarray(3));
+  assert.deepEqual(channel.exitCodes, [1]);
+});
+
+test('EOF waits for queued input and Ctrl-D is ordinary input', async () => {
+  const ws = new FakeWebSocket();
+  const proxy = makeProxy({ webSocketFactory: () => ws, backpressurePollMs: 1 });
+  const channel = new FakeChannel();
+  proxy._bridgeSshToWss(channel, 'fixture');
+  ws.open(); ws.bufferedAmount = proxy.maxWsBufferedBytes;
+  channel.emit('data', Buffer.from([4]));
+  channel.emit('end');
+  assert.equal(ws.sent.length, 0);
+  ws.bufferedAmount = 0;
+  await delay(5);
+  assert.deepEqual(ws.sent.map((wire) => JSON.parse(wire).$case), ['data', 'disconnect']);
+  assert.equal(dataText(ws), '\x04');
+  assert.equal(ws.readyState, 1);
+  channel.close();
+});
+
+test('exec rejects NUL before transport and nonempty stdin locally but EOF keeps output alive', async () => {
+  let sockets = 0;
+  const nul = makeProxy({ webSocketFactory: () => { sockets += 1; return new FakeWebSocket(); } });
+  const nulChannel = new FakeChannel();
+  nul._bridgeExecToWss(nulChannel, 'fixture', 'x\0y');
+  assert.equal(sockets, 0);
+  assert.deepEqual(nulChannel.exitCodes, [1]);
+  for (const input of [Buffer.from('x'), null]) {
+    const ws = new FakeWebSocket();
+    const proxy = makeProxy({ webSocketFactory: () => ws });
+    const channel = new FakeChannel();
+    const localErrors = [];
+    channel.stderr = { write: (text) => localErrors.push(text) };
+    proxy._bridgeExecToWss(channel, 'fixture', 'printf output');
+    ws.open();
+    const nonce = startExec(ws);
+    if (input) {
+      channel.emit('data', input);
+      assert.deepEqual(channel.exitCodes, [1]);
+      assert.equal(localErrors.join(''), 'Exec stdin is not supported.\n');
+    } else {
+      channel.emit('end');
+      completeExec(ws, nonce, 'output', 7);
+      assert.deepEqual(channel.exitCodes, [7]);
+      assert.equal(Buffer.concat(channel.writes).toString(), 'output');
+    }
+    await nextTurn();
+  }
+});
+
+test('exec transport termination cannot report success before END', async () => {
+  for (const upstream of [0, 7, null, 'signal', 'close']) {
+    const ws = new FakeWebSocket();
+    const proxy = makeProxy({ webSocketFactory: () => ws });
+    const channel = new FakeChannel();
+    proxy._bridgeExecToWss(channel, 'fixture', 'true');
+    ws.open(); startExec(ws);
+    if (upstream === 'close') { ws.readyState = 3; ws.emit('close', 1000); }
+    else ws.emit('message', Buffer.from(JSON.stringify({ $case: 'exit', exit: upstream === 'signal' ? { signal: 'TERM' } : { code: upstream } })));
+    assert.deepEqual(channel.exitCodes, [upstream === 7 ? 7 : 255]);
+    await nextTurn();
+  }
+  const ws = new FakeWebSocket();
+  const channel = new FakeChannel();
+  makeProxy({ webSocketFactory: () => ws })._bridgeExecToWss(channel, 'fixture', 'true');
+  ws.open();
+  ws.emit('message', Buffer.from(JSON.stringify({ $case: 'exit', exit: { code: 126 } })));
+  assert.deepEqual(channel.exitCodes, [1]);
+});
+
+test('exec codec errors map setup/framing to 1 and encoded/prelude resource caps to 125', async () => {
+  for (const kind of ['framing', 'encoded', 'prelude']) {
+    const ws = new FakeWebSocket();
+    const proxy = makeProxy({ webSocketFactory: () => ws, maxExecEncodedBytes: 8, maxExecPreludeBytes: 8 });
+    const channel = new FakeChannel();
+    proxy._bridgeExecToWss(channel, 'fixture', 'true');
+    ws.open();
+    if (kind === 'prelude') ws.message('123456789');
+    else { startExec(ws); ws.message(kind === 'framing' ? '!' : 'QUFBQUFBQUFB'); }
+    assert.deepEqual(channel.exitCodes, [kind === 'framing' ? 1 : 125]);
+    await nextTurn();
+  }
+});
+
+test('accepted exec output drains before exit, and queued output stays bounded', async () => {
+  const ws = new FakeWebSocket();
+  const proxy = makeProxy({ webSocketFactory: () => ws, maxQueuedOutputBytes: 8 });
+  const channel = new FakeChannel();
+  channel.writeResult = false;
+  proxy._bridgeExecToWss(channel, 'fixture', 'true');
+  ws.open();
+  completeExec(ws, startExec(ws), '1234', 0);
+  assert.equal(ws.paused, true);
+  assert.deepEqual(channel.exitCodes, []);
+  channel.writeResult = true;
+  channel.emit('drain');
+  assert.deepEqual(channel.exitCodes, [0]);
+  assert.equal(Buffer.concat(channel.writes).toString(), '1234');
+  await nextTurn();
+  const blockedWs = new FakeWebSocket();
+  const blocked = new FakeChannel();
+  blocked.writeResult = false;
+  const limited = makeProxy({ webSocketFactory: () => blockedWs, maxQueuedOutputBytes: 4 });
+  limited._bridgeSshToWss(blocked, 'queue-limit');
+  blockedWs.open();
+  blockedWs.message('1234');
+  blockedWs.message('1234'); // in-flight WS messages after pause still have a bound.
+  blockedWs.message('5');
+  blocked.writeResult = true;
+  blocked.emit('drain');
+  assert.deepEqual(blocked.exitCodes, [125]);
+  assert.equal(Buffer.concat(blocked.writes).toString(), '12341234');
+});
+
+test('reader drain and WSS send stalls have finite resource deadlines', async () => {
+  const ws = new FakeWebSocket();
+  const proxy = makeProxy({ webSocketFactory: () => ws, shutdownTimeoutMs: 10 });
+  const channel = new FakeChannel();
+  channel.writeResult = false;
+  proxy._bridgeExecToWss(channel, 'fixture', 'true');
+  ws.open(); completeExec(ws, startExec(ws), 'output');
+  await delay(30);
+  assert.deepEqual(channel.exitCodes, [125]);
+  assert.equal(proxy.getSessions().length, 0);
+  const stalledWs = new FakeWebSocket();
+  const stalledChannel = new FakeChannel();
+  makeProxy({ webSocketFactory: () => stalledWs, wssHandshakeTimeoutMs: 10, backpressurePollMs: 1 })
+    ._bridgeExecToWss(stalledChannel, 'fixture', 'true');
+  stalledWs.bufferedAmount = 1024 * 1024;
+  stalledWs.open();
+  await delay(30);
+  assert.deepEqual(stalledChannel.exitCodes, [125]);
+});
+
+test('PTY requests validate reply signatures and resize storms coalesce latest shell/exec size', async () => {
+  for (const kind of ['shell', 'exec']) {
+    const ws = new FakeWebSocket();
+    let url;
+    const proxy = makeProxy({ cols: 80, rows: 24, backpressurePollMs: 1, webSocketFactory: (value) => { url = value; return ws; } });
+    const client = new EventEmitter();
+    proxy._onSshClient(client); client.emit('ready');
+    const session = new EventEmitter();
+    client.emit('session', () => session, () => {});
+    let accepted = 0;
+    let rejected = 0;
+    const accept = () => { accepted += 1; };
+    const reject = () => { rejected += 1; };
+    session.emit('window-change', accept, reject, { cols: 100, rows: 30 });
+    session.emit('pty', accept, reject, { cols: 501, rows: 30 });
+    session.emit('pty', accept, reject, { cols: 120, rows: 40 });
+    session.emit('pty', accept, reject, { cols: 120, rows: 40 });
+    assert.equal(accepted, 1);
+    assert.equal(rejected, 3);
+    session.emit('window-change', accept, reject, { cols: 0, rows: 0 });
+    const channel = new FakeChannel();
+    session.emit(kind, () => channel, reject, { command: 'true' });
+    assert.equal(new URL(url).searchParams.get('cols'), '120');
+    assert.equal(new URL(url).searchParams.get('rows'), '40');
+    assert.equal(new URL(proxy.wssUrl).searchParams.get('cols'), '80');
+    session.emit('window-change', undefined, undefined, { cols: 121, rows: 41 });
+    ws.open();
+    assert.ok(ws.sent.some((message) => JSON.parse(message).resize?.cols === 121));
+    ws.bufferedAmount = proxy.maxWsBufferedBytes;
+    for (let cols = 122; cols <= 400; cols += 1) {
+      session.emit('window-change', accept, reject, { cols, rows: 42 });
+    }
+    session.emit('window-change', undefined, undefined, { cols: -1, rows: 42 });
+    ws.bufferedAmount = 0;
+    await delay(5);
+    const resizes = ws.sent.map((message) => JSON.parse(message)).filter((message) => message.$case === 'resize');
+    assert.equal(resizes.length, 2);
+    assert.deepEqual(resizes.at(-1).resize, { cols: 400, rows: 42 });
+    channel.close(); client.emit('close');
+    await nextTurn();
+  }
+});
+
+test('terminal snapshot contains final counters and kind before deletion and only emits once', async () => {
+  const ws = new FakeWebSocket();
+  const proxy = makeProxy({ webSocketFactory: () => ws });
+  const channel = new FakeChannel();
+  const closed = [];
+  proxy.on('session-close', (value) => {
+    closed.push(value);
+    assert.equal(proxy.getSessions().some((session) => session.id === value.sessionId), true);
+    assert.equal(value.session.kind, 'shell');
+    assert.equal(value.session.bytesSent, Buffer.byteLength('中文'));
+    assert.equal(value.session.bytesReceived, Buffer.byteLength('🙂reply'));
+  });
+  proxy._bridgeSshToWss(channel, 'private-address');
+  ws.open();
+  channel.emit('data', Buffer.from('中文'));
+  ws.message('🙂reply');
+  ws.emit('message', Buffer.from(JSON.stringify({ $case: 'exit', exit: { code: 7 } })));
+  assert.equal(closed.length, 1);
+  assert.equal(closed[0].exitCode, 7);
+  assert.equal(closed[0].reason, 'completed');
+  assert.ok(closed[0].endedAt >= closed[0].session.connectedAt);
+  assert.equal(proxy.getSessions().length, 0);
+  channel.emit('close');
+  ws.emit('error', new Error('late transport failure'));
+  await nextTurn();
+  assert.equal(closed.length, 1);
+});
+
+test('history terminal reasons reflect source rather than guessing from a numeric exec exit status', async () => {
+  for (const exitCode of [0, 124, 125, 255]) {
+    const ws = new FakeWebSocket();
+    const proxy = makeProxy({ webSocketFactory: () => ws });
+    const channel = new FakeChannel();
+    let terminal;
+    proxy.on('session-close', (value) => { terminal = value; });
+    proxy._bridgeExecToWss(channel, 'fixture', 'command is not recorded');
+    ws.open();
+    completeExec(ws, startExec(ws), 'output is not recorded in history', exitCode);
+    assert.equal(terminal.session.kind, 'exec');
+    assert.equal(terminal.reason, 'completed');
+    assert.equal(terminal.exitCode, exitCode);
+    assert.equal(Object.hasOwn(terminal.session, 'command'), false);
+    await nextTurn();
+  }
+  const sources = [
+    ['user_disconnect', (_ws, proxy) => proxy.disconnectSession(proxy.getSessions()[0].id)],
+    ['network_error', (ws) => ws.emit('error', new Error('transport'))],
+    ['auth_error', (ws) => ws.emit('unexpected-response', {}, { statusCode: 403, resume() {} })],
+    ['output_limit', (ws) => ws.message('12345')],
+    ['interrupted', (_ws, _proxy, channel) => channel.emit('close')],
+  ];
+  for (const [reason, terminate] of sources) {
+    const ws = new FakeWebSocket();
+    const proxy = makeProxy({ webSocketFactory: () => ws, maxQueuedOutputBytes: 4 });
+    const channel = new FakeChannel();
+    let terminal;
+    proxy.on('session-close', (value) => { terminal = value; });
+    proxy._bridgeSshToWss(channel, 'fixture');
+    ws.open();
+    terminate(ws, proxy, channel);
+    assert.equal(terminal.reason, reason);
+    await nextTurn();
+  }
+});
+
+test('local exec deadlines record timeout while unrelated channel sessions remain active', async () => {
+  const sockets = [new FakeWebSocket(), new FakeWebSocket()];
+  const firstWs = sockets[0], secondWs = sockets[1];
+  const proxy = makeProxy({ webSocketFactory: () => sockets.shift(), execTimeoutMs: 10 });
+  const terminals = [];
+  proxy.on('session-close', (value) => terminals.push(value));
+  const execChannel = new FakeChannel();
+  const shellChannel = new FakeChannel();
+  proxy._bridgeExecToWss(execChannel, 'fixture', 'true');
+  proxy._bridgeSshToWss(shellChannel, 'fixture');
+  firstWs.open(); secondWs.open();
+  await delay(30);
+  assert.equal(terminals.length, 1);
+  assert.equal(terminals[0].reason, 'timeout');
+  assert.equal(terminals[0].exitCode, 124);
+  assert.equal(proxy.getSessions().length, 1);
+  shellChannel.close();
+  await nextTurn();
+});
+
+test('stop finalizes even backpressured sessions before stopped and a late close is ignored', async () => {
+  for (const [stopReason, terminalReason] of [['restart', 'proxy_stop'], ['auth_error', 'auth_error'],
+    ['app_exit', 'app_exit'], ['fatal', 'app_exit']]) {
+    const ws = new FakeWebSocket();
+    const proxy = makeProxy({ webSocketFactory: () => ws, shutdownTimeoutMs: 10 });
+    const channel = new FakeChannel();
+    channel.writeResult = false;
+    proxy._bridgeSshToWss(channel, 'fixture');
+    ws.open();
+    ws.message('final received bytes');
+    const order = [];
+    proxy.on('session-close', (value) => {
+      order.push('close');
+      assert.equal(value.reason, terminalReason);
+      assert.equal(value.session.bytesReceived, Buffer.byteLength('final received bytes'));
+    });
+    proxy.on('stopped', () => {
+      order.push('stopped');
+      assert.equal(proxy.getSessions().length, 0);
+    });
+    await proxy.stop(stopReason);
+    assert.deepEqual(order, ['close', 'stopped']);
+    channel.emit('drain');
+    channel.emit('close');
+    ws.emit('close', 1006);
+    await nextTurn();
+    assert.deepEqual(order, ['close', 'stopped']);
+  }
+});
+
+test('SSH socket timeout/error remains attributable after the socket ownership map is cleared', async () => {
+  for (const source of ['timeout', 'network_error']) {
+    const ws = new FakeWebSocket();
+    const proxy = makeProxy({ webSocketFactory: () => ws });
+    const socket = new FakeSocket();
+    proxy._trackTcpSocket(socket);
+    const client = new EventEmitter();
+    client._sock = socket;
+    proxy._onSshClient(client);
+    client.emit('ready');
+    const sshSession = new EventEmitter();
+    client.emit('session', () => sshSession, () => {});
+    const channel = new FakeChannel();
+    sshSession.emit('shell', () => channel, () => {});
+    ws.open();
+    let terminal;
+    proxy.on('session-close', (value) => { terminal = value; });
+    if (source === 'timeout') socket.emit('timeout');
+    else { socket.emit('error', new Error('socket reset')); socket.destroy(); }
+    await nextTurn();
+    assert.equal(proxy._sockets.size, 0);
+    channel.emit('close');
+    assert.equal(terminal.reason, source);
+    assert.equal(terminal.exitCode, null);
+    client.emit('close');
+  }
 });

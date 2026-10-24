@@ -1,7 +1,7 @@
-import { createContext, useContext, useState, useCallback, useEffect } from 'react';
+import { createContext, useContext, useState, useCallback, useEffect, useRef } from 'react';
 import en from './en';
 import zh from './zh';
-import { setAppLocale } from '../lib/electron';
+import { getStatus, getSettings, onRuntimeState, setAppLocale } from '../lib/electron';
 
 const LOCALES = { en, zh };
 const FALLBACK = 'en';
@@ -23,26 +23,44 @@ function resolve(obj, path) {
 }
 
 export function LocaleProvider({ children }) {
-  const [locale, setLocaleState] = useState(() => {
-    // Try stored preference, then browser language, fallback to 'en'
-    try {
-      const stored = localStorage.getItem('usshtc107-locale');
-      if (stored && LOCALES[stored]) return stored;
-    } catch (_) {}
-    const browserLang = (navigator.language || '').toLowerCase();
-    return browserLang.startsWith('zh') ? 'zh' : 'en';
-  });
+  const [locale, setLocaleState] = useState(FALLBACK);
+  const preferenceRevision = useRef(0);
 
-  const setLocale = useCallback((l) => {
-    if (LOCALES[l]) {
-      setLocaleState(l);
-      try { localStorage.setItem('usshtc107-locale', l); } catch (_) {}
-    }
+  useEffect(() => {
+    let active = true;
+    let latestScope = null;
+    let latestRevision = -1;
+    let readSequence = 0;
+    const readPreferences = async (snapshot) => {
+      if (!active || !snapshot || snapshot.revision <= latestRevision) return;
+      latestRevision = snapshot.revision;
+      const scope = { profileId: snapshot.profileId, epoch: snapshot.epoch };
+      if (latestScope?.profileId === scope.profileId && latestScope?.epoch === scope.epoch) return;
+      latestScope = scope;
+      const sequence = ++readSequence;
+      const revision = preferenceRevision.current;
+      try {
+        const settings = await getSettings(scope);
+        if (active && sequence === readSequence && revision === preferenceRevision.current && LOCALES[settings.locale]) {
+          setLocaleState(settings.locale);
+        }
+      } catch (_) { /* Keep the safe fallback without persisting it. */ }
+    };
+    let unsubscribe;
+    try { unsubscribe = onRuntimeState((value) => { void readPreferences(value); }); } catch (_) {}
+    void getStatus().then(readPreferences).catch(() => {});
+    return () => { active = false; unsubscribe?.(); };
+  }, []);
+
+  const setLocale = useCallback(async (nextLocale) => {
+    if (!LOCALES[nextLocale]) return;
+    const revision = ++preferenceRevision.current;
+    const result = await setAppLocale(nextLocale);
+    if (!result?.cancelled && revision === preferenceRevision.current) setLocaleState(nextLocale);
   }, []);
 
   useEffect(() => {
     document.documentElement.lang = locale === 'zh' ? 'zh-CN' : 'en';
-    setAppLocale(locale).catch(() => {});
   }, [locale]);
 
   /**

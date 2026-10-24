@@ -1,104 +1,73 @@
+'use strict';
+
 const { contextBridge, ipcRenderer } = require('electron');
+
+const subscribe = (channel, callback) => {
+  const listener = (_event, value) => callback(value);
+  ipcRenderer.on(channel, listener);
+  return () => ipcRenderer.removeListener(channel, listener);
+};
 
 contextBridge.exposeInMainWorld('electronAPI', {
   isElectron: true,
-
-  // ---- Runtime ----
   getRuntimeInfo: () => ipcRenderer.invoke('runtime:get-info'),
-
-  // ---- Status ----
   getStatus: () => ipcRenderer.invoke('status:get'),
-
-  // ---- Settings ----
-  getSettings: () => ipcRenderer.invoke('settings:get'),
-  saveSettings: (settings) => ipcRenderer.invoke('settings:save', settings),
-
-  // ---- SSO Credentials (encrypted) ----
-  saveSsoCredentials: (username, password) => ipcRenderer.invoke('sso:save-credentials', username, password),
-  getSsoCredentials: () => ipcRenderer.invoke('sso:get-credentials'),
-  clearSsoCredentials: () => ipcRenderer.invoke('sso:clear-credentials'),
-
-  // ---- Login ----
-  startLogin: () => ipcRenderer.invoke('login:start'),
-
-  // ---- Proxy control ----
-  startProxy: () => ipcRenderer.invoke('proxy:start'),
-  stopProxy: () => ipcRenderer.invoke('proxy:stop'),
-
-  // ---- Logs ----
+  getSettings: (scope) => ipcRenderer.invoke('settings:get', scope),
+  saveSettings: (payload) => ipcRenderer.invoke('settings:save', payload),
+  saveAppSettings: (patch) => ipcRenderer.invoke('settings:save-app', patch),
+  retryLoadSettings: (scope) => ipcRenderer.invoke('settings:retry-load', scope),
+  getProfiles: () => ipcRenderer.invoke('profiles:get'),
+  createProfile: (payload) => ipcRenderer.invoke('profiles:create', payload),
+  renameProfile: (payload) => ipcRenderer.invoke('profiles:rename', payload),
+  deleteProfile: (payload) => ipcRenderer.invoke('profiles:delete', payload),
+  activateProfile: (payload) => ipcRenderer.invoke('profiles:activate', payload),
+  saveOnboarding: (payload) => ipcRenderer.invoke('onboarding:save', payload),
+  getUpdateState: () => ipcRenderer.invoke('updates:get-state'),
+  checkForUpdates: () => ipcRenderer.invoke('updates:check'),
+  downloadUpdate: (payload) => ipcRenderer.invoke('updates:download', payload),
+  installUpdate: (payload) => ipcRenderer.invoke('updates:install', payload),
+  openUpdateRelease: () => ipcRenderer.invoke('updates:open-release'),
+  saveSsoCredentials: (payload) => ipcRenderer.invoke('sso:save-credentials', payload),
+  getSsoCredentials: (scope) => ipcRenderer.invoke('sso:get-credentials', scope),
+  clearSsoCredentials: (scope) => ipcRenderer.invoke('sso:clear-credentials', scope),
+  startLogin: (scope) => ipcRenderer.invoke('login:start', scope),
+  startProxy: (scope) => ipcRenderer.invoke('proxy:start', scope),
+  stopProxy: (scope) => ipcRenderer.invoke('proxy:stop', scope),
+  restartProxy: (scope) => ipcRenderer.invoke('proxy:restart', scope),
   getLogs: () => ipcRenderer.invoke('logs:get'),
   clearLogs: () => ipcRenderer.invoke('logs:clear'),
-
-  // ---- Sessions ----
   getSessions: () => ipcRenderer.invoke('sessions:get'),
-  disconnectSession: (sessionId) => ipcRenderer.invoke('sessions:disconnect', sessionId),
-
-  // ---- Stats ----
+  disconnectSession: (payload) => ipcRenderer.invoke('sessions:disconnect', payload),
   getStats: () => ipcRenderer.invoke('stats:get'),
-
-  // ---- SSH Key Info ----
-  getSshKeyInfo: () => ipcRenderer.invoke('ssh-key:get-info'),
-
-  // ---- SSH Config ----
-  generateSshConfig: (opts) => ipcRenderer.invoke('ssh-config:generate', opts),
-
-  // ---- Theme ----
+  getHistory: (payload) => ipcRenderer.invoke('history:get', payload),
+  clearHistory: (scope) => ipcRenderer.invoke('history:clear', scope),
+  getAutostart: () => ipcRenderer.invoke('autostart:get'),
+  setAutostart: (enabled) => ipcRenderer.invoke('autostart:set', enabled),
+  retryRecovery: (scope) => ipcRenderer.invoke('recovery:retry', scope),
+  getSshKeyInfo: (scope) => ipcRenderer.invoke('ssh-key:get-info', scope),
+  exportKeyBackup: (scope) => ipcRenderer.invoke('ssh-key:backup', scope),
+  importKeyBackup: (scope) => ipcRenderer.invoke('ssh-key:restore', scope),
+  rotateSshKeys: (payload) => ipcRenderer.invoke('ssh-key:rotate', payload),
+  rebuildSshKeys: (payload) => ipcRenderer.invoke('ssh-key:rebuild', payload),
+  previewSshConfig: (scope) => ipcRenderer.invoke('ssh-config:preview', scope),
+  startDiagnostics: (scope) => ipcRenderer.invoke('diagnostics:start', scope),
+  cancelDiagnostics: (payload) => ipcRenderer.invoke('diagnostics:cancel', payload),
+  getDiagnostics: (scope) => ipcRenderer.invoke('diagnostics:get', scope),
+  exportLogs: (payload) => ipcRenderer.invoke('exports:logs', payload),
+  exportDiagnostics: (scope) => ipcRenderer.invoke('exports:diagnostics', scope),
+  generateSshConfig: (payload) => ipcRenderer.invoke('ssh-config:generate', payload),
   getTheme: () => ipcRenderer.invoke('theme:get'),
   setTheme: (theme) => ipcRenderer.invoke('theme:set', theme),
   setLocale: (locale) => ipcRenderer.invoke('locale:set', locale),
-
-  // ---- External ----
   openExternal: (url) => ipcRenderer.invoke('external:open', url),
   copyToClipboard: (text) => ipcRenderer.invoke('clipboard:write', text),
-  setAppDirty: (dirty) => ipcRenderer.invoke('app:set-dirty', dirty),
-  exitApp: () => ipcRenderer.invoke('app:exit'),
-
-  // ---- Event subscriptions (each returns an unsubscribe function) ----
-  onLoginStatus: (cb) => {
-    const listener = (_e, data) => cb(data);
-    ipcRenderer.on('login-status', listener);
-    return () => ipcRenderer.removeListener('login-status', listener);
-  },
-
-  onProxyStatus: (cb) => {
-    const listener = (_e, data) => cb(data);
-    ipcRenderer.on('proxy-status', listener);
-    return () => ipcRenderer.removeListener('proxy-status', listener);
-  },
-
-  onCookieStatus: (cb) => {
-    const listener = (_e, data) => cb(data);
-    ipcRenderer.on('cookie-status', listener);
-    return () => ipcRenderer.removeListener('cookie-status', listener);
-  },
-
-  onNewLog: (cb) => {
-    const listener = (_e, data) => cb(data);
-    ipcRenderer.on('new-log', listener);
-    return () => ipcRenderer.removeListener('new-log', listener);
-  },
-
-  onLoginProgress: (cb) => {
-    const listener = (_e, data) => cb(data);
-    ipcRenderer.on('login-progress', listener);
-    return () => ipcRenderer.removeListener('login-progress', listener);
-  },
-
-  onSessionUpdate: (cb) => {
-    const listener = (_e, data) => cb(data);
-    ipcRenderer.on('session-update', listener);
-    return () => ipcRenderer.removeListener('session-update', listener);
-  },
-
-  onStatsUpdate: (cb) => {
-    const listener = (_e, data) => cb(data);
-    ipcRenderer.on('stats-update', listener);
-    return () => ipcRenderer.removeListener('stats-update', listener);
-  },
-
-  onThemeChanged: (cb) => {
-    const listener = (_e, data) => cb(data);
-    ipcRenderer.on('theme-changed', listener);
-    return () => ipcRenderer.removeListener('theme-changed', listener);
-  },
+  setAppDirty: (payload) => ipcRenderer.invoke('app:set-dirty', payload),
+  exitApp: (payload) => ipcRenderer.invoke('app:exit', payload),
+  onRuntimeState: (callback) => subscribe('runtime-state', callback),
+  onNewLog: (callback) => subscribe('new-log', callback),
+  onDiagnosticsState: (callback) => subscribe('diagnostics:state', callback),
+  onUpdateState: (callback) => subscribe('updates:state', callback),
+  onSessionUpdate: (callback) => subscribe('session-update', callback),
+  onStatsUpdate: (callback) => subscribe('stats-update', callback),
+  onThemeChanged: (callback) => subscribe('theme-changed', callback),
 });

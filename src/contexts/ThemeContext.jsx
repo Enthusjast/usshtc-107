@@ -35,13 +35,10 @@ export function ThemeProvider({ children }) {
 
   const toggleTheme = useCallback(async () => {
     const next = theme === 'dark' ? 'light' : 'dark';
-    try {
-      const result = await persistTheme(next);
-      if (result?.ok === false) return false;
-      return applyTheme(next);
-    } catch {
-      return false;
-    }
+    const revision = ++themeVersionRef.current;
+    const result = await persistTheme(next);
+    if (result?.cancelled || revision !== themeVersionRef.current) return false;
+    return applyTheme(next);
   }, [applyTheme, theme]);
 
   return (

@@ -14,17 +14,14 @@ function credentialLimitError(name, maxBytes) {
 
 function validateCookie(cookie) {
   if (typeof cookie !== 'string') throw new TypeError('cookie must be a string');
-  if (Buffer.byteLength(cookie, 'utf8') > MAX_COOKIE_BYTES) {
-    throw credentialLimitError('cookie', MAX_COOKIE_BYTES);
-  }
+  if (Buffer.byteLength(cookie, 'utf8') > MAX_COOKIE_BYTES) throw credentialLimitError('cookie', MAX_COOKIE_BYTES);
   return cookie;
 }
 
 function normalizeUsername(username) {
-  if (typeof username !== 'string'
-      || username.length > MAX_SSO_USERNAME_CHARS
+  if (typeof username !== 'string' || username.length > MAX_SSO_USERNAME_CHARS
       || Buffer.byteLength(username, 'utf8') > MAX_SSO_USERNAME_BYTES
-      || /[\r\n\0]/.test(username)) {
+      || /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u.test(username)) {
     throw new TypeError('username is invalid');
   }
   return username.trim();
@@ -32,20 +29,39 @@ function normalizeUsername(username) {
 
 function validatePassword(password) {
   if (typeof password !== 'string') throw new TypeError('password is invalid');
-  if (Buffer.byteLength(password, 'utf8') > MAX_SSO_PASSWORD_BYTES) {
-    throw credentialLimitError('password', MAX_SSO_PASSWORD_BYTES);
-  }
+  if (Buffer.byteLength(password, 'utf8') > MAX_SSO_PASSWORD_BYTES) throw credentialLimitError('password', MAX_SSO_PASSWORD_BYTES);
   return password;
 }
 
+// Opaque, locked keyring values must survive migration without decrypting them.
+function validateEncryptedSecret(value) {
+  if (typeof value !== 'string') throw new TypeError('encrypted credential is invalid');
+  if (Buffer.byteLength(value, 'utf8') > Math.ceil(MAX_ENCRYPTED_SECRET_BYTES / 3) * 4
+      || Buffer.from(value, 'base64').length > MAX_ENCRYPTED_SECRET_BYTES) {
+    throw credentialLimitError('encrypted credential', MAX_ENCRYPTED_SECRET_BYTES);
+  }
+  return value;
+}
+
+function persistenceError(result) {
+  const error = new Error('Credential persistence failed');
+  error.code = result?.errorCode || 'SETTINGS_SAVE_FAILED';
+  return error;
+}
+
 class CredentialStore {
-  constructor({ safeStorage, settings, persist, userDataPath, onWarning = () => {} }) {
+  constructor({ safeStorage, profileId, readSecrets, commitSecrets, userDataPath, onWarning = () => {} }) {
+    if (typeof readSecrets !== 'function' || typeof commitSecrets !== 'function') {
+      throw new TypeError('readSecrets and commitSecrets must be functions');
+    }
     this.safeStorage = safeStorage;
-    this.settings = settings;
-    this.persist = persist;
+    this.profileId = profileId;
+    this.readSecrets = readSecrets;
+    this.commitSecrets = commitSecrets;
     this.userDataPath = userDataPath;
     this.onWarning = onWarning;
     this.ephemeralCookie = '';
+    this.cookieRevoked = false;
   }
 
   isEncryptionAvailable() {
@@ -56,17 +72,16 @@ class CredentialStore {
         if (backend === 'basic_text' || backend === 'unknown') return false;
       }
       return true;
-    } catch (_) {
-      return false;
-    }
+    } catch (_) { return false; }
   }
 
-  _encrypt(value) {
+  seal(value) {
     if (!this.isEncryptionAvailable()) {
       const error = new Error('OS credential encryption is unavailable');
       error.code = 'SECURE_STORAGE_UNAVAILABLE';
       throw error;
     }
+    if (typeof value !== 'string') throw new TypeError('secret must be a string');
     const encrypted = this.safeStorage.encryptString(value);
     if (!Buffer.isBuffer(encrypted) || encrypted.length > MAX_ENCRYPTED_SECRET_BYTES) {
       throw credentialLimitError('encrypted credential', MAX_ENCRYPTED_SECRET_BYTES);
@@ -74,148 +89,105 @@ class CredentialStore {
     return encrypted.toString('base64');
   }
 
-  _decrypt(value) {
-    if (!value || !this.isEncryptionAvailable()) return '';
-    if (typeof value !== 'string'
-        || Buffer.byteLength(value, 'ascii') > MAX_ENCRYPTED_SECRET_BYTES * 2) {
-      throw credentialLimitError('encrypted credential', MAX_ENCRYPTED_SECRET_BYTES * 2);
-    }
-    const encrypted = Buffer.from(value, 'base64');
-    if (encrypted.length > MAX_ENCRYPTED_SECRET_BYTES) {
-      throw credentialLimitError('encrypted credential', MAX_ENCRYPTED_SECRET_BYTES);
-    }
-    return this.safeStorage.decryptString(encrypted);
-  }
-
-  _commit(patch, removed = []) {
-    const previous = {};
-    for (const key of [...Object.keys(patch), ...removed]) {
-      previous[key] = { exists: Object.hasOwn(this.settings, key), value: this.settings[key] };
-    }
-    Object.assign(this.settings, patch);
-    for (const key of removed) delete this.settings[key];
-    try {
-      this.persist(this.settings);
-    } catch (error) {
-      for (const [key, snapshot] of Object.entries(previous)) {
-        if (snapshot.exists) this.settings[key] = snapshot.value;
-        else delete this.settings[key];
-      }
+  unseal(value) {
+    validateEncryptedSecret(value);
+    if (!this.isEncryptionAvailable()) {
+      const error = new Error('OS credential encryption is unavailable');
+      error.code = 'SECURE_STORAGE_UNAVAILABLE';
       throw error;
     }
+    if (!value || value.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) {
+      throw new TypeError('encrypted credential is invalid');
+    }
+    return this.safeStorage.decryptString(Buffer.from(value, 'base64'));
   }
 
-  _decodeLegacyXor(value) {
-    if (typeof value !== 'string'
-        || Buffer.byteLength(value, 'ascii') > MAX_ENCRYPTED_SECRET_BYTES * 2) {
-      throw credentialLimitError('legacy credential', MAX_ENCRYPTED_SECRET_BYTES * 2);
-    }
-    const key = crypto.createHash('md5').update(this.userDataPath).digest();
-    const bytes = Buffer.from(value.slice(4), 'base64');
-    for (let index = 0; index < bytes.length; index += 1) bytes[index] ^= key[index % key.length];
-    return bytes.toString('utf8');
+  _commit(patch) {
+    const result = this.commitSecrets(this.cookieRevoked ? { ...patch, savedCookieEncrypted: '' } : patch);
+    if (result?.state !== 'committed' || result.durable !== true) throw persistenceError(result);
+    return result;
   }
 
-  migrateLegacySecrets() {
-    const patch = {};
-    const removed = [];
-
-    if (this.settings.savedCookie) {
-      try {
-        validateCookie(this.settings.savedCookie);
-        this.ephemeralCookie = this.settings.savedCookie;
-        if (this.isEncryptionAvailable()) {
-          patch.savedCookieEncrypted = this._encrypt(this.settings.savedCookie);
-        } else {
-          this.onWarning('Removed a plaintext saved Cookie because OS encryption is unavailable');
-        }
-      } catch (error) {
-        this.onWarning(`Removed an invalid plaintext saved Cookie: ${error.message}`);
-      }
-      removed.push('savedCookie');
+  static migrateLegacySecrets(options, raw) {
+    const policy = new CredentialStore({ ...options, profileId: 'default', readSecrets: () => ({}), commitSecrets: () => {} });
+    const secrets = {
+      ssoUsername: normalizeUsername(raw.ssoUsername ?? ''),
+      ssoPassword: '',
+      savedCookieEncrypted: validateEncryptedSecret(raw.savedCookieEncrypted ?? ''),
+    };
+    let ephemeralCookie = '';
+    const password = raw.ssoPassword ?? '';
+    if (typeof password !== 'string') throw new TypeError('password is invalid');
+    if (password.startsWith('xor:')) {
+      validateEncryptedSecret(password.slice(4));
+      const key = crypto.createHash('md5').update(options.userDataPath).digest();
+      const bytes = Buffer.from(password.slice(4), 'base64');
+      for (let index = 0; index < bytes.length; index += 1) bytes[index] ^= key[index % key.length];
+      const plaintext = validatePassword(bytes.toString('utf8'));
+      if (policy.isEncryptionAvailable()) secrets.ssoPassword = policy.seal(plaintext);
+      else policy.onWarning('Removed a legacy-obfuscated SSO password because OS encryption is unavailable');
+    } else {
+      secrets.ssoPassword = validateEncryptedSecret(password);
     }
-
-    if (this.settings.ssoPassword?.startsWith('xor:')) {
-      try {
-        if (!this.isEncryptionAvailable()) throw new Error('OS encryption is unavailable');
-        const legacyPassword = validatePassword(this._decodeLegacyXor(this.settings.ssoPassword));
-        patch.ssoPassword = this._encrypt(legacyPassword);
-      } catch (error) {
-        patch.ssoPassword = '';
-        this.onWarning(`Removed a legacy-obfuscated SSO password: ${error.message}`);
-      }
+    if (!secrets.savedCookieEncrypted && Object.hasOwn(raw, 'savedCookie')) {
+      ephemeralCookie = validateCookie(raw.savedCookie);
+      if (policy.isEncryptionAvailable()) secrets.savedCookieEncrypted = policy.seal(ephemeralCookie);
+      else policy.onWarning('Removed a plaintext saved Cookie because OS encryption is unavailable');
     }
+    return { secrets, ephemeralCookie };
+  }
 
-    if (this.settings.ssoUsername) {
-      try {
-        const normalizedUsername = normalizeUsername(this.settings.ssoUsername);
-        if (normalizedUsername !== this.settings.ssoUsername) patch.ssoUsername = normalizedUsername;
-      } catch (error) {
-        patch.ssoUsername = '';
-        this.onWarning(`Removed an invalid SSO username: ${error.message}`);
-      }
-    }
-
-    if (Object.keys(patch).length > 0 || removed.length > 0) this._commit(patch, removed);
+  restoreEphemeralCookie(cookie) {
+    this.ephemeralCookie = validateCookie(cookie);
+    this.cookieRevoked = false;
   }
 
   getCookie() {
+    if (this.cookieRevoked) return '';
     if (this.ephemeralCookie) return this.ephemeralCookie;
-    try {
-      return validateCookie(this._decrypt(this.settings.savedCookieEncrypted));
-    } catch (error) {
-      this.onWarning(`Saved Cookie could not be decrypted: ${error.message}`);
-      return '';
-    }
+    const encrypted = this.readSecrets().savedCookieEncrypted;
+    if (!encrypted) return '';
+    try { return validateCookie(this.unseal(encrypted)); }
+    catch (_) { this.onWarning('Saved Cookie could not be decrypted'); return ''; }
   }
 
   saveCookie(cookie) {
     if (cookie === '') return this.clearCookie();
     validateCookie(cookie);
-    if (!this.isEncryptionAvailable()) {
-      this._commit({ savedCookieEncrypted: '' }, ['savedCookie']);
-      this.ephemeralCookie = cookie;
-      return false;
-    }
-    const encrypted = this._encrypt(cookie);
-    this._commit({ savedCookieEncrypted: encrypted }, ['savedCookie']);
+    const encrypted = this.isEncryptionAvailable() ? this.seal(cookie) : '';
+    this._commit({ savedCookieEncrypted: encrypted });
     this.ephemeralCookie = cookie;
-    return true;
+    this.cookieRevoked = false;
+    return Boolean(encrypted);
   }
 
   clearCookie() {
-    this._commit({ savedCookieEncrypted: '' }, ['savedCookie']);
+    // Real authorization revocation is memory-first even when the root is locked.
+    this.cookieRevoked = true;
     this.ephemeralCookie = '';
+    this._commit({ savedCookieEncrypted: '' });
     return true;
   }
 
   getSsoStatus() {
+    const secrets = this.readSecrets();
     let username = '';
-    try { username = normalizeUsername(this.settings.ssoUsername || ''); } catch (_) {}
-    return {
-      username,
-      hasPassword: Boolean(this.settings.ssoPassword),
-      storageAvailable: this.isEncryptionAvailable(),
-    };
+    try { username = normalizeUsername(secrets.ssoUsername || ''); } catch (_) {}
+    return { profileId: this.profileId, username, hasPassword: Boolean(secrets.ssoPassword), storageAvailable: this.isEncryptionAvailable() };
   }
 
   getSsoPassword() {
-    if (!this.settings.ssoPassword || this.settings.ssoPassword.startsWith('xor:')) return '';
-    try {
-      return validatePassword(this._decrypt(this.settings.ssoPassword));
-    } catch (error) {
-      this.onWarning(`SSO password could not be decrypted: ${error.message}`);
-      return '';
-    }
+    const password = this.readSecrets().ssoPassword;
+    if (!password || password.startsWith('xor:')) return '';
+    try { return validatePassword(this.unseal(password)); }
+    catch (_) { this.onWarning('SSO password could not be decrypted'); return ''; }
   }
 
   saveSso({ username, password, clearPassword = false }) {
-    const normalizedUsername = normalizeUsername(username);
+    const patch = { ssoUsername: normalizeUsername(username) };
     if (password !== undefined) validatePassword(password);
-
-    const patch = { ssoUsername: normalizedUsername };
     if (clearPassword) patch.ssoPassword = '';
-    else if (password) patch.ssoPassword = this._encrypt(password);
+    else if (password) patch.ssoPassword = this.seal(password);
     this._commit(patch);
     return this.getSsoStatus();
   }
@@ -227,10 +199,6 @@ class CredentialStore {
 }
 
 module.exports = {
-  CredentialStore,
-  MAX_COOKIE_BYTES,
-  MAX_ENCRYPTED_SECRET_BYTES,
-  MAX_SSO_PASSWORD_BYTES,
-  MAX_SSO_USERNAME_BYTES,
-  validateCookie,
+  CredentialStore, MAX_COOKIE_BYTES, MAX_ENCRYPTED_SECRET_BYTES, MAX_SSO_PASSWORD_BYTES,
+  MAX_SSO_USERNAME_BYTES, normalizeUsername, validateCookie, validateEncryptedSecret,
 };

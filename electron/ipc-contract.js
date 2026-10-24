@@ -1,0 +1,54 @@
+'use strict';
+
+const { redactLogMessage } = require('./log-redaction');
+
+const BUSINESS_CODES = new Set([
+  'VALIDATION_FAILED', 'INVALID_ARGUMENT', 'AUTH_REQUIRED', 'PROXY_START_FAILED',
+  'PROXY_STOP_FAILED', 'OPERATION_IN_PROGRESS', 'SHUTTING_DOWN',
+  'SECURE_STORAGE_UNAVAILABLE', 'SETTINGS_WRITE_FAILED', 'SSH_CONFIG_INVALID',
+  'CREDENTIAL_TOO_LARGE', 'PROFILE_CHANGED', 'DRAFT_CHANGED', 'OPERATION_CANCELLED',
+  'LOGIN_RESET_FAILED', 'AUTH_PERSIST_FAILED', 'SSH_KEY_INVALID', 'KEY_TRANSACTION_FAILED',
+  'SETTINGS_LOCKED', 'SETTINGS_DURABILITY_UNCERTAIN', 'SETTINGS_COMMIT_UNKNOWN',
+  'SETTINGS_RECOVERY_REQUIRED', 'PROFILE_LIMIT', 'PROFILE_NOT_FOUND', 'PROFILE_LAST',
+  'PROFILE_ALIAS_CONFLICT', 'PROFILE_NAME_INVALID',
+  'SSH_KEY_MISSING', 'SSH_KEY_PERMISSIONS', 'SSH_KEY_FINGERPRINT_MISMATCH',
+  'SETTINGS_INVALID', 'SETTINGS_VERSION_UNSUPPORTED', 'SETTINGS_FILE_TOO_LARGE',
+  'SETTINGS_LOAD_FAILED', 'SETTINGS_SAVE_FAILED', 'SETTINGS_MIGRATION_FAILED',
+  'SSH_CONFIG_CHANGED', 'SSH_ALIAS_CONFLICT',
+  'HISTORY_STORAGE_FAILED', 'HISTORY_WRITE_FAILED', 'HISTORY_LOAD_FAILED', 'HISTORY_INVALID',
+  'EXPORT_FAILED',
+  'AUTOSTART_CONFLICT', 'AUTOSTART_UNAVAILABLE', 'AUTOSTART_FAILED', 'AUTOSTART_UPDATE_FAILED',
+  'NETWORK_UNAVAILABLE', 'TLS_FAILED', 'WSS_FAILED', 'TIMEOUT', 'PORT_IN_USE', 'RECOVERY_EXHAUSTED',
+  'KEY_BACKUP_INVALID', 'KEY_ROLLBACK_FAILED',
+  'ONBOARDING_NOT_READY',
+  'UPDATE_NETWORK', 'UPDATE_NO_RELEASE', 'UPDATE_INVALID_METADATA', 'UPDATE_VERSION_REJECTED',
+  'UPDATE_CHECKSUM_MISMATCH', 'UPDATE_SIGNATURE_INVALID', 'UPDATE_PERMISSION_DENIED',
+  'UPDATE_PREPARATION_FAILED', 'UPDATE_INSTALL_FAILED', 'UPDATE_RESTART_REQUIRED', 'UPDATE_MANUAL_ONLY',
+]);
+
+class ServiceError extends Error {
+  constructor(code, fieldErrors) {
+    super(code);
+    this.code = code;
+    if (fieldErrors) this.fieldErrors = fieldErrors;
+  }
+}
+
+function createTrustedHandler(assertTrustedIpc, handler, logError) {
+  return async (event, ...args) => {
+    try {
+      assertTrustedIpc(event);
+      const value = await handler(...args);
+      return { ok: true, value: value === undefined ? null : value };
+    } catch (error) {
+      const code = BUSINESS_CODES.has(error?.code) ? error.code : 'INTERNAL_ERROR';
+      if (code === 'INTERNAL_ERROR') logError(redactLogMessage(error?.stack || String(error)));
+      return { ok: false, error: {
+        code,
+        ...(code === 'VALIDATION_FAILED' && error.fieldErrors ? { fieldErrors: error.fieldErrors } : {}),
+      } };
+    }
+  };
+}
+
+module.exports = { ServiceError, createTrustedHandler };

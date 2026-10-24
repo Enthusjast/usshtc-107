@@ -1,5 +1,5 @@
 import {
-  IconDashboard, IconTerminal, IconScrollText, IconSettings,
+  IconDashboard, IconTerminal, IconScrollText, IconSettings, IconActivity,
   IconSun, IconMoon, IconGlobe,
 } from './Icons';
 
@@ -7,6 +7,7 @@ const NAV_ITEMS = [
   { id: 'dashboard', key: 'dashboard', Icon: IconDashboard },
   { id: 'sessions',  key: 'sessions',  Icon: IconTerminal },
   { id: 'logs',      key: 'logs',      Icon: IconScrollText },
+  { id: 'diagnostics', key: 'diagnostics', Icon: IconActivity },
 ];
 
 const BOTTOM_ITEMS = [
@@ -14,14 +15,14 @@ const BOTTOM_ITEMS = [
 ];
 
 export default function Sidebar({
-  activeView, onNavigate, collapsed, onToggle,
-  theme, onToggleTheme, locale, onToggleLocale, t,
+  activeView, onNavigate, collapsed, onToggle, navigationRef, modal = false,
+  theme, onToggleTheme, locale, onToggleLocale, preferencesDisabled, t,
 }) {
   const isDark = theme === 'dark';
   const localeLabel = locale === 'zh' ? 'EN' : '中';
 
   return (
-    <aside className={`sidebar ${collapsed ? 'collapsed' : ''}`} aria-label={t('appNavigation')}>
+    <aside ref={navigationRef} className={`sidebar ${collapsed ? 'collapsed' : ''}`} role={modal ? 'dialog' : undefined} aria-modal={modal ? true : undefined} aria-label={t('appNavigation')}>
       <button
         type="button"
         className="sidebar-brand"
@@ -55,6 +56,7 @@ export default function Sidebar({
         type="button"
         className="sidebar-theme-toggle"
         onClick={onToggleTheme}
+        disabled={preferencesDisabled}
         title={isDark ? t('switchToLight') : t('switchToDark')}
         aria-label={isDark ? t('switchToLight') : t('switchToDark')}
       >
@@ -69,6 +71,7 @@ export default function Sidebar({
         type="button"
         className="sidebar-theme-toggle"
         onClick={onToggleLocale}
+        disabled={preferencesDisabled}
         title={locale === 'zh' ? 'Switch to English' : '切换到中文'}
         aria-label={locale === 'zh' ? 'Switch to English' : '切换到中文'}
       >

@@ -13,7 +13,7 @@ vi.mock('../src/lib/electron', () => electronMocks);
 
 function ThemeProbe() {
   const { theme, toggleTheme } = useTheme();
-  return <button type="button" onClick={toggleTheme}>{theme}</button>;
+  return <button type="button" onClick={() => { void toggleTheme().catch(() => {}); }}>{theme}</button>;
 }
 
 function renderTheme() {
@@ -31,7 +31,7 @@ describe('Theme context persistence', () => {
     emitThemeChange = undefined;
     document.documentElement.removeAttribute('data-theme');
     electronMocks.getTheme.mockReset().mockResolvedValue('dark');
-    electronMocks.setTheme.mockReset().mockResolvedValue({ ok: true });
+    electronMocks.setTheme.mockReset().mockResolvedValue({});
     electronMocks.onThemeChanged.mockReset().mockImplementation((callback) => {
       emitThemeChange = callback;
       return vi.fn();
@@ -81,5 +81,19 @@ describe('Theme context persistence', () => {
 
     expect(await screen.findByRole('button', { name: 'light' })).toBeInTheDocument();
     expect(document.documentElement).toHaveAttribute('data-theme', 'light');
+  });
+
+  it('does not apply a stale initial theme read after a preference save has already started', async () => {
+    let finishRead;
+    let finishWrite;
+    electronMocks.getTheme.mockImplementation(() => new Promise((resolve) => { finishRead = resolve; }));
+    electronMocks.setTheme.mockImplementation(() => new Promise((resolve) => { finishWrite = resolve; }));
+    renderTheme();
+    fireEvent.click(screen.getByRole('button', {name:'dark'}));
+    finishRead('light');
+    await waitFor(() => expect(electronMocks.setTheme).toHaveBeenCalledWith('light'));
+    expect(screen.getByRole('button', {name:'dark'})).toBeInTheDocument();
+    finishWrite({});
+    expect(await screen.findByRole('button', {name:'light'})).toBeInTheDocument();
   });
 });

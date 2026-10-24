@@ -1,366 +1,297 @@
+import { APP_DEFAULTS, PROFILE_DEFAULTS, PROFILE_SETTING_KEYS, validateSettingsPatch } from '../../shared/settings-schema.mjs';
+import { formatApiError, formatValidationError } from '../lib/api-errors';
 import { useState, useEffect, useCallback, useRef } from 'react';
 import {
-  getSettings,
-  saveSettings,
-  getRuntimeInfo,
-  generateSshConfig,
-  saveSsoCredentials,
-  getSsoCredentials,
-  clearSsoCredentials,
-  supportsClearSsoCredentials,
-  getSshKeyInfo,
-  copyToClipboard,
+  getSettings, saveSettings, saveAppSettings, getRuntimeInfo,
+  saveSsoCredentials, getSsoCredentials, clearSsoCredentials,
+  restartProxy,
 } from '../lib/electron';
 import { useToast } from '../components/Toast';
 import LoadError from '../components/LoadError';
+import ProfileManagement from '../components/ProfileManagement';
+import SshConfigPreview from '../components/SshConfigPreview';
+import AutostartControl from '../components/AutostartControl';
+import SshKeyPanel from '../components/SshKeyPanel';
+import SetupResume from '../components/SetupResume';
+import UpdatePanel from '../components/UpdatePanel';
 import { useLocale } from '../i18n/LocaleContext';
-import { IconSettings, IconServer, IconFileEdit, IconInfo, IconGlobe, IconKey, IconClipboard } from '../components/Icons';
+import { IconSettings, IconServer, IconFileEdit, IconInfo, IconGlobe, IconKey } from '../components/Icons';
+import { useRuntime, sameScope } from '../contexts/RuntimeContext';
 
-const DEFAULT_SETTINGS = {
-  port: 3000,
-  host: '127.0.0.1',
-  cluster: 'training',
-  loginNode: '11.11.10.202',
-  cols: 80,
-  rows: 24,
-  useRoot: false,
-  autoConnect: true,
-  startMinimized: false,
-  theme: 'dark',
-  sshAlias: 'usshtc107',
-};
-
-const TOKEN_PATTERN = /^[A-Za-z0-9._-]+$/;
-const EDITABLE_SETTING_KEYS = [
-  'host',
-  'port',
-  'cluster',
-  'loginNode',
-  'cols',
-  'rows',
-  'useRoot',
-  'autoConnect',
-  'startMinimized',
-  'sshAlias',
-];
-
-function isValidHost(value) {
-  const host = String(value || '').trim();
-  if (!host || host.length > 253 || /[\r\n\0\s]/.test(host)) return false;
-  if (host.includes(':')) {
-    try {
-      return new URL(`http://[${host}]/`).hostname.length > 0;
-    } catch {
-      return false;
-    }
-  }
-  if (host === 'localhost') return true;
-  return host.split('.').every((label) => (
-    label.length > 0
-    && label.length <= 63
-    && /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(label)
-  ));
-}
-
-function validateSettings(settings, t) {
-  const errors = {};
-  const port = Number(settings.port);
-  const cols = Number(settings.cols);
-  const rows = Number(settings.rows);
-  const host = String(settings.host || '').trim();
-  const cluster = String(settings.cluster || '').trim();
-  const loginNode = String(settings.loginNode || '').trim();
-  const sshAlias = String(settings.sshAlias || '').trim();
-
-  if (!host) errors.host = t('fieldRequired');
-  else if (!isValidHost(host)) errors.host = t('hostFormat');
-  if (!Number.isInteger(port) || port < 1 || port > 65535) errors.port = t('portRange');
-  if (!cluster) errors.cluster = t('fieldRequired');
-  else if (cluster.length > 128 || !TOKEN_PATTERN.test(cluster)) errors.cluster = t('clusterFormat');
-  if (!loginNode) errors.loginNode = t('fieldRequired');
-  else if (!isValidHost(loginNode)) errors.loginNode = t('hostFormat');
-  if (!Number.isInteger(cols) || cols < 40 || cols > 500) errors.cols = t('colsRange');
-  if (!Number.isInteger(rows) || rows < 10 || rows > 200) errors.rows = t('rowsRange');
-  if (!sshAlias) errors.sshAlias = t('fieldRequired');
-  else if (sshAlias.length > 64 || !TOKEN_PATTERN.test(sshAlias)) errors.sshAlias = t('sshAliasFormat');
-
-  return errors;
-}
+const SETTINGS_DEFAULTS = { ...APP_DEFAULTS, ...PROFILE_DEFAULTS };
+const APP_PREFERENCE_KEYS = ['startMinimized', 'reconnectOnResume', 'autoCheckUpdates', 'notifyConnections', 'notifyAuth', 'notifyRecovery', 'notifyUpdates'];
+const EDITABLE_SETTING_KEYS = [...PROFILE_SETTING_KEYS, ...APP_PREFERENCE_KEYS];
+const CONNECTION_SETTING_KEYS = ['host', 'port', 'cluster', 'loginNode', 'cols', 'rows', 'useRoot', 'sshAlias'];
 
 function FieldError({ id, message }) {
   if (!message) return null;
   return <div id={id} className="field-error">{message}</div>;
 }
 
-export default function SettingsView({ onDirtyChange, onBusyChange }) {
+export default function SettingsView({ onDirtyChange, onDraftChange, onBusyChange, initialSection, onNavigate }) {
   const pushToast = useToast();
   const { t, locale, setLocale } = useLocale();
-  const [settings, setSettings] = useState({ ...DEFAULT_SETTINGS });
+  const { snapshot, scope, flushDraft, getDraftRevision, getScope, retry: refreshRuntime } = useRuntime();
+  const draftRevision = useRef(getDraftRevision?.() ?? 0);
+  const scopeRef = useRef(scope);
+  const alive = useRef(true);
+  const draftCallbackRef = useRef(onDraftChange);
+  draftCallbackRef.current = onDraftChange;
+  scopeRef.current = scope;
+  const locked = Boolean(snapshot?.storageErrorCode);
+  const needsRestart = snapshot?.needsRestart === true;
+  const [settings, setSettings] = useState({ ...SETTINGS_DEFAULTS });
   const [runtime, setRuntime] = useState(null);
   const [loadState, setLoadState] = useState('loading');
   const [saveState, setSaveState] = useState('idle');
+  const [profileSaveState, setProfileSaveState] = useState('idle');
+  const [appSaveState, setAppSaveState] = useState('idle');
   const [settingsDirty, setSettingsDirty] = useState(false);
-  const [needsRestart, setNeedsRestart] = useState(false);
+  const [managementDirty, setManagementDirty] = useState(false);
+  const [managementReset, setManagementReset] = useState(0);
   const [fieldErrors, setFieldErrors] = useState({});
-  const [sshConfigResult, setSshConfigResult] = useState(null);
+  const [configRevision, setConfigRevision] = useState(0);
   const [generating, setGenerating] = useState(false);
+  const [autostartBusy, setAutostartBusy] = useState(false);
+  const [keyBusy, setKeyBusy] = useState(false);
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const [consumingDraft, setConsumingDraft] = useState(false);
   const [ssoUsername, setSsoUsername] = useState('');
   const [initialSsoUsername, setInitialSsoUsername] = useState('');
   const [ssoPassword, setSsoPassword] = useState('');
   const [passwordDirty, setPasswordDirty] = useState(false);
   const [hasStoredPassword, setHasStoredPassword] = useState(false);
-  const [secureStorageAvailable, setSecureStorageAvailable] = useState(true);
+  const [secureStorageAvailable, setSecureStorageAvailable] = useState(false);
   const [clearingCredentials, setClearingCredentials] = useState(false);
-  const [sshPubKey, setSshPubKey] = useState('');
-  const [sshKeyPath, setSshKeyPath] = useState('');
-  const [keyCopied, setKeyCopied] = useState(false);
+  const [credentialError, setCredentialError] = useState(null);
   const dirtySettingKeysRef = useRef(new Set());
-  const keyCopyTimerRef = useRef(null);
 
   const credentialsDirty = ssoUsername !== initialSsoUsername || passwordDirty;
-  const dirty = settingsDirty || credentialsDirty;
+  const dirty = settingsDirty || credentialsDirty || managementDirty;
   const isSaving = saveState === 'saving';
-  const busy = isSaving || generating || clearingCredentials;
-  const canClearCredentials = supportsClearSsoCredentials() && (hasStoredPassword || Boolean(ssoUsername));
+  const busy = isSaving || generating || clearingCredentials || autostartBusy || keyBusy || updateBusy || consumingDraft;
+  const canClearCredentials = hasStoredPassword || Boolean(ssoUsername);
+  const currentScope = () => getScope?.() ?? scopeRef.current;
+  const accepts = (origin) => alive.current && sameScope(currentScope(), origin);
 
-  const loadSettingsData = useCallback(async () => {
-    setLoadState('loading');
-    const [settingsResult, runtimeResult, keyResult, credentialsResult] = await Promise.allSettled([
-      getSettings(),
-      getRuntimeInfo(),
-      getSshKeyInfo(),
-      getSsoCredentials(),
-    ]);
-
-    const loadedSettings = settingsResult.status === 'fulfilled' ? settingsResult.value : null;
-    const loadedRuntime = runtimeResult.status === 'fulfilled' ? runtimeResult.value : null;
-    const keyInfo = keyResult.status === 'fulfilled' ? keyResult.value : null;
-    const credentials = credentialsResult.status === 'fulfilled' ? credentialsResult.value : null;
-
-    if (!loadedSettings || !loadedRuntime || !keyInfo || !credentials) {
-      setLoadState('error');
-      return;
-    }
-
-    setSettings((prev) => ({ ...prev, ...loadedSettings }));
-    setRuntime(loadedRuntime);
-    setSshPubKey(keyInfo.publicKey || '');
-    setSshKeyPath(keyInfo.privateKeyPath || '');
+  const applyCredentials = (credentials) => {
     setSsoUsername(credentials.username || '');
     setInitialSsoUsername(credentials.username || '');
     setSsoPassword('');
     setPasswordDirty(false);
     setHasStoredPassword(Boolean(credentials.hasPassword));
     setSecureStorageAvailable(credentials.storageAvailable !== false);
+    setCredentialError(null);
+  };
+
+  const loadSettingsData = useCallback(async (targetScope = scopeRef.current, preserveView = false) => {
+    if (!accepts(targetScope)) return false;
+    if (!preserveView) setLoadState('loading');
+    const revision = draftRevision.current;
+    const [settingsResult, runtimeResult, credentialsResult] = await Promise.allSettled([
+      getSettings(targetScope), getRuntimeInfo(), getSsoCredentials(targetScope),
+    ]);
+    if (!accepts(targetScope) || draftRevision.current !== revision) return false;
+    if (settingsResult.status !== 'fulfilled') { setLoadState('error'); return false; }
+    setSettings({ ...SETTINGS_DEFAULTS, ...settingsResult.value });
+    setRuntime(runtimeResult.status === 'fulfilled' ? runtimeResult.value : null);
+    if (credentialsResult.status === 'fulfilled' && credentialsResult.value.profileId === targetScope.profileId) {
+      applyCredentials(credentialsResult.value);
+    } else setCredentialError(credentialsResult.status === 'rejected' ? credentialsResult.reason : { code: 'PROFILE_CHANGED' });
     dirtySettingKeysRef.current.clear();
     setSettingsDirty(false);
     setFieldErrors({});
     setSaveState('idle');
     setLoadState('ready');
-  }, []);
+    return credentialsResult.status === 'fulfilled' && credentialsResult.value.profileId === targetScope.profileId;
+  }, [getScope]);
 
   useEffect(() => {
-    loadSettingsData();
-  }, [loadSettingsData]);
-
+    alive.current = true;
+    return () => { alive.current = false; };
+  }, []);
+  useEffect(() => {
+    if (scope && !dirty) void loadSettingsData(scope, true);
+  }, [scope?.profileId, scope?.epoch, locked]);
   useEffect(() => {
     onDirtyChange?.(dirty);
-  }, [dirty, onDirtyChange]);
-
-  useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
-
-  useEffect(() => {
-    onBusyChange?.(busy);
-  }, [busy, onBusyChange]);
-
-  useEffect(() => () => onBusyChange?.(false), [onBusyChange]);
-
+    onDraftChange?.({ dirty, draftRevision: draftRevision.current });
+  }, [dirty, onDirtyChange, onDraftChange]);
   useEffect(() => () => {
-    if (keyCopyTimerRef.current !== null) clearTimeout(keyCopyTimerRef.current);
+    draftCallbackRef.current?.({ dirty: false, draftRevision: draftRevision.current });
   }, []);
-
+  useEffect(() => { onBusyChange?.(busy); }, [busy, onBusyChange]);
+  useEffect(() => () => onBusyChange?.(false), [onBusyChange]);
   useEffect(() => {
-    if (!dirty) return undefined;
-    const warnBeforeUnload = (event) => {
-      event.preventDefault();
-      event.returnValue = '';
-    };
-    window.addEventListener('beforeunload', warnBeforeUnload);
-    return () => window.removeEventListener('beforeunload', warnBeforeUnload);
-  }, [dirty]);
+    if (!['ssh-config', 'updates'].includes(initialSection) || loadState !== 'ready') return;
+    const frame = requestAnimationFrame(() => {
+      const heading = document.getElementById(`${initialSection}-heading`);
+      heading?.scrollIntoView?.({ block: 'start' });
+      heading?.focus({ preventScroll: true });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [initialSection, loadState]);
 
-  const markEdited = () => setSaveState('idle');
-
+  const markEdited = (nextDirty = true) => {
+    draftRevision.current += 1;
+    onDraftChange?.({ dirty: nextDirty, draftRevision: draftRevision.current });
+    setSaveState('idle');
+  };
   const update = (key, value) => {
     dirtySettingKeysRef.current.add(key);
     setSettings((prev) => ({ ...prev, [key]: value }));
     setSettingsDirty(true);
+    if (PROFILE_SETTING_KEYS.includes(key)) setProfileSaveState('idle');
+    else setAppSaveState('idle');
     setFieldErrors((prev) => ({ ...prev, [key]: undefined }));
-    if (key === 'host' || key === 'port' || key === 'sshAlias') setSshConfigResult(null);
+    if (CONNECTION_SETTING_KEYS.includes(key)) setConfigRevision((value) => value + 1);
     markEdited();
   };
-
   const updateSsoUsername = (value) => {
     setSsoUsername(value);
-    markEdited();
+    markEdited(settingsDirty || managementDirty || value !== initialSsoUsername || passwordDirty);
   };
-
   const updateSsoPassword = (value) => {
     setSsoPassword(value);
     setPasswordDirty(value.length > 0);
-    markEdited();
+    markEdited(settingsDirty || managementDirty || ssoUsername !== initialSsoUsername || value.length > 0);
+  };
+  const consumeDraft = async (result) => {
+    if (!alive.current || result?.cancelled || result?.consumedDraftRevision !== draftRevision.current) return;
+    const revision = draftRevision.current;
+    const origin = currentScope();
+    setConsumingDraft(true);
+    try {
+      // The IPC reply can beat this action's final runtime-state event.
+      await refreshRuntime();
+      if (!alive.current || currentScope()?.profileId !== origin?.profileId || revision !== draftRevision.current) return;
+      const applied = await loadSettingsData(currentScope(), true);
+      if (applied && alive.current && revision === draftRevision.current) {
+        setManagementDirty(false);
+        setManagementReset((value) => value + 1);
+        onDraftChange?.({ dirty: false, draftRevision: revision });
+      }
+    } finally { if (alive.current) setConsumingDraft(false); }
   };
 
   const handleSave = async () => {
-    const errors = settingsDirty ? validateSettings(settings, t) : {};
+    if (locked || busy) return;
+    const revision = draftRevision.current;
+    const origin = currentScope();
+    const patch = Object.fromEntries([...dirtySettingKeysRef.current].map((key) => [key, settings[key]]));
+    const validation = validateSettingsPatch(patch, settings);
+    const errors = validation.ok ? {} : Object.fromEntries(Object.entries(validation.fieldErrors).map(([key, code]) => [key, formatValidationError(code, t)]));
     setFieldErrors(errors);
-    if (Object.keys(errors).length > 0) {
-      pushToast('error', t('invalidSettings'), t('fixHighlightedFields'));
-      return;
-    }
-
-    const normalizedSettings = {
-      ...settings,
-      host: String(settings.host).trim(),
-      cluster: String(settings.cluster).trim(),
-      loginNode: String(settings.loginNode).trim(),
-      sshAlias: String(settings.sshAlias).trim(),
-      port: Number(settings.port),
-      cols: Number(settings.cols),
-      rows: Number(settings.rows),
-      useRoot: Boolean(settings.useRoot),
-    };
-    const settingsPatch = Object.fromEntries(
-      [...dirtySettingKeysRef.current].map((key) => [key, normalizedSettings[key]]),
-    );
-
+    if (!validation.ok) { pushToast('error', t('invalidSettings'), t('fixHighlightedFields')); return; }
     setSaveState('saving');
-    let failureTitle = t('settingsSaveFailed');
-    let restartRequired = needsRestart;
-    try {
-      if (Object.keys(settingsPatch).length > 0) {
-        const result = await saveSettings(settingsPatch);
-        if (result?.ok === false) throw new Error(result.error || t('settingsSaveFailed'));
+    let failed = false;
+    let cancelled = false;
+    let credentialsRemaining = credentialsDirty;
+    let managementRemaining = managementDirty;
+    let restartRequired = false;
+    const stillCurrent = () => accepts(origin) && draftRevision.current === revision;
+    const commitPatch = async (keys, save, setState) => {
+      if (!keys.length || cancelled || !stillCurrent()) return;
+      try {
+        await flushDraft();
+        if (!stillCurrent()) return;
+        const changes = Object.fromEntries(keys.map((key) => [key, validation.value[key]]));
+        const result = await save(changes);
+        if (!stillCurrent()) return;
+        if (result?.cancelled) { cancelled = true; return; }
         restartRequired ||= Boolean(result?.needsRestart);
-        setNeedsRestart(restartRequired);
-        setSettings(normalizedSettings);
-        for (const key of Object.keys(settingsPatch)) dirtySettingKeysRef.current.delete(key);
+        keys.forEach((key) => dirtySettingKeysRef.current.delete(key));
+        setSettings((previous) => ({ ...previous, ...changes }));
         setSettingsDirty(dirtySettingKeysRef.current.size > 0);
+        setState('saved');
+      } catch (error) {
+        if (!stillCurrent()) return;
+        failed = true;
+        setState('error');
+        if (error?.fieldErrors) setFieldErrors((previous) => ({ ...previous, ...Object.fromEntries(Object.entries(error.fieldErrors).map(([key, code]) => [key, formatValidationError(code, t)])) }));
+        pushToast('error', t('settingsSaveFailed'), formatApiError(error, t));
       }
-      if (credentialsDirty) {
-        failureTitle = t('credentialsSaveFailed');
-        const credentialResult = await saveSsoCredentials(
-          ssoUsername.trim(),
-          passwordDirty ? ssoPassword : undefined,
-        );
-        if (credentialResult?.ok === false) throw new Error(credentialResult.error || t('credentialsSaveFailed'));
-        if (passwordDirty) setHasStoredPassword(true);
-        setInitialSsoUsername(ssoUsername.trim());
-        setSsoUsername(ssoUsername.trim());
-        setSsoPassword('');
-        setPasswordDirty(false);
+    };
+    try {
+      await commitPatch(Object.keys(patch).filter((key) => PROFILE_SETTING_KEYS.includes(key)), (changes) => saveSettings({ scope: origin, patch: changes }), setProfileSaveState);
+      await commitPatch(Object.keys(patch).filter((key) => !PROFILE_SETTING_KEYS.includes(key)), saveAppSettings, setAppSaveState);
+      if (credentialsDirty && !cancelled && stillCurrent()) {
+        try {
+          await flushDraft();
+          if (!stillCurrent()) return;
+          const result = await saveSsoCredentials({ scope: origin, username: ssoUsername.trim(), ...(passwordDirty ? { password: ssoPassword } : {}) });
+          if (!alive.current || currentScope()?.profileId !== origin.profileId || revision !== draftRevision.current) return;
+          if (result?.cancelled) cancelled = true;
+          else if (accepts(origin) || result?.consumedDraftRevision === revision) {
+            credentialsRemaining = false;
+            if (passwordDirty) setHasStoredPassword(true);
+            setInitialSsoUsername(ssoUsername.trim());
+            setSsoUsername(ssoUsername.trim());
+            setSsoPassword('');
+            setPasswordDirty(false);
+            if (result?.consumedDraftRevision === revision) {
+              await consumeDraft(result);
+              managementRemaining = false;
+            }
+          }
+        } catch (error) {
+          if (!alive.current || currentScope()?.profileId !== origin.profileId) return;
+          failed = true;
+          pushToast('error', t('credentialsSaveFailed'), formatApiError(error, t));
+        }
       }
-      setSaveState('saved');
-      if (restartRequired) {
-        pushToast('warn', t('settingsSaved'), t('restartToApply'));
-      } else {
-        pushToast('success', t('settingsSaved'));
-      }
-    } catch (error) {
-      setSaveState('idle');
-      pushToast('error', failureTitle, error?.message || t('unknownError'));
+      if (!alive.current || currentScope()?.profileId !== origin.profileId || revision !== draftRevision.current) return;
+      const remaining = dirtySettingKeysRef.current.size > 0 || credentialsRemaining || managementRemaining;
+      onDraftChange?.({ dirty: remaining, draftRevision: revision });
+      setSaveState(failed || cancelled || remaining ? 'idle' : 'saved');
+      if (!failed && !cancelled) pushToast(restartRequired ? 'warn' : 'success', t('settingsSaved'), restartRequired ? t('restartToApply') : undefined);
+    } finally {
+      if (alive.current) setSaveState((previous) => previous === 'saving' ? 'idle' : previous);
     }
   };
 
   const handleReset = () => {
-    setSettings((prev) => {
-      const resetSettings = { ...prev };
-      EDITABLE_SETTING_KEYS.forEach((key) => {
-        resetSettings[key] = DEFAULT_SETTINGS[key];
-      });
-      return resetSettings;
-    });
+    if (locked) return;
+    markEdited();
+    setSettings((previous) => ({ ...previous, ...Object.fromEntries(EDITABLE_SETTING_KEYS.map((key) => [key, SETTINGS_DEFAULTS[key]])) }));
     dirtySettingKeysRef.current = new Set(EDITABLE_SETTING_KEYS);
     setSettingsDirty(true);
-    setSaveState('idle');
+    setProfileSaveState('idle');
+    setAppSaveState('idle');
     setFieldErrors({});
-    setSshConfigResult(null);
+    setConfigRevision((value) => value + 1);
     pushToast('info', t('resetToDefaults'), t('clickSaveToApply'));
   };
 
   const handleClearCredentials = async () => {
-    if (!window.confirm(t('confirmClearCredentials'))) return;
+    if (locked) return;
     setClearingCredentials(true);
+    const origin = currentScope();
     try {
-      const result = await clearSsoCredentials();
-      if (result?.ok === false) throw new Error(result.error || t('clearCredentialsFailed'));
-      setSsoUsername('');
-      setInitialSsoUsername('');
-      setSsoPassword('');
-      setPasswordDirty(false);
-      setHasStoredPassword(false);
-      setSaveState('idle');
+      const revision = draftRevision.current;
+      await flushDraft();
+      if (!accepts(origin)) return;
+      const result = await clearSsoCredentials(origin);
+      if (!alive.current || result?.cancelled || currentScope()?.profileId !== origin.profileId || revision !== draftRevision.current) return;
+      if (!accepts(origin) && result?.consumedDraftRevision !== revision) return;
+      applyCredentials({ username: '', hasPassword: false, storageAvailable: secureStorageAvailable });
+      await consumeDraft(result);
       pushToast('success', t('ssoCredentialsCleared'));
     } catch (error) {
-      pushToast('error', t('clearCredentialsFailed'), error?.message || t('unknownError'));
-    } finally {
-      setClearingCredentials(false);
-    }
+      if (alive.current) pushToast('error', t('clearCredentialsFailed'), formatApiError(error, t));
+    } finally { if (alive.current) setClearingCredentials(false); }
   };
 
-  const handleGenerateSshConfig = async () => {
-    const configKeys = ['host', 'port', 'sshAlias'];
-    if (configKeys.some((key) => dirtySettingKeysRef.current.has(key))) {
-      pushToast('error', t('saveSettingsFirst'), t('saveSshConfigSettingsFirst'));
-      return;
-    }
-    const errors = validateSettings(settings, t);
-    const configErrors = Object.fromEntries(
-      Object.entries(errors).filter(([key]) => ['host', 'port', 'sshAlias'].includes(key)),
-    );
-    if (Object.keys(configErrors).length > 0) {
-      setFieldErrors((prev) => ({ ...prev, ...configErrors }));
-      pushToast('error', t('invalidSettings'), t('fixHighlightedFields'));
-      return;
-    }
-
-    setGenerating(true);
-    setSshConfigResult(null);
+  const retryCredentials = async () => {
+    const origin = currentScope();
     try {
-      const result = await generateSshConfig({
-        host: String(settings.host).trim(),
-        port: Number(settings.port),
-        alias: String(settings.sshAlias).trim(),
-      });
-      setSshConfigResult(result);
-      if (result?.success) {
-        pushToast('success', t('sshConfigWritten'), t('sshNowUse', settings.sshAlias || 'usshtc107'));
-      } else {
-        pushToast('error', t('failed'), t('errorPrefix', result?.error || t('unknownError')));
-      }
+      const value = await getSsoCredentials(origin);
+      if (accepts(origin) && value.profileId === origin.profileId) applyCredentials(value);
     } catch (error) {
-      setSshConfigResult({ success: false, error: error?.message || t('unknownError') });
-      pushToast('error', t('failed'), error?.message || t('unknownError'));
-    } finally {
-      setGenerating(false);
+      if (accepts(origin)) setCredentialError(error);
     }
   };
 
-  const handleCopyPubKey = async () => {
-    if (!sshPubKey) return;
-    const ok = await copyToClipboard(sshPubKey);
-    if (ok === false) {
-      pushToast('error', t('copyFailed'));
-      return;
-    }
-    setKeyCopied(true);
-    pushToast('info', t('copied'));
-    if (keyCopyTimerRef.current !== null) clearTimeout(keyCopyTimerRef.current);
-    keyCopyTimerRef.current = setTimeout(() => {
-      keyCopyTimerRef.current = null;
-      setKeyCopied(false);
-    }, 2000);
-  };
 
   if (loadState === 'loading') {
     return (
@@ -390,9 +321,21 @@ export default function SettingsView({ onDirtyChange, onBusyChange }) {
 
   return (
     <div className="settings-view">
+      {consumingDraft && <p role="status">{t('loadingSettings')}</p>}
+      <SetupResume onNavigate={onNavigate} disabled={busy} />
+      <fieldset className="settings-form-fields" disabled={locked}>
+      <ProfileManagement key={managementReset} disabled={busy || locked || Boolean(snapshot?.operation)} onEdit={markEdited} onDirtyChange={setManagementDirty} onConsumedDraft={consumeDraft} />
       {needsRestart && (
         <div className="settings-warning" role="status">
           {t('proxyRunningRestart')}
+          <button type="button" className="btn" disabled={locked || busy || Boolean(snapshot?.operation)} onClick={async () => {
+            try {
+              await flushDraft();
+              const origin = currentScope();
+              const result = await restartProxy(origin);
+              if (alive.current && currentScope()?.profileId === origin?.profileId) await consumeDraft(result);
+            } catch (error) { pushToast('error', t('actionFailed'), formatApiError(error, t)); }
+          }}>{t('restartAndApply')}</button>
         </div>
       )}
 
@@ -471,6 +414,30 @@ export default function SettingsView({ onDirtyChange, onBusyChange }) {
         </div>
       </section>
 
+      <section className="card" aria-labelledby="os-preferences-heading">
+        <h2 id="os-preferences-heading" className="card-header">
+          <span className="card-header-icon" aria-hidden="true"><IconSettings /></span> {t('osPreferences')}
+        </h2>
+        <AutostartControl scope={scope} getScope={getScope} flushDraft={flushDraft} disabled={locked || isSaving || generating || clearingCredentials || Boolean(snapshot?.operation)} onBusyChange={setAutostartBusy} />
+        <div className="settings-toggle-list">
+          {APP_PREFERENCE_KEYS.filter((key) => key !== 'startMinimized').map((key) => (
+            <div key={key}>
+              <label className="toggle-wrapper" htmlFor={`setting-${key}`}>
+                <span className="toggle-label">{t(key)}</span>
+                <span className="toggle-switch">
+                  <input id={`setting-${key}`} type="checkbox" checked={settings[key] === true} onChange={(event) => update(key, event.target.checked)} disabled={busy} aria-describedby={key === 'reconnectOnResume' ? 'reconnect-help' : key === 'autoCheckUpdates' ? 'auto-check-updates-help' : undefined} />
+                  <span className="toggle-slider" aria-hidden="true" />
+                </span>
+              </label>
+              <FieldError id={`setting-${key}-error`} message={fieldErrors[key]} />
+            </div>
+          ))}
+        </div>
+        <p id="reconnect-help" className="settings-help">{t('reconnectOnResumeHint')}</p>
+        <p id="auto-check-updates-help" className="settings-help">{t('autoCheckUpdatesHint')}</p>
+        <p className="settings-help">{t('notificationPrivacyHint')}</p>
+      </section>
+
       <section className="card" aria-labelledby="sso-settings-heading">
         <h2 id="sso-settings-heading" className="card-header">
           <span className="card-header-icon" aria-hidden="true"><IconKey /></span> {t('ssoCredentials')}
@@ -478,6 +445,8 @@ export default function SettingsView({ onDirtyChange, onBusyChange }) {
         <p className="settings-help">
           {secureStorageAvailable ? t('ssoCredentialsHint') : t('secureStorageUnavailable')}
         </p>
+        {credentialError && <div className="field-error" role="alert">{formatApiError(credentialError, t)} <button type="button" className="btn" onClick={() => { void retryCredentials(); }}>{t('retry')}</button></div>}
+        <fieldset className="settings-form-fields" disabled={Boolean(credentialError)}>
         <div className="settings-field-stack">
           <div>
             <label className="form-label" htmlFor="setting-ssoUsername">{t('ssoUsernameLabel')}</label>
@@ -490,10 +459,11 @@ export default function SettingsView({ onDirtyChange, onBusyChange }) {
           </div>
         </div>
         {canClearCredentials && (
-          <button type="button" className="btn btn-danger settings-secondary-action" onClick={handleClearCredentials} disabled={clearingCredentials || isSaving}>
+          <button type="button" className="btn btn-danger settings-secondary-action" onClick={handleClearCredentials} disabled={busy}>
             {clearingCredentials ? t('clearingCredentials') : t('clearCredentials')}
           </button>
         )}
+        </fieldset>
       </section>
 
       <section className="card" aria-labelledby="language-settings-heading">
@@ -501,59 +471,62 @@ export default function SettingsView({ onDirtyChange, onBusyChange }) {
           <span className="card-header-icon" aria-hidden="true"><IconGlobe /></span> {t('language')}
         </h2>
         <div className="segmented-control" aria-label={t('language')}>
-          <button type="button" className={`btn ${locale === 'en' ? 'btn-primary' : ''}`} onClick={() => setLocale('en')} aria-pressed={locale === 'en'}>English</button>
-          <button type="button" className={`btn ${locale === 'zh' ? 'btn-primary' : ''}`} onClick={() => setLocale('zh')} aria-pressed={locale === 'zh'}>中文</button>
+          <button type="button" className={`btn ${locale === 'en' ? 'btn-primary' : ''}`} onClick={() => setLocale('en').catch((error) => pushToast('error', t('actionFailed'), formatApiError(error, t)))} aria-pressed={locale === 'en'}>English</button>
+          <button type="button" className={`btn ${locale === 'zh' ? 'btn-primary' : ''}`} onClick={() => setLocale('zh').catch((error) => pushToast('error', t('actionFailed'), formatApiError(error, t)))} aria-pressed={locale === 'zh'}>中文</button>
         </div>
       </section>
+      </fieldset>
 
-      <section className="card" aria-labelledby="ssh-key-heading">
-        <h2 id="ssh-key-heading" className="card-header">
-          <span className="card-header-icon" aria-hidden="true"><IconKey /></span> {t('sshPublicKeyTitle')}
-        </h2>
-        <p className="settings-help">{t('sshPublicKeyHint')}</p>
-        {sshPubKey ? (
-          <>
-            <div className="code-block settings-key-block">{sshPubKey}</div>
-            <div className="settings-inline-action">
-              <button type="button" className="btn" onClick={handleCopyPubKey}>
-                <span aria-hidden="true"><IconClipboard size={15} /></span>
-                {keyCopied ? t('copied') : t('copyPublicKey')}
-              </button>
-              {sshKeyPath && <span className="settings-path">{t('privateKeyAt')} <span className="mono">{sshKeyPath}</span></span>}
-            </div>
-          </>
-        ) : (
-          <div className="settings-help">{t('noSshKey')}</div>
-        )}
-      </section>
+      <SshKeyPanel
+        storageAvailable={secureStorageAvailable && !credentialError}
+        disabled={locked || isSaving || generating || clearingCredentials || autostartBusy || Boolean(snapshot?.operation)}
+        recoveryDisabled={isSaving || generating || clearingCredentials || autostartBusy || Boolean(snapshot?.operation)}
+        onBusyChange={setKeyBusy}
+        onConsumedDraft={consumeDraft}
+      />
+      <fieldset className="settings-form-fields" disabled={locked}>
 
       <section className="card" aria-labelledby="ssh-config-heading">
-        <h2 id="ssh-config-heading" className="card-header">
+        <h2 id="ssh-config-heading" className="card-header" tabIndex={-1}>
           <span className="card-header-icon" aria-hidden="true"><IconFileEdit /></span> {t('sshConfig')}
         </h2>
-        <p className="settings-help">{t('sshConfigHint', settings.sshAlias || 'usshtc107')}</p>
+        <p className="settings-help">{t('sshConfigHint', settings.sshAlias || PROFILE_DEFAULTS.sshAlias)}</p>
+        <p className="settings-help">{t('sshConfigProfileWarning')}</p>
+        <p className="settings-help">{t('sshConfigRulesWarning')}</p>
         <div className="settings-config-action">
           <div className="settings-alias-field">
             <label className="form-label" htmlFor="setting-sshAlias">{t('sshAlias')}</label>
-            <input id="setting-sshAlias" className="form-input" value={settings.sshAlias || ''} onChange={(e) => update('sshAlias', e.target.value)} placeholder="usshtc107" aria-invalid={Boolean(fieldErrors.sshAlias)} aria-describedby={fieldErrors.sshAlias ? 'setting-ssh-alias-error' : undefined} disabled={isSaving || generating} />
+            <input id="setting-sshAlias" className="form-input" value={settings.sshAlias || ''} onChange={(e) => update('sshAlias', e.target.value)} placeholder={PROFILE_DEFAULTS.sshAlias} aria-invalid={Boolean(fieldErrors.sshAlias)} aria-describedby={fieldErrors.sshAlias ? 'setting-ssh-alias-error' : undefined} disabled={isSaving || generating} />
             <FieldError id="setting-ssh-alias-error" message={fieldErrors.sshAlias} />
           </div>
-          <button type="button" className="btn btn-primary" onClick={handleGenerateSshConfig} disabled={generating || isSaving}>
-            {generating ? t('writing') : t('generateSshConfig')}
-          </button>
         </div>
-        {sshConfigResult?.success && <div className="code-block settings-config-result">{sshConfigResult.content}</div>}
-        {sshConfigResult && !sshConfigResult.success && <div className="field-error">{t('errorPrefix', sshConfigResult.error)}</div>}
-        {sshConfigResult?.success && <div className="settings-path settings-result-path">{t('writtenTo')} <span className="mono">{sshConfigResult.path}</span></div>}
+        <SshConfigPreview
+          key={JSON.stringify([scope?.profileId, scope?.epoch, configRevision, snapshot?.desiredConfig])}
+          scope={scope}
+          alias={settings.sshAlias || PROFILE_DEFAULTS.sshAlias}
+          unsaved={CONNECTION_SETTING_KEYS.some((key) => dirtySettingKeysRef.current.has(key))}
+          disabled={locked || isSaving || clearingCredentials || autostartBusy || keyBusy}
+          onBusyChange={setGenerating}
+          isCurrent={accepts}
+        />
       </section>
 
       <div className="settings-actions">
-        <button type="button" className="btn btn-primary" onClick={handleSave} disabled={!dirty || isSaving || clearingCredentials || generating}>
+        <button type="button" className="btn btn-primary" onClick={handleSave} disabled={(!settingsDirty && !credentialsDirty) || busy}>
           {isSaving ? t('saving') : saveState === 'saved' ? t('savedLabel') : t('saveSettings')}
         </button>
-        <button type="button" className="btn" onClick={handleReset} disabled={isSaving || clearingCredentials || generating}>{t('resetDefaults')}</button>
+        <button type="button" className="btn" onClick={handleReset} disabled={busy}>{t('resetDefaults')}</button>
         {dirty && <span className="settings-dirty-status" role="status">{t('unsavedChanges')}</span>}
+        {profileSaveState === 'saved' && <span role="status">{t('profileSettingsSaved')}</span>}
+        {appSaveState === 'saved' && <span role="status">{t('appSettingsSaved')}</span>}
       </div>
+      </fieldset>
+      <UpdatePanel
+        disabled={locked || isSaving || generating || clearingCredentials || autostartBusy || keyBusy || Boolean(snapshot?.operation)}
+        onBusyChange={setUpdateBusy}
+        onConsumedDraft={consumeDraft}
+      />
+      <fieldset className="settings-form-fields" disabled={locked}>
 
       {runtime && (
         <section className="card" aria-labelledby="about-heading">
@@ -569,6 +542,7 @@ export default function SettingsView({ onDirtyChange, onBusyChange }) {
           </div>
         </section>
       )}
+      </fieldset>
     </div>
   );
 }

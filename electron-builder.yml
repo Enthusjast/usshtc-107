@@ -8,6 +8,7 @@ directories:
 
 files:
   - electron/**/*
+  - shared/**/*
   - dist/**/*
   - LICENSE
   - '!node_modules/{buildcheck,cpu-features,nan}/**/*'
@@ -16,6 +17,17 @@ files:
 asar: true
 npmRebuild: false
 artifactName: "${productName}-${version}-${os}-${arch}.${ext}"
+electronUpdaterCompatibility: '>=2.16'
+
+publish:
+  provider: github
+  owner: Enthusjast
+  repo: usshtc-107
+  private: false
+  protocol: https
+  channel: latest
+  tagNamePrefix: v
+  releaseType: release
 
 linux:
   target:
@@ -29,11 +41,16 @@ mac:
   target:
     - target: dmg
       arch: [x64, arm64]
+    - target: zip
+      arch: [x64, arm64]
   category: public.app-category.utilities
   icon: build/icon.icns
   hardenedRuntime: true
   notarize: true
   forceCodeSigning: true
+
+dmg:
+  writeUpdateInfo: false
 
 win:
   target:

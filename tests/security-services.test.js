@@ -6,23 +6,10 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { Server: SSHServer, utils: sshUtils } = require('ssh2');
 
-const {
-  CredentialStore,
-  MAX_COOKIE_BYTES,
-  MAX_ENCRYPTED_SECRET_BYTES,
-  MAX_SSO_PASSWORD_BYTES,
-  validateCookie,
-} = require('../electron/credential-store');
-const {
-  MAX_SETTINGS_FILE_BYTES,
-  SettingsStore,
-  normalizePublicSettings,
-  publicSettings,
-} = require('../electron/settings-store');
-const {
-  SshConfigService,
-  stripManagedBlocks,
-} = require('../electron/ssh-config-service');
+const { CredentialStore } = require('../electron/credential-store');
+const { SettingsStore, createDefaultRoot, publicSettings } = require('../electron/settings-store');
+const { validateSettingsPatch } = require('../shared/settings-schema.mjs');
+const { SshConfigService } = require('../electron/ssh-config-service');
 const {
   ensureClientKeyPair,
   ensurePrivateKey,
@@ -82,16 +69,18 @@ const DEFAULTS = {
 };
 
 test('settings validation rejects SSH config injection and invalid dimensions', () => {
-  assert.throws(
-    () => normalizePublicSettings({ sshAlias: 'safe\n  ProxyCommand calc' }, DEFAULTS),
-    /unsupported characters/,
-  );
-  assert.throws(
-    () => normalizePublicSettings({ host: '127.0.0.1\nProxyCommand=id' }, DEFAULTS),
-    /valid host/,
-  );
-  assert.throws(() => normalizePublicSettings({ cols: Infinity }, DEFAULTS), /integer/);
-  assert.throws(() => normalizePublicSettings({ unexpected: true }, DEFAULTS), /Unknown setting/);
+  assert.deepEqual(validateSettingsPatch({ sshAlias: 'safe\n  ProxyCommand calc' }, DEFAULTS), {
+    ok: false, fieldErrors: { sshAlias: 'invalid_token' },
+  });
+  assert.deepEqual(validateSettingsPatch({ host: '127.0.0.1\nProxyCommand=id' }, DEFAULTS), {
+    ok: false, fieldErrors: { host: 'invalid_host' },
+  });
+  assert.deepEqual(validateSettingsPatch({ cols: Infinity }, DEFAULTS), {
+    ok: false, fieldErrors: { cols: 'integer_range' },
+  });
+  assert.deepEqual(validateSettingsPatch({ unexpected: true }, DEFAULTS), {
+    ok: false, fieldErrors: { unexpected: 'unknown_key' },
+  });
 });
 
 test('login navigation allows only the platform and CAS HTTPS origins', () => {
@@ -116,22 +105,21 @@ test('cookie expiry invalidates a successful login and prevents proxy start', ()
     invalidateQueries: () => { generation += 1; },
     setCapturedCookie: (value) => { capturedCookie = value; },
     clearStoredCookie: () => { storedCookieCleared += 1; },
-    publish: (channel, value) => published.push([channel, value]),
+    publish: (value) => published.push(value),
     onStateChanged: () => { stateChanges += 1; },
   });
 
   assert.equal(controller.canStartProxy(), true);
   controller.expireCookie();
 
-  assert.deepEqual(state, { loginStatus: 'failure', cookieValid: false, cookieCount: 0 });
+  assert.deepEqual(state, { loginStatus: 'failure', loginStage: null, cookieValid: false, cookieCount: 0 });
   assert.equal(controller.canStartProxy(), false);
   assert.equal(capturedCookie, '');
   assert.equal(storedCookieCleared, 1);
   assert.equal(generation, 1);
   assert.equal(stateChanges, 1);
   assert.deepEqual(published, [
-    ['login-status', 'failure'],
-    ['cookie-status', { cookieValid: false, cookieCount: 0 }],
+    { loginStatus: 'failure', loginStage: null, cookieValid: false, cookieCount: 0 },
   ]);
 });
 
@@ -143,7 +131,7 @@ test('cookie loss does not turn an in-progress login into a failure', () => {
     invalidateQueries: () => {},
     setCapturedCookie: () => {},
     clearStoredCookie: () => {},
-    publish: (channel, value) => published.push([channel, value]),
+    publish: (value) => published.push(value),
   });
 
   controller.expireCookie();
@@ -151,7 +139,7 @@ test('cookie loss does not turn an in-progress login into a failure', () => {
   assert.equal(state.loginStatus, 'pending');
   assert.equal(controller.canStartProxy(), false);
   assert.deepEqual(published, [
-    ['cookie-status', { cookieValid: false, cookieCount: 0 }],
+    { loginStatus: 'pending', loginStage: null, cookieValid: false, cookieCount: 0 },
   ]);
 });
 
@@ -318,180 +306,46 @@ test('shutdown coordinator requires stop and exit callbacks', () => {
   assert.throws(() => createShutdownCoordinator({}), /must be functions/);
 });
 
-test('settings are written atomically with private permissions and secrets stay out of DTOs', (t) => {
-  const directory = temporaryDirectory(t);
-  const filePath = path.join(directory, 'settings.json');
-  const store = new SettingsStore({ filePath, defaults: DEFAULTS });
-  const saved = { ...DEFAULTS, ssoPassword: 'ciphertext', savedCookieEncrypted: 'cookie-ciphertext' };
-
-  store.save(saved);
-  assert.deepEqual(store.load(), saved);
+test('schema two root saves privately and public settings never expose profile secrets', (t) => {
+  const filePath = path.join(temporaryDirectory(t), 'settings.json');
+  const store = new SettingsStore({ filePath });
+  const root = createDefaultRoot();
+  root.profiles[0].secrets.ssoPassword = Buffer.from('opaque ciphertext').toString('base64');
+  assert.deepEqual(store.save(root), { state: 'committed', durable: true, errorCode: null });
+  assert.deepEqual(store.load(), root);
   if (process.platform !== 'win32') assert.equal(fs.statSync(filePath).mode & 0o777, 0o600);
-  const dto = publicSettings(saved);
+  const dto = publicSettings(root);
+  assert.equal(dto.port, 3000);
   assert.equal('ssoPassword' in dto, false);
   assert.equal('savedCookieEncrypted' in dto, false);
 });
 
-test('oversized settings files fail closed without creating a large backup', (t) => {
-  const directory = temporaryDirectory(t);
-  const filePath = path.join(directory, 'settings.json');
-  const warnings = [];
-  fs.writeFileSync(filePath, Buffer.alloc(MAX_SETTINGS_FILE_BYTES + 1, 0x20));
-  const store = new SettingsStore({
-    filePath,
-    defaults: DEFAULTS,
-    onWarning: (message) => warnings.push(message),
-  });
-
-  assert.deepEqual(store.load(), DEFAULTS);
-  assert.match(warnings.join('\n'), /exceeds the .*byte limit/);
-  assert.deepEqual(
-    fs.readdirSync(directory).filter((name) => name.includes('.corrupt-')),
-    [],
-  );
-});
-
-test('corrupt settings backups are private and oversized saves are rejected', (t) => {
-  const directory = temporaryDirectory(t);
-  const filePath = path.join(directory, 'settings.json');
-  fs.writeFileSync(filePath, '{not-json', { mode: 0o644 });
-  const store = new SettingsStore({ filePath, defaults: DEFAULTS });
-
-  assert.deepEqual(store.load(), DEFAULTS);
-  const [backupName] = fs.readdirSync(directory).filter((name) => name.includes('.corrupt-'));
-  assert.ok(backupName);
-  if (process.platform !== 'win32') {
-    assert.equal(fs.statSync(path.join(directory, backupName)).mode & 0o777, 0o600);
-  }
-
-  assert.throws(
-    () => store.save({ ...DEFAULTS, ssoPassword: 'x'.repeat(MAX_SETTINGS_FILE_BYTES) }),
-    (error) => error?.code === 'SETTINGS_FILE_TOO_LARGE',
-  );
-  assert.equal(
-    fs.readdirSync(directory).some((name) => name.endsWith('.tmp')),
-    false,
-  );
-});
-
-test('credential store encrypts secrets and never returns a decrypted password in status', () => {
-  const settings = { ...DEFAULTS };
-  let persisted;
+test('credentials encrypt secrets in the shared root and status never returns a password', () => {
+  let root = createDefaultRoot();
   const store = new CredentialStore({
-    safeStorage: fakeSafeStorage(),
-    settings,
-    persist: (value) => { persisted = { ...value }; },
-    userDataPath: '/test/user-data',
+    safeStorage: fakeSafeStorage(), profileId: 'default', userDataPath: '/test/user-data',
+    readSecrets: () => root.profiles[0].secrets,
+    commitSecrets: (patch) => {
+      root = structuredClone(root);
+      Object.assign(root.profiles[0].secrets, patch);
+      return { state: 'committed', durable: true, errorCode: null };
+    },
   });
-
-  const status = store.saveSso({ username: 'SA123', password: 'school-password' });
-  assert.deepEqual(status, { username: 'SA123', hasPassword: true, storageAvailable: true });
-  assert.equal('password' in status, false);
-  assert.notEqual(persisted.ssoPassword, 'school-password');
+  assert.deepEqual(store.saveSso({ username: 'SA123', password: 'school-password' }), {
+    profileId: 'default', username: 'SA123', hasPassword: true, storageAvailable: true,
+  });
   assert.equal(store.getSsoPassword(), 'school-password');
-
+  assert.notEqual(root.profiles[0].secrets.ssoPassword, 'school-password');
   assert.equal(store.saveCookie('session=secret'), true);
-  assert.equal(settings.savedCookie, undefined);
-  assert.notEqual(settings.savedCookieEncrypted, 'session=secret');
   assert.equal(store.getCookie(), 'session=secret');
+  assert.equal('savedCookie' in root.profiles[0].secrets, false);
 });
 
-test('credential limits are enforced using UTF-8 byte lengths', () => {
-  const settings = { ...DEFAULTS };
-  const store = new CredentialStore({
-    safeStorage: fakeSafeStorage(),
-    settings,
-    persist: () => {},
-    userDataPath: '/test/user-data',
-  });
-  const maximumCookie = 'x'.repeat(MAX_COOKIE_BYTES);
 
-  assert.equal(validateCookie(maximumCookie), maximumCookie);
-  assert.equal(store.saveCookie(maximumCookie), true);
-  assert.throws(
-    () => store.saveCookie(`${maximumCookie}x`),
-    (error) => error?.code === 'CREDENTIAL_LIMIT_EXCEEDED',
-  );
-  assert.throws(() => store.saveCookie(null), /cookie must be a string/);
-  assert.throws(
-    () => store.saveSso({
-      username: 'SA123',
-      password: '\u{1F600}'.repeat(Math.floor(MAX_SSO_PASSWORD_BYTES / 4) + 1),
-    }),
-    (error) => error?.code === 'CREDENTIAL_LIMIT_EXCEEDED',
-  );
-});
-
-test('oversized stored and legacy credentials are discarded', () => {
-  const warnings = [];
-  const oversizedEncrypted = Buffer.alloc(MAX_ENCRYPTED_SECRET_BYTES + 1).toString('base64');
-  const settings = {
-    ...DEFAULTS,
-    savedCookie: 'x'.repeat(MAX_COOKIE_BYTES + 1),
-    savedCookieEncrypted: oversizedEncrypted,
-    ssoPassword: `xor:${'A'.repeat(MAX_ENCRYPTED_SECRET_BYTES * 2 + 1)}`,
-  };
-  const store = new CredentialStore({
-    safeStorage: fakeSafeStorage(),
-    settings,
-    persist: () => {},
-    userDataPath: '/test/user-data',
-    onWarning: (message) => warnings.push(message),
-  });
-
-  store.migrateLegacySecrets();
-  assert.equal(settings.savedCookie, undefined);
-  assert.equal(settings.ssoPassword, '');
-  assert.equal(store.getCookie(), '');
-  assert.match(warnings.join('\n'), /invalid plaintext saved Cookie/);
-  assert.match(warnings.join('\n'), /legacy-obfuscated SSO password/);
-  assert.match(warnings.join('\n'), /Saved Cookie could not be decrypted/);
-});
-
-test('legacy XOR/password and plaintext Cookie are migrated or removed', () => {
-  const userDataPath = '/test/user-data';
-  const legacyPassword = Buffer.from('legacy-password');
-  const key = crypto.createHash('md5').update(userDataPath).digest();
-  for (let index = 0; index < legacyPassword.length; index += 1) {
-    legacyPassword[index] ^= key[index % key.length];
-  }
-  const settings = {
-    ...DEFAULTS,
-    savedCookie: 'session=plaintext',
-    ssoPassword: `xor:${legacyPassword.toString('base64')}`,
-  };
-  const store = new CredentialStore({
-    safeStorage: fakeSafeStorage(),
-    settings,
-    persist: () => {},
-    userDataPath,
-  });
-
-  store.migrateLegacySecrets();
-  assert.equal(settings.savedCookie, undefined);
-  assert.equal(store.getCookie(), 'session=plaintext');
-  assert.equal(store.getSsoPassword(), 'legacy-password');
-  assert.equal(settings.ssoPassword.startsWith('xor:'), false);
-
-  const unavailableSettings = { ...DEFAULTS, savedCookie: 'session=plaintext' };
-  const unavailableStore = new CredentialStore({
-    safeStorage: fakeSafeStorage(false),
-    settings: unavailableSettings,
-    persist: () => {},
-    userDataPath,
-  });
-  unavailableStore.migrateLegacySecrets();
-  assert.equal(unavailableSettings.savedCookie, undefined);
-  assert.throws(
-    () => unavailableStore.saveSso({ username: 'SA123', password: 'password' }),
-    /unavailable/,
-  );
-});
-
-test('SSH config replaces legacy blocks, preserves user config, and creates a backup', (t) => {
+test('SSH config prepends an owned block, preserves legacy user bytes, and backs up the source', (t) => {
   const sshDirectory = temporaryDirectory(t);
   const configPath = path.join(sshDirectory, 'config');
-  fs.writeFileSync(configPath, [
+  const original = Buffer.from([
     'Host personal',
     '  HostName example.com',
     '',
@@ -500,32 +354,35 @@ test('SSH config replaces legacy blocks, preserves user config, and creates a ba
     '  HostName 127.0.0.1',
     '  StrictHostKeyChecking no',
     '',
-  ].join('\n'));
-
+  ].join('\r\n'));
+  fs.writeFileSync(configPath, original);
   const service = new SshConfigService({
     sshDirectory,
     privateKeyPath: path.join(sshDirectory, 'client key'),
   });
-  const result = service.write({ alias: 'usshtc107', host: '127.0.0.1', port: 3000 });
-  const written = fs.readFileSync(configPath, 'utf8');
+  const options = { profileId: 'default', alias: 'usshtc107', host: '127.0.0.1', port: 3000 };
+  const preview = service.preview(options);
+  const expected = { expectedSourceHash: preview.sourceHash, expectedConfigHash: preview.configHash };
+  const result = service.write(options, expected);
+  const written = fs.readFileSync(configPath);
 
-  assert.match(written, /Host personal/);
-  assert.doesNotMatch(written, /old-alias/);
-  assert.match(written, /StrictHostKeyChecking accept-new/);
-  assert.doesNotMatch(written, /UserKnownHostsFile \/dev\/null/);
-  assert.ok(result.backupPath && fs.existsSync(result.backupPath));
+  assert.deepEqual(written.subarray(Buffer.byteLength(`${preview.block}\n`)), original);
+  assert.match(preview.block, /StrictHostKeyChecking accept-new/);
+  assert.match(preview.block, /Host \*\n# END usshtc107 managed$/);
+  assert.doesNotMatch(preview.block, /UserKnownHostsFile/);
+  assert.deepEqual(fs.readFileSync(result.backupPath), original);
   if (process.platform !== 'win32') {
     assert.equal(fs.statSync(result.backupPath).mode & 0o777, 0o600);
   }
   assert.throws(
-    () => service.write({ alias: 'ok\nProxyCommand id', host: '127.0.0.1', port: 3000 }),
-    /unsupported characters/,
+    () => service.write({ ...options, alias: 'ok\nProxyCommand id' }, expected),
+    (error) => error?.code === 'invalid_token',
   );
-  assert.equal(stripManagedBlocks(written).includes('usshtc107'), false);
 });
 
-test('legacy SSH config migration preserves indented Host and Match blocks', () => {
-  const config = [
+test('legacy SSH comments do not grant ownership of indented Host or Match directives', (t) => {
+  const sshDirectory = temporaryDirectory(t);
+  const original = Buffer.from([
     '# usshtc107-auto-generated',
     'Host old-alias',
     '  HostName 127.0.0.1',
@@ -535,14 +392,11 @@ test('legacy SSH config migration preserves indented Host and Match blocks', () 
     '    HostName personal.example.com',
     'Match user deploy',
     '  IdentityFile ~/.ssh/deploy',
-  ].join('\n');
-
-  const stripped = stripManagedBlocks(config);
-  assert.doesNotMatch(stripped, /old-alias|StrictHostKeyChecking no/);
-  assert.match(stripped, /Host indented-personal/);
-  assert.match(stripped, /HostName personal\.example\.com/);
-  assert.match(stripped, /Match user deploy/);
-  assert.match(stripped, /IdentityFile ~\/\.ssh\/deploy/);
+  ].join('\n'));
+  fs.writeFileSync(path.join(sshDirectory, 'config'), original);
+  const service = new SshConfigService({ sshDirectory, privateKeyPath: path.join(sshDirectory, 'key') });
+  const preview = service.preview({ profileId: 'default', alias: 'usshtc107', host: 'localhost', port: 3000 });
+  assert.deepEqual(preview.content.subarray(Buffer.byteLength(`${preview.block}\n`)), original);
 });
 
 test('SSH config writes fail closed when a managed block has no END marker', (t) => {
@@ -567,8 +421,11 @@ test('SSH config writes fail closed when a managed block has no END marker', (t)
   });
 
   assert.throws(
-    () => service.write({ alias: 'usshtc107', host: '127.0.0.1', port: 3000 }),
-    (error) => error?.code === 'SSH_CONFIG_UNTERMINATED_MANAGED_BLOCK',
+    () => service.write(
+      { profileId: 'default', alias: 'usshtc107', host: '127.0.0.1', port: 3000 },
+      { expectedSourceHash: 'reviewed-source', expectedConfigHash: 'reviewed-config' },
+    ),
+    (error) => error?.code === 'SSH_CONFIG_INVALID',
   );
   assert.equal(fs.readFileSync(configPath, 'utf8'), malformed);
   assert.equal(fs.existsSync(service.backupPath), false);
@@ -643,6 +500,8 @@ test('legacy PKCS#8 proxy host key is migrated to an ssh2-compatible key', (t) =
   const parsed = sshUtils.parseKey(migrated);
   assert.equal(parsed.type, 'ssh-ed25519');
   assert.equal(parsed.isPrivateKey(), true);
+  const legacyPublic = crypto.createPublicKey(crypto.createPrivateKey(legacyHostKey)).export({ format: 'jwk' });
+  assert.deepEqual(parsed.getPublicSSH().subarray(-32), Buffer.from(legacyPublic.x, 'base64url'));
   assert.doesNotThrow(() => new SSHServer({ hostKeys: [migrated] }));
   assert.equal(ensureProxyHostKey(hostKeyPath), migrated);
 });

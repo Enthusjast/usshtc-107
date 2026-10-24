@@ -3,14 +3,14 @@ const net = require('net');
 const { Server: SSHServer, utils: sshUtils } = require('ssh2');
 const { WebSocket } = require('ws');
 const { EventEmitter } = require('events');
+const { StringDecoder } = require('string_decoder');
+const { quotePosix, buildExecBootstrap, createExecParser } = require('./exec-codec');
 const { validateCookie } = require('./credential-store');
+const { buildWssUrl, buildWssOptions } = require('./wss-connection');
 const {
-  PLATFORM,
-  AUTH_CLOSE_CODES,
   WSS_HANDSHAKE_TIMEOUT,
   PING_INTERVAL,
   PING_TIMEOUT,
-  CTRL_D_DRAIN_MS,
   SSH_HANDSHAKE_TIMEOUT,
   SSH_SOCKET_IDLE_TIMEOUT,
   PROXY_SHUTDOWN_TIMEOUT,
@@ -21,25 +21,21 @@ const {
   MAX_WSS_PAYLOAD_BYTES,
   MAX_PENDING_BYTES,
   MAX_EXEC_OUTPUT_BYTES,
+  MAX_EXEC_PRELUDE_BYTES,
+  MAX_QUEUED_OUTPUT_BYTES,
   MAX_WS_BUFFERED_BYTES,
 } = require('./constants');
 
 const WS_CONNECTING = 0;
 const WS_OPEN = 1;
-const EXEC_ERROR_EXIT_CODE = 1;
-const EXEC_TIMEOUT_EXIT_CODE = 124;
-const EXEC_OUTPUT_LIMIT_EXIT_CODE = 125;
-const EXEC_DISCONNECTED_EXIT_CODE = 255;
 const EXEC_WRITE_CHUNK_BYTES = 64 * 1024;
 
 function parseServerMessage(raw) {
   try {
     const msg = JSON.parse(raw.toString('utf-8'));
     switch (msg.$case) {
-      case 'exit':
-      case 'close':
-      case 'logout': {
-        const candidate = msg.exitCode ?? msg.code ?? msg.exit?.code;
+      case 'exit': {
+        const candidate = msg.exit?.code;
         const exitCode = Number.isInteger(candidate) && candidate >= 0 && candidate <= 255
           ? candidate
           : null;
@@ -55,12 +51,12 @@ function parseServerMessage(raw) {
         return { type: 'unknown' };
     }
   } catch {
-    return { type: 'raw_text', payload: raw.toString('utf-8') };
+    return { type: 'unknown' };
   }
 }
 
-function buildClientMessage(buf) {
-  return JSON.stringify({ $case: 'data', data: { data: buf.toString('utf-8') } });
+function buildClientMessage(text) {
+  return JSON.stringify({ $case: 'data', data: { data: text } });
 }
 
 function extractEd25519RawKey(data) {
@@ -89,16 +85,30 @@ function positiveInteger(value, fallback) {
   return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
-function nonNegativeInteger(value, fallback) {
-  return Number.isInteger(value) && value >= 0 ? value : fallback;
+// Size the actual JSON wire representation, without splitting surrogate pairs.
+function nextDataFrame(text, offset, maxBytes) {
+  let bytes = Buffer.byteLength(buildClientMessage(''));
+  let end = offset;
+  while (end < text.length) {
+    const point = text.codePointAt(end);
+    const width = point > 0xffff ? 2 : 1;
+    const char = text.slice(end, end + width);
+    const cost = Buffer.byteLength(JSON.stringify(char)) - 2;
+    if (bytes + cost > maxBytes) break;
+    bytes += cost;
+    end += width;
+  }
+  if (end === offset) throw new Error('WSS frame limit is too small');
+  return { message: buildClientMessage(text.slice(offset, end)), end, bytes };
 }
 
 let sessionIdCounter = 0;
 
 class Session {
-  constructor(id, remoteAddress) {
+  constructor(id, remoteAddress, kind) {
     this.id = id;
     this.remoteAddress = remoteAddress;
+    this.kind = kind;
     this.connectedAt = Date.now();
     this.bytesSent = 0;
     this.bytesReceived = 0;
@@ -112,19 +122,8 @@ class ProxyServer extends EventEmitter {
     this.port = options.port ?? 3000;
     this.host = typeof options.host === 'string' && options.host ? options.host : '127.0.0.1';
     this.cookie = validateCookie(options.cookie === undefined ? '' : options.cookie);
-    this.wssUrl = options.wssUrl;
-
-    if (!this.wssUrl) {
-      const params = new URLSearchParams({
-        cluster: options.cluster || 'training',
-        loginNode: options.loginNode || '11.11.10.202',
-        path: '',
-        cols: options.cols || '80',
-        rows: options.rows || '24',
-        useRoot: options.useRoot ? 'true' : 'false',
-      });
-      this.wssUrl = `${PLATFORM.wssBase}?${params.toString()}`;
-    }
+    this._acceptingConnections = options.acceptingConnections !== false;
+    this.wssUrl = buildWssUrl(options);
 
     this.tlsCa = options.tlsCa ?? options.ca;
     this.authorizedKey = Buffer.isBuffer(options.authorizedKey)
@@ -158,10 +157,8 @@ class ProxyServer extends EventEmitter {
       PROXY_SHUTDOWN_TIMEOUT
     );
     this.execTimeoutMs = positiveInteger(options.execTimeoutMs, EXEC_TIMEOUT);
-    this.execInitialDelayMs = nonNegativeInteger(options.execInitialDelayMs, 1000);
     this.pingIntervalMs = positiveInteger(options.pingIntervalMs, PING_INTERVAL);
     this.pingTimeoutMs = positiveInteger(options.pingTimeoutMs, PING_TIMEOUT);
-    this.ctrlDDrainMs = nonNegativeInteger(options.ctrlDDrainMs, CTRL_D_DRAIN_MS);
     this.backpressurePollMs = positiveInteger(
       options.backpressurePollMs,
       WS_BACKPRESSURE_POLL_MS
@@ -178,6 +175,13 @@ class ProxyServer extends EventEmitter {
       options.maxExecOutputBytes,
       MAX_EXEC_OUTPUT_BYTES
     );
+    this.maxExecPreludeBytes = positiveInteger(options.maxExecPreludeBytes, MAX_EXEC_PRELUDE_BYTES);
+    this.maxExecEncodedBytes = positiveInteger(
+      options.maxExecEncodedBytes, 2 * this.maxExecOutputBytes + 64 * 1024
+    );
+    this.maxQueuedOutputBytes = positiveInteger(options.maxQueuedOutputBytes, MAX_QUEUED_OUTPUT_BYTES);
+    this.cols = positiveInteger(options.cols, 80);
+    this.rows = positiveInteger(options.rows, 24);
     this.maxWsBufferedBytes = positiveInteger(
       options.maxWsBufferedBytes,
       MAX_WS_BUFFERED_BYTES
@@ -269,23 +273,19 @@ class ProxyServer extends EventEmitter {
   }
 
   _webSocketOptions() {
-    const wsOptions = {
-      headers: {
-        Cookie: this.cookie,
-        Origin: PLATFORM.origin,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-          + 'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      },
-      rejectUnauthorized: true,
-      handshakeTimeout: this.wssHandshakeTimeoutMs,
+    return buildWssOptions({
+      cookie: this.cookie,
+      tlsCa: this.tlsCa,
+      handshakeTimeoutMs: this.wssHandshakeTimeoutMs,
       maxPayload: this.maxWssPayloadBytes,
-    };
-    if (this.tlsCa !== undefined && this.tlsCa !== null) wsOptions.ca = this.tlsCa;
-    return wsOptions;
+    });
   }
 
-  _createWebSocket() {
-    return this._webSocketFactory(this.wssUrl, this._webSocketOptions());
+  _createWebSocket({ cols = this.cols, rows = this.rows } = {}) {
+    const url = new URL(this.wssUrl);
+    url.searchParams.set('cols', String(cols));
+    url.searchParams.set('rows', String(rows));
+    return this._webSocketFactory(url.toString(), this._webSocketOptions());
   }
 
   _closeWebSocket(ws) {
@@ -306,12 +306,8 @@ class ProxyServer extends EventEmitter {
     }
   }
 
-  _isAuthCloseCode(code) {
-    return AUTH_CLOSE_CODES.has(Number(code));
-  }
-
-  _openSession(remoteAddress, close) {
-    const session = new Session(++sessionIdCounter, remoteAddress);
+  _openSession(remoteAddress, close, kind = 'shell') {
+    const session = new Session(++sessionIdCounter, remoteAddress, kind);
     session._close = close;
     this._sessions.set(session.id, session);
     this.emit('session-open', this._sessionSnapshot(session));
@@ -319,490 +315,341 @@ class ProxyServer extends EventEmitter {
     return session;
   }
 
-  _closeSessionRecord(session) {
-    if (!session || !this._sessions.has(session.id)) return;
+  _closeSessionRecord(session, { exitCode = null, reason = 'interrupted' } = {}) {
+    if (!session || this._sessions.get(session.id) !== session || session._finalized) return;
+    session._finalized = true;
+    const snapshot = this._sessionSnapshot(session);
+    // Deliver the last counters while this exact session is still owned. Listeners
+    // must use this snapshot, not reconstruct it after the record has disappeared.
+    this.emit('session-close', { sessionId: session.id, session: snapshot,
+      endedAt: Date.now(), exitCode, reason });
     this._sessions.delete(session.id);
-    this.emit('session-close', { sessionId: session.id });
     this._emitStats();
   }
 
-  _bridgeExecToWss(channel, _client, clientStr, command) {
+  _bridgeExecToWss(channel, clientStr, command, ptyState) {
+    return this._bridgeChannel(channel, clientStr, ptyState, command);
+  }
+
+  _bridgeSshToWss(channel, clientStr, ptyState) {
+    return this._bridgeChannel(channel, clientStr, ptyState);
+  }
+
+  _bridgeChannel(channel, clientStr, ptyState = { cols: this.cols, rows: this.rows }, command) {
     const self = this;
+    const exec = command !== undefined;
     const commandText = typeof command === 'string' ? command : '';
-    if (Buffer.byteLength(commandText, 'utf-8') > this.maxPendingBytes) {
-      try { channel.exit(EXEC_OUTPUT_LIMIT_EXIT_CODE); } catch (_) {}
+    function rejectEarly(code, diagnostic) {
+      try { channel.stderr?.write(diagnostic); } catch (_) {}
+      try { channel.exit(code); } catch (_) {}
       try { channel.end(); } catch (_) {}
-      return;
+      return { resize() {} };
     }
-
+    if (exec && commandText.includes('\0')) return rejectEarly(1, 'Exec command contains NUL.\n');
+    if (exec && Buffer.byteLength(commandText) > this.maxPendingBytes) {
+      return rejectEarly(125, 'Exec input limit exceeded.\n');
+    }
     let ws;
-    try {
-      ws = this._createWebSocket();
-    } catch (err) {
-      this.emit('proxy-log', 'error', 'wss', `WSS setup failed: ${err.message}`);
-      try { channel.exit(EXEC_ERROR_EXIT_CODE); } catch (_) {}
-      try { channel.end(); } catch (_) {}
-      return;
+    try { ws = this._createWebSocket(ptyState); } catch (_) {
+      return rejectEarly(1, 'WSS setup failed.\n');
     }
-
+    const initialSize = { cols: ptyState.cols, rows: ptyState.rows };
     const timers = new Set();
-    const doneId = crypto.randomBytes(12).toString('hex');
-    const doneCommand = `echo DONE_${doneId} $?`;
-    const donePattern = new RegExp(`DONE_${doneId}\\s+(\\d{1,3})\\r?\\n`);
-    let outputText = '';
+    const decoder = exec ? null : new StringDecoder('utf8');
+    const pending = [];
+    const output = [];
+    let pendingBytes = 0;
     let outputBytes = 0;
     let closed = false;
-    let done = false;
-    let drainListener = null;
-    let drainTimeout = null;
+    let finished = false;
+    let finishCode = null;
+    let finishReason = 'interrupted';
+    let ready = false;
+    let inputEnded = false;
+    let disconnectSent = false;
+    let pendingResize = null;
+    let pollTimer = null;
+    let sendDeadline = null;
+    let drainDeadline = null;
+    let waitingDrain = false;
+    let channelPaused = false;
+    let pingTimer = null;
+    let pongTimer = null;
+    let execTimer = null;
     let session;
-
-    function cleanOutput() {
-      const doneCommandIndex = outputText.indexOf(doneCommand);
-      const doneOutputMatch = outputText.match(donePattern);
-      const doneOutputIndex = doneOutputMatch?.index ?? -1;
-      let cutoff = outputText.length;
-      if (doneCommandIndex >= 0) cutoff = Math.min(cutoff, doneCommandIndex);
-      if (doneOutputIndex >= 0) cutoff = Math.min(cutoff, doneOutputIndex);
-
-      let stripped = outputText.slice(0, cutoff);
-      stripped = stripped.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
-      stripped = stripped.replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, '');
-      stripped = stripped.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
-
-      const commandWithNewline = `${commandText}\r\n`;
-      const commandIndex = stripped.lastIndexOf(commandWithNewline);
-      if (commandIndex >= 0) {
-        stripped = stripped.slice(commandIndex + commandWithNewline.length);
-      }
-      stripped = stripped.replace(/[\w.\-]+@[\w.\-]+:[\w./~\- ]*[$#]\s*$/, '');
-      return stripped.replace(/^\s+/, '').replace(/\s+$/, '');
+    let parser;
+    function cancel(timer) {
+      if (timer) { clearTimeout(timer); timers.delete(timer); }
     }
-
-    function detachChannelListeners() {
-      channel.removeListener('close', onChannelClose);
-      channel.removeListener('end', onChannelEnd);
-      if (drainListener) {
-        channel.removeListener('drain', drainListener);
-        drainListener = null;
-      }
-      if (drainTimeout) {
-        clearTimeout(drainTimeout);
-        drainTimeout = null;
-      }
+    function pauseInput() {
+      if (channelPaused || exec) return;
+      channelPaused = true;
+      channel.pause?.();
     }
-
+    function resumeInput() {
+      if (!channelPaused || closed || inputEnded) return;
+      channelPaused = false;
+      channel.resume?.();
+    }
+    function account(direction, bytes) {
+      if (!bytes) return;
+      if (direction === 'sent') {
+        session.bytesSent += bytes;
+        self._totalBytesSent += bytes;
+      } else {
+        session.bytesReceived += bytes;
+        self._totalBytesReceived += bytes;
+      }
+      self.emit('traffic', { sessionId: session.id, direction, bytes });
+    }
     function cleanup() {
       if (closed) return;
       closed = true;
       self._clearTimers(timers);
-      detachChannelListeners();
-      self._closeSessionRecord(session);
+      clearInterval(pingTimer);
+      channel.removeListener('data', onInput);
+      channel.removeListener('end', onInputEnd);
+      channel.removeListener('close', cleanup);
+      channel.removeListener('drain', onDrain);
+      pending.length = 0;
+      output.length = 0;
+      self._closeSessionRecord(session, { exitCode: finishCode,
+        reason: finishCode === null ? (ptyState.closeReason?.() || finishReason) : finishReason });
       self._closeWebSocket(ws);
-      try { if (!channel.closed) channel.close(); } catch (_) {}
     }
-
-    function writeOutputAndClose(text, exitCode) {
-      const output = text ? Buffer.from(`${text}\n`) : Buffer.alloc(0);
-      let offset = 0;
-
-      function finishChannel() {
-        if (closed) return;
-        try { if (!channel.closed) channel.exit(exitCode); } catch (_) {}
-        try { if (!channel.closed) channel.end(); } catch (_) {}
-        self._schedule(timers, cleanup, 250);
-      }
-
-      function writeNext() {
-        if (closed) return;
-        while (offset < output.length) {
-          const end = Math.min(offset + EXEC_WRITE_CHUNK_BYTES, output.length);
-          const chunk = output.subarray(offset, end);
-          offset = end;
-          let writable = true;
-          try { writable = channel.write(chunk); } catch (_) { cleanup(); return; }
-          if (!writable) {
-            drainListener = () => {
-              drainListener = null;
-              if (drainTimeout) {
-                clearTimeout(drainTimeout);
-                drainTimeout = null;
-              }
-              writeNext();
-            };
-            channel.once('drain', drainListener);
-            drainTimeout = setTimeout(cleanup, self.shutdownTimeoutMs);
-            return;
-          }
-        }
-        finishChannel();
-      }
-
-      writeNext();
-    }
-
-    function finishExec(exitCode) {
-      if (done || closed) return;
-      done = true;
-      self._clearTimers(timers);
-      self._closeWebSocket(ws);
-      const normalizedExitCode = Number.isInteger(exitCode) && exitCode >= 0 && exitCode <= 255
-        ? exitCode
-        : EXEC_ERROR_EXIT_CODE;
-      self.emit('proxy-log', 'info', 'wss', `Exec completed with exit code ${normalizedExitCode}`);
-      writeOutputAndClose(cleanOutput(), normalizedExitCode);
-    }
-
-    function onChannelClose() { cleanup(); }
-    function onChannelEnd() { cleanup(); }
-
-    session = this._openSession(`${clientStr} [exec]`, () => {
-      if (!done && !closed) {
-        done = true;
-        try { if (!channel.closed) channel.exit(EXEC_DISCONNECTED_EXIT_CODE); } catch (_) {}
-      }
-      cleanup();
-    });
-
-    this.emit('proxy-log', 'info', 'wss', 'Connecting exec session');
-
-    ws.on('message', (data) => {
-      if (done || closed) return;
-      const result = parseServerMessage(data);
-      if (result.type === 'session_ended') {
-        finishExec(result.exitCode ?? EXEC_ERROR_EXIT_CODE);
-        return;
-      }
-      if (result.type !== 'data' || !result.payload) return;
-
-      const payloadBytes = Buffer.byteLength(result.payload, 'utf-8');
-      if (outputBytes + payloadBytes > self.maxExecOutputBytes) {
-        self.emit('proxy-log', 'warn', 'wss', 'Exec output limit exceeded');
-        finishExec(EXEC_OUTPUT_LIMIT_EXIT_CODE);
-        return;
-      }
-      outputBytes += payloadBytes;
-      outputText += result.payload;
-      session.bytesReceived += payloadBytes;
-      self._totalBytesReceived += payloadBytes;
-      self.emit('traffic', { sessionId: session.id, direction: 'received', bytes: payloadBytes });
-
-      const doneMatch = outputText.match(donePattern);
-      if (doneMatch) {
-        const parsedExitCode = Number.parseInt(doneMatch[1], 10);
-        finishExec(parsedExitCode <= 255 ? parsedExitCode : EXEC_ERROR_EXIT_CODE);
-      }
-    });
-
-    ws.on('open', () => {
-      if (closed || done) return;
-      self.emit('proxy-log', 'info', 'wss', 'WSS connected for exec session');
-      self._schedule(timers, () => finishExec(EXEC_TIMEOUT_EXIT_CODE), self.execTimeoutMs);
-      self._schedule(timers, () => {
-        if (closed || done || ws.readyState !== WS_OPEN) return;
-        const commandBuffer = Buffer.from(`${commandText}\n`, 'utf-8');
-        const markerBuffer = Buffer.from(`${doneCommand}\n`, 'utf-8');
-        const onSendError = (err) => { if (err) finishExec(EXEC_ERROR_EXIT_CODE); };
-        try {
-          ws.send(buildClientMessage(commandBuffer), onSendError);
-          ws.send(buildClientMessage(markerBuffer), onSendError);
-          session.bytesSent += commandBuffer.length;
-          self._totalBytesSent += commandBuffer.length;
-          self.emit('traffic', {
-            sessionId: session.id,
-            direction: 'sent',
-            bytes: commandBuffer.length,
-          });
-        } catch (_) {
-          finishExec(EXEC_ERROR_EXIT_CODE);
-        }
-      }, self.execInitialDelayMs);
-    });
-
-    ws.on('unexpected-response', (_req, res) => {
-      if (closed || done) return;
-      self.emit('proxy-log', 'error', 'wss', `WSS HTTP ${res.statusCode} for exec session`);
-      res.resume?.();
-      if (res.statusCode === 401 || res.statusCode === 403) {
-        self.emit('auth-error', { statusCode: res.statusCode, clientStr });
-      }
-      finishExec(EXEC_ERROR_EXIT_CODE);
-    });
-
-    ws.on('error', (err) => {
-      if (closed || done) return;
-      self.emit('proxy-log', 'error', 'wss', `WSS exec error: ${err.message}`);
-      finishExec(EXEC_ERROR_EXIT_CODE);
-    });
-
-    ws.on('close', (code) => {
-      if (closed || done) return;
-      if (self._isAuthCloseCode(code)) {
-        self.emit('auth-error', { statusCode: code, clientStr });
-      }
-      finishExec(EXEC_ERROR_EXIT_CODE);
-    });
-
-    channel.on('close', onChannelClose);
-    channel.on('end', onChannelEnd);
-  }
-
-  _bridgeSshToWss(channel, _client, clientStr) {
-    const self = this;
-    let ws;
-    try {
-      ws = this._createWebSocket();
-    } catch (err) {
-      this.emit('proxy-log', 'error', 'wss', `WSS setup failed: ${err.message}`);
-      try { channel.exit(EXEC_ERROR_EXIT_CODE); } catch (_) {}
-      try { channel.close(); } catch (_) {}
-      return;
-    }
-
-    const timers = new Set();
-    let pingTimer = null;
-    let pongTimer = null;
-    let ctrlDTimer = null;
-    let backpressureTimer = null;
-    let backpressureDeadlineTimer = null;
-    let channelDrainListener = null;
-    let closed = false;
-    let wssReady = false;
-    let channelPaused = false;
-    let pendingBytes = 0;
-    const pendingData = [];
-    let session;
-
-    function pauseChannel() {
-      if (channelPaused) return;
-      channelPaused = true;
-      try { channel.pause?.(); } catch (_) {}
-    }
-
-    function resumeChannel() {
-      if (!channelPaused || closed) return;
-      channelPaused = false;
-      try { channel.resume?.(); } catch (_) {}
-    }
-
-    function stopTimers() {
-      self._clearTimers(timers);
-      if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
-      if (pongTimer) { clearTimeout(pongTimer); pongTimer = null; }
-      if (ctrlDTimer) { clearTimeout(ctrlDTimer); ctrlDTimer = null; }
-      if (backpressureTimer) { clearTimeout(backpressureTimer); backpressureTimer = null; }
-      if (backpressureDeadlineTimer) {
-        clearTimeout(backpressureDeadlineTimer);
-        backpressureDeadlineTimer = null;
-      }
-    }
-
-    function detachChannelListeners() {
-      channel.removeListener('data', onChannelData);
-      channel.removeListener('close', onChannelClose);
-      channel.removeListener('end', onChannelEnd);
-      if (channelDrainListener) {
-        channel.removeListener('drain', channelDrainListener);
-        channelDrainListener = null;
-      }
-    }
-
-    function cleanup(exitCode = 0) {
+    function closeChannel() {
       if (closed) return;
-      closed = true;
-      stopTimers();
-      detachChannelListeners();
-      pendingData.length = 0;
-      pendingBytes = 0;
-      self._closeSessionRecord(session);
-      self._closeWebSocket(ws);
-      try {
-        if (!channel.closed) {
-          channel.exit(exitCode);
-          channel.close();
-        }
-      } catch (_) {}
+      cleanup();
+      try { channel.close(); } catch (_) {}
     }
-
-    session = this._openSession(clientStr, () => cleanup(EXEC_DISCONNECTED_EXIT_CODE));
-    this.emit('proxy-log', 'info', 'wss', 'Connecting interactive session');
-
-    function startPingPong() {
-      pingTimer = setInterval(() => {
-        if (closed || ws.readyState !== WS_OPEN) return;
-        if (pongTimer) clearTimeout(pongTimer);
-        try { ws.ping(); } catch (_) { cleanup(EXEC_ERROR_EXIT_CODE); return; }
-        pongTimer = setTimeout(() => {
-          pongTimer = null;
-          if (!closed) {
-            try { ws.terminate(); } catch (_) {}
-          }
-        }, self.pingTimeoutMs);
-        pongTimer.unref?.();
-      }, self.pingIntervalMs);
-      pingTimer.unref?.();
-    }
-
-    function scheduleBackpressureFlush() {
-      if (backpressureTimer || closed) return;
-      if (!backpressureDeadlineTimer) {
-        backpressureDeadlineTimer = setTimeout(() => {
-          backpressureDeadlineTimer = null;
-          if (!closed) cleanup(EXEC_ERROR_EXIT_CODE);
-        }, self.wssHandshakeTimeoutMs);
-        backpressureDeadlineTimer.unref?.();
-      }
-      backpressureTimer = setTimeout(() => {
-        backpressureTimer = null;
-        flushPending();
-      }, self.backpressurePollMs);
-      backpressureTimer.unref?.();
-    }
-
-    function sendBuffer(buf) {
-      if (closed || ws.readyState !== WS_OPEN) return false;
-      let message;
-      try { message = buildClientMessage(buf); } catch (_) { cleanup(EXEC_ERROR_EXIT_CODE); return false; }
-      const messageBytes = Buffer.byteLength(message);
-      if (messageBytes > self.maxWsBufferedBytes) {
-        self.emit('proxy-log', 'warn', 'wss', 'SSH input frame exceeds WSS buffer limit');
-        cleanup(EXEC_ERROR_EXIT_CODE);
-        return false;
-      }
-      if ((ws.bufferedAmount || 0) + messageBytes > self.maxWsBufferedBytes) {
-        return false;
-      }
-      try {
-        ws.send(message, (err) => { if (err && !closed) cleanup(EXEC_ERROR_EXIT_CODE); });
-      } catch (_) {
-        cleanup(EXEC_ERROR_EXIT_CODE);
-        return false;
-      }
-      session.bytesSent += buf.length;
-      self._totalBytesSent += buf.length;
-      self.emit('traffic', { sessionId: session.id, direction: 'sent', bytes: buf.length });
-      return true;
-    }
-
-    function flushPending() {
-      if (closed || !wssReady || ws.readyState !== WS_OPEN) return;
-      while (pendingData.length > 0) {
-        const next = pendingData[0];
-        if (!sendBuffer(next)) {
-          pauseChannel();
-          scheduleBackpressureFlush();
+    function flushOutput() {
+      if (closed || waitingDrain || finished) return;
+      while (output.length) {
+        const chunk = output.shift();
+        outputBytes -= chunk.length;
+        let writable;
+        try { writable = channel.write(chunk); } catch (_) { closeChannel(); return; }
+        if (!writable) {
+          waitingDrain = true;
+          try { ws.pause?.(); } catch (_) {}
+          channel.once('drain', onDrain);
+          drainDeadline = self._schedule(timers, () => {
+            finishCode = 125;
+            finishReason = 'timeout';
+            try { channel.exit(125); channel.end(); } catch (_) {}
+            closeChannel();
+          }, self.shutdownTimeoutMs);
           return;
         }
-        pendingData.shift();
-        pendingBytes -= next.length;
       }
-      if (backpressureDeadlineTimer) {
-        clearTimeout(backpressureDeadlineTimer);
-        backpressureDeadlineTimer = null;
-      }
-      resumeChannel();
-    }
-
-    function enqueueData(data) {
-      const buf = Buffer.from(data);
-      if (pendingBytes + buf.length > self.maxPendingBytes) {
-        self.emit('proxy-log', 'warn', 'wss', 'SSH input buffer limit exceeded');
-        cleanup(EXEC_ERROR_EXIT_CODE);
-        return false;
-      }
-      pendingData.push(buf);
-      pendingBytes += buf.length;
-      return true;
-    }
-
-    function onChannelData(data) {
-      if (closed || !enqueueData(data)) return;
-      if (!wssReady) pauseChannel();
-      flushPending();
-
-      if (!closed && data.length === 1 && data[0] === 0x04) {
-        if (ctrlDTimer) clearTimeout(ctrlDTimer);
-        ctrlDTimer = setTimeout(() => {
-          ctrlDTimer = null;
-          if (!closed && ws.readyState === WS_OPEN) {
-            try { ws.close(1000); } catch (_) {}
-          }
-        }, self.ctrlDDrainMs);
-        ctrlDTimer.unref?.();
+      if (finishCode !== null) {
+        finished = true;
+        self._closeSessionRecord(session, { exitCode: finishCode, reason: finishReason });
+        try { channel.exit(finishCode); channel.end(); } catch (_) { closeChannel(); return; }
+        // end() drains SSH output; force-close only if the peer never closes.
+        self._schedule(timers, closeChannel, self.shutdownTimeoutMs);
       }
     }
-
-    function onChannelClose() { cleanup(0); }
-    function onChannelEnd() { cleanup(0); }
-
-    ws.on('message', (data) => {
-      if (closed) return;
-      const result = parseServerMessage(data);
-      if (result.type === 'session_ended') {
-        cleanup(result.exitCode ?? 0);
+    function onDrain() {
+      waitingDrain = false;
+      cancel(drainDeadline);
+      drainDeadline = null;
+      flushOutput();
+      if (!closed && !finished && finishCode === null) {
+        try { ws.resume?.(); } catch (_) {}
+      }
+    }
+    function complete(code, diagnostic, reason = 'completed') {
+      if (closed || finishCode !== null) return;
+      finishCode = code;
+      finishReason = reason;
+      cancel(execTimer);
+      cancel(sendDeadline);
+      cancel(pollTimer);
+      clearInterval(pingTimer);
+      cancel(pongTimer);
+      pending.length = 0;
+      pendingBytes = 0;
+      if (diagnostic) { try { channel.stderr?.write(diagnostic); } catch (_) {} }
+      self._closeWebSocket(ws);
+      flushOutput();
+    }
+    function queueOutput(buffer) {
+      if (closed || finishCode !== null) return;
+      if (outputBytes + buffer.length > self.maxQueuedOutputBytes) {
+        complete(125, 'Output queue limit exceeded.\n', 'output_limit');
         return;
       }
-      if ((result.type !== 'data' && result.type !== 'raw_text') || !result.payload) return;
-
-      const buf = Buffer.from(result.payload);
-      if (channel.closed) return;
-      let writable = true;
-      try { writable = channel.write(buf); } catch (_) { cleanup(EXEC_ERROR_EXIT_CODE); return; }
-      session.bytesReceived += buf.length;
-      self._totalBytesReceived += buf.length;
-      self.emit('traffic', { sessionId: session.id, direction: 'received', bytes: buf.length });
-
-      if (!writable && !channelDrainListener) {
-        try { ws.pause?.(); } catch (_) {}
-        channelDrainListener = () => {
-          channelDrainListener = null;
-          if (!closed) {
-            try { ws.resume?.(); } catch (_) {}
-          }
-        };
-        channel.once('drain', channelDrainListener);
+      account('received', buffer.length);
+      for (let offset = 0; offset < buffer.length; offset += EXEC_WRITE_CHUNK_BYTES) {
+        output.push(buffer.subarray(offset, offset + EXEC_WRITE_CHUNK_BYTES));
       }
-    });
-
-    ws.on('pong', () => {
-      if (pongTimer) { clearTimeout(pongTimer); pongTimer = null; }
-    });
-
+      outputBytes += buffer.length;
+      flushOutput();
+    }
+    function enqueue(text, rawBytes = 0) {
+      if (text) pending.push({ text, offset: 0, rawBytes });
+    }
+    function scheduleFlush() {
+      if (pollTimer || closed || finishCode !== null) return;
+      if (!sendDeadline) sendDeadline = self._schedule(timers, () => {
+        complete(exec ? 125 : 1, 'WSS input stalled.\n', 'timeout');
+      }, self.wssHandshakeTimeoutMs);
+      pollTimer = self._schedule(timers, () => { pollTimer = null; flushInput(); }, self.backpressurePollMs);
+    }
+    function send(message, bytes) {
+      if ((ws.bufferedAmount || 0) + bytes > self.maxWsBufferedBytes) return false;
+      try { ws.send(message, (error) => { if (error) complete(255, undefined, 'network_error'); }); }
+      catch (_) { complete(255, undefined, 'network_error'); return false; }
+      return !closed && finishCode === null;
+    }
+    function flushInput() {
+      if (closed || finishCode !== null || !ready || ws.readyState !== WS_OPEN) return;
+      while (pending.length) {
+        const item = pending[0];
+        let frame;
+        try {
+          frame = item.frame || nextDataFrame(item.text, item.offset, Math.min(self.maxWsBufferedBytes, EXEC_WRITE_CHUNK_BYTES));
+          item.frame = frame;
+        } catch (_) { complete(1, 'WSS frame limit is too small.\n', 'interrupted'); return; }
+        if (!send(frame.message, frame.bytes)) { pauseInput(); scheduleFlush(); return; }
+        item.frame = null;
+        item.offset = frame.end;
+        if (item.offset === item.text.length) {
+          pending.shift();
+          pendingBytes -= item.rawBytes;
+          account('sent', item.rawBytes);
+        }
+      }
+      if (pendingResize) {
+        const message = JSON.stringify({ $case: 'resize', resize: pendingResize });
+        const bytes = Buffer.byteLength(message);
+        if (bytes > self.maxWsBufferedBytes) { complete(1, undefined, 'interrupted'); return; }
+        if (!send(message, bytes)) { scheduleFlush(); return; }
+        pendingResize = null;
+      }
+      cancel(sendDeadline);
+      sendDeadline = null;
+      resumeInput();
+      if (!exec && inputEnded && !disconnectSent) {
+        const message = JSON.stringify({ $case: 'disconnect' });
+        const bytes = Buffer.byteLength(message);
+        if (bytes > self.maxWsBufferedBytes) { complete(1, undefined, 'interrupted'); return; }
+        if (!send(message, bytes)) { scheduleFlush(); return; }
+        disconnectSent = true;
+        self._schedule(timers, () => complete(0, undefined, 'user_disconnect'), self.shutdownTimeoutMs);
+      }
+    }
+    function onInput(data) {
+      if (closed || finishCode !== null || !data.length) return;
+      if (exec) { complete(1, 'Exec stdin is not supported.\n', 'interrupted'); return; }
+      if (inputEnded) return;
+      if (pendingBytes + data.length > self.maxPendingBytes) {
+        complete(1, 'SSH input limit exceeded.\n', 'interrupted');
+        return;
+      }
+      const oldCarry = decoder.lastNeed ? decoder.lastTotal - decoder.lastNeed : 0;
+      pendingBytes += data.length;
+      const text = decoder.write(data);
+      const carry = decoder.lastNeed ? decoder.lastTotal - decoder.lastNeed : 0;
+      enqueue(text, data.length + oldCarry - carry);
+      if (!ready) pauseInput();
+      flushInput();
+    }
+    function onInputEnd() {
+      if (inputEnded || closed) return;
+      inputEnded = true;
+      if (exec) return; // SSH EOF is not command cancellation.
+      const carry = decoder.lastNeed ? decoder.lastTotal - decoder.lastNeed : 0;
+      enqueue(decoder.end(), carry);
+      flushInput();
+    }
+    session = this._openSession(clientStr, (reason = 'user_disconnect') => complete(255, undefined, reason),
+      exec ? 'exec' : 'shell');
+    if (exec) {
+      const nonce = crypto.randomBytes(32).toString('hex');
+      parser = createExecParser({
+        nonce,
+        maxPreludeBytes: this.maxExecPreludeBytes,
+        maxOutputBytes: this.maxExecOutputBytes,
+        maxEncodedBytes: this.maxExecEncodedBytes,
+        onReady() {
+          if (closed || finishCode !== null) return;
+          const bytes = Buffer.byteLength(commandText);
+          pendingBytes += bytes;
+          enqueue(`${Buffer.from(commandText, 'utf8').toString('base64')}\n`, bytes);
+          flushInput();
+        },
+        onOutput: queueOutput,
+        onComplete: complete,
+      });
+      enqueue(`exec sh -c ${quotePosix(buildExecBootstrap(nonce))}\n`);
+    }
     ws.on('open', () => {
-      if (closed) return;
-      self.emit('proxy-log', 'info', 'wss', 'WSS connected for interactive session');
-      wssReady = true;
-      startPingPong();
-      flushPending();
-    });
-
-    ws.on('unexpected-response', (_req, res) => {
-      if (closed) return;
-      self.emit('proxy-log', 'error', 'wss', `WSS HTTP ${res.statusCode} for interactive session`);
-      res.resume?.();
-      if (res.statusCode === 401 || res.statusCode === 403) {
-        self.emit('auth-error', { statusCode: res.statusCode, clientStr });
+      if (closed || finishCode !== null) return;
+      ready = true;
+      if (ptyState.cols !== initialSize.cols || ptyState.rows !== initialSize.rows) {
+        pendingResize = { cols: ptyState.cols, rows: ptyState.rows };
       }
-      cleanup(EXEC_ERROR_EXIT_CODE);
-    });
-
-    ws.on('error', (err) => {
-      if (closed) return;
-      self.emit('proxy-log', 'error', 'wss', `WSS interactive error: ${err.message}`);
-      cleanup(EXEC_ERROR_EXIT_CODE);
-    });
-
-    ws.on('close', (code) => {
-      if (closed) return;
-      if (self._isAuthCloseCode(code)) {
-        self.emit('auth-error', { statusCode: code, clientStr });
+      if (exec) execTimer = self._schedule(timers, () => complete(124, undefined, 'timeout'), self.execTimeoutMs);
+      else {
+        pingTimer = setInterval(() => {
+          if (closed || finishCode !== null || ws.readyState !== WS_OPEN) return;
+          cancel(pongTimer);
+          try { ws.ping(); } catch (_) { complete(255, undefined, 'network_error'); return; }
+          pongTimer = self._schedule(timers, () => {
+            try { ws.terminate(); } catch (_) {}
+            complete(255, undefined, 'timeout');
+          }, self.pingTimeoutMs);
+        }, self.pingIntervalMs);
+        pingTimer.unref?.();
       }
-      cleanup(code === 1000 ? 0 : EXEC_ERROR_EXIT_CODE);
+      flushInput();
     });
-
-    channel.on('data', onChannelData);
-    channel.on('close', onChannelClose);
-    channel.on('end', onChannelEnd);
+    ws.on('pong', () => { cancel(pongTimer); pongTimer = null; });
+    ws.on('message', (data) => {
+      if (closed || finishCode !== null) return;
+      const result = parseServerMessage(data);
+      if (result.type === 'session_ended') {
+        const setupFailed = exec && result.exitCode === 126 && parser.state === 'PRELUDE';
+        complete(exec ? (setupFailed ? 1 : (result.exitCode > 0 ? result.exitCode : 255)) : (result.exitCode ?? 0),
+          undefined, exec && (setupFailed || !result.exitCode) ? 'interrupted' : 'completed');
+        return;
+      }
+      if (result.type !== 'data') return;
+      if (exec) {
+        try { parser.write(result.payload); } catch (error) {
+          const limited = error?.code === 'EXEC_OUTPUT_LIMIT';
+          complete(limited ? 125 : 1, 'Exec protocol failed.\n', limited ? 'output_limit' : 'interrupted');
+        }
+      } else queueOutput(Buffer.from(result.payload, 'utf8'));
+    });
+    ws.on('unexpected-response', (_request, response) => {
+      if (closed || finishCode !== null) return;
+      response.resume?.();
+      if (response.statusCode === 401 || response.statusCode === 403) {
+        self.emit('auth-error', { statusCode: response.statusCode, clientStr });
+      }
+      complete(exec ? 255 : 1, undefined,
+        response.statusCode === 401 || response.statusCode === 403 ? 'auth_error' : 'network_error');
+    });
+    ws.on('error', () => complete(255, undefined, 'network_error'));
+    ws.on('close', () => {
+      if (!closed && finishCode === null) complete(255, undefined, 'network_error');
+    });
+    channel.on('data', onInput);
+    channel.on('end', onInputEnd);
+    channel.on('close', cleanup);
+    return {
+      resize(cols, rows) {
+        if (closed || finishCode !== null) return;
+        ptyState.cols = cols;
+        ptyState.rows = rows;
+        pendingResize = { cols, rows };
+        // One latest-size record per tick, including while WSS is blocked.
+        if (ready) scheduleFlush();
+      },
+    };
   }
 
   _rawClientKey(ctx) {
@@ -847,6 +694,7 @@ class ProxyServer extends EventEmitter {
     this._clients.add(client);
     const clientChannels = new Set();
     const clientChannelCleanups = new Map();
+    const socketState = this._sockets.get(client._sock);
     this.emit('connection', this._clients.size);
     const addr = (client._sock && `${client._sock.remoteAddress}:${client._sock.remotePort}`)
       || 'unknown';
@@ -886,13 +734,23 @@ class ProxyServer extends EventEmitter {
       this.emit('proxy-log', 'info', 'ssh', `Client ready: ${addr}`);
 
       client.on('session', (acceptSession, rejectSession) => {
-        if (this._sshChannels.size >= this.maxSessions) {
+        if (!this._acceptingConnections || this._sshChannels.size >= this.maxSessions) {
           rejectSession?.();
           return;
         }
 
         const sshSession = acceptSession();
         let bridgeStarted = false;
+        let bridgeHandle = null;
+        const ptyState = { requested: false, cols: this.cols, rows: this.rows,
+          closeReason: () => socketState?.reason || 'interrupted' };
+        const updateSize = (info) => {
+          if (!info || !Number.isInteger(info.cols) || !Number.isInteger(info.rows)
+              || info.cols < 0 || info.cols > 500 || info.rows < 0 || info.rows > 200) return false;
+          if (info.cols) ptyState.cols = info.cols;
+          if (info.rows) ptyState.rows = info.rows;
+          return true;
+        };
         this._sshChannels.add(sshSession);
         clientChannels.add(sshSession);
         const removeSshChannel = () => {
@@ -906,8 +764,12 @@ class ProxyServer extends EventEmitter {
         sshSession.once('close', removeSshChannel);
         sshSession.once('error', removeSshChannel);
 
-        sshSession.on('pty', (acceptPty) => {
-          this.emit('proxy-log', 'info', 'ssh', 'PTY requested');
+        sshSession.on('pty', (acceptPty, rejectPty, info) => {
+          if (bridgeStarted || ptyState.requested || !updateSize(info)) {
+            rejectPty?.();
+            return;
+          }
+          ptyState.requested = true;
           acceptPty?.();
         });
 
@@ -918,21 +780,25 @@ class ProxyServer extends EventEmitter {
           }
           bridgeStarted = true;
           const channel = acceptShell();
-          this._bridgeSshToWss(channel, client, addr);
+          bridgeHandle = this._bridgeSshToWss(channel, addr, ptyState);
         });
 
         sshSession.on('exec', (acceptExec, rejectExec, info) => {
-          if (bridgeStarted || this._sessions.size >= this.maxSessions) {
+          if (bridgeStarted || this._sessions.size >= this.maxSessions || typeof info?.command !== 'string') {
             rejectExec?.();
             return;
           }
           bridgeStarted = true;
           const channel = acceptExec();
-          this._bridgeExecToWss(channel, client, addr, info.command);
+          bridgeHandle = this._bridgeExecToWss(channel, addr, info.command, ptyState);
         });
 
         sshSession.on('env', (acceptEnv) => acceptEnv?.());
-        sshSession.on('window-change', (accept) => accept?.());
+        sshSession.on('window-change', (acceptResize, rejectResize, info) => {
+          if (!ptyState.requested || !updateSize(info)) { rejectResize?.(); return; }
+          bridgeHandle?.resize(ptyState.cols, ptyState.rows);
+          acceptResize?.();
+        });
       });
     });
 
@@ -944,6 +810,7 @@ class ProxyServer extends EventEmitter {
     });
 
     client.on('error', (err) => {
+      if (socketState && !socketState.reason) socketState.reason = 'network_error';
       this.emit('proxy-log', 'error', 'ssh', `Client error: ${err.message}`);
     });
   }
@@ -954,7 +821,7 @@ class ProxyServer extends EventEmitter {
       return false;
     }
 
-    const meta = { handshakeTimer: null, onTimeout: null };
+    const meta = { handshakeTimer: null, onTimeout: null, reason: null };
     this._sockets.set(socket, meta);
 
     const cleanup = () => {
@@ -963,22 +830,31 @@ class ProxyServer extends EventEmitter {
       this._sockets.delete(socket);
     };
     socket.once('close', cleanup);
-    socket.once('error', () => {});
+    socket.once('error', () => { if (!meta.reason) meta.reason = 'network_error'; });
 
     meta.handshakeTimer = setTimeout(() => {
       meta.handshakeTimer = null;
+      meta.reason = 'timeout';
       socket.destroy();
     }, this.sshHandshakeTimeoutMs);
     meta.handshakeTimer.unref?.();
 
-    meta.onTimeout = () => socket.destroy();
+    meta.onTimeout = () => { meta.reason = 'timeout'; socket.destroy(); };
     socket.setTimeout?.(this.socketIdleTimeoutMs);
     socket.on('timeout', meta.onTimeout);
     socket.setNoDelay?.(true);
     return true;
   }
 
+  setAcceptingConnections(accepting) {
+    this._acceptingConnections = accepting === true;
+  }
+
   _handleTcpSocket(socket) {
+    if (!this._acceptingConnections) {
+      socket.destroy();
+      return;
+    }
     if (!this._trackTcpSocket(socket)) return;
     try {
       this._sshServer.injectSocket(socket);
@@ -991,6 +867,7 @@ class ProxyServer extends EventEmitter {
   _sessionSnapshot(session) {
     return {
       id: session.id,
+      kind: session.kind,
       remoteAddress: session.remoteAddress,
       connectedAt: session.connectedAt,
       bytesSent: session.bytesSent,
@@ -1019,7 +896,7 @@ class ProxyServer extends EventEmitter {
   disconnectSession(sessionId) {
     const session = this._sessions.get(sessionId);
     if (!session || typeof session._close !== 'function') return false;
-    session._close();
+    session._close('user_disconnect');
     return true;
   }
 
@@ -1136,7 +1013,11 @@ class ProxyServer extends EventEmitter {
             }
             this._started = true;
             this._startTime = Date.now();
-            this.emit('started', { host: this.host, port: this.port });
+            const address = server.address?.();
+            this.emit('started', {
+              host: address?.address || this.host,
+              port: address?.port ?? this.port,
+            });
             settle(resolve, true);
           });
         } catch (err) {
@@ -1162,14 +1043,14 @@ class ProxyServer extends EventEmitter {
     return listening;
   }
 
-  stop() {
+  stop(reason = 'proxy_stop') {
     this._cancelPendingStart();
     if (this._stopPromise) return this._stopPromise;
 
-    const wasActive = this._started || this._starting || !!this._server || !!this._startPromise;
+    const wasActive = this._started || this._starting || !!this._server || !!this._startPromise || this._sessions.size > 0;
     if (!wasActive) return Promise.resolve();
 
-    const operation = this._enqueueLifecycle(() => this._doStop(wasActive));
+    const operation = this._enqueueLifecycle(() => this._doStop(wasActive, reason));
     const result = operation.finally(() => {
       if (this._stopPromise === result) this._stopPromise = null;
     });
@@ -1223,13 +1104,18 @@ class ProxyServer extends EventEmitter {
     });
   }
 
-  async _doStop(emitStopped) {
+  async _doStop(emitStopped, reason) {
     this._stopping = true;
     this._started = false;
     this._startTime = null;
     try {
+      const sessionReason = reason === 'app_exit' || reason === 'fatal' ? 'app_exit'
+        : reason === 'auth_error' ? 'auth_error' : 'proxy_stop';
       for (const session of Array.from(this._sessions.values())) {
-        try { session._close?.(); } catch (_) {}
+        try { session._close?.(sessionReason); } catch (_) {}
+        // A stalled SSH reader may defer bridge completion. Stop still owns and
+        // finalizes its last counters before stopped, including a failed stop.
+        this._closeSessionRecord(session, { exitCode: null, reason: sessionReason });
       }
       for (const client of this._clients) {
         try { client.end(); } catch (_) {}

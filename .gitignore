@@ -5,6 +5,8 @@ node_modules/
 dist/
 release/
 coverage/
+test-results/
+playwright-report/
 
 # IDE / Editors
 .vscode/

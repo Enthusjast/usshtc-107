@@ -1,19 +1,20 @@
+import { formatApiError } from '../lib/api-errors';
 import { useState, useEffect, useCallback, useRef } from 'react';
 import {
-  getStatus, getStats,
   startLogin, startProxy, stopProxy,
-  onLoginStatus, onProxyStatus, onCookieStatus, onLoginProgress,
-  onStatsUpdate,
-  copyToClipboard, getSshKeyInfo,
+  copyToClipboard, getSshKeyInfo, retryRecovery,
 } from '../lib/electron';
 import { useToast } from '../components/Toast';
 import LoadError from '../components/LoadError';
+import TrafficTrend from '../components/TrafficTrend';
+import SetupResume from '../components/SetupResume';
 import { useLocale } from '../i18n/LocaleContext';
 import {
   IconKey, IconZap, IconLink, IconGlobe,
   IconActivity, IconClipboard,
 } from '../components/Icons';
 import { formatBytes, formatUptime } from '../lib/format';
+import { useRuntime, sameScope } from '../contexts/RuntimeContext';
 
 const LOGIN_META_KEYS = {
   idle:     ['notLoggedIn', 'red'],
@@ -27,40 +28,28 @@ const PROXY_META_KEYS = {
   stopped:  ['stopped', 'red'],
   starting: ['starting', 'yellow'],
   started:  ['running', 'green'],
+  stopping: ['stopping', 'yellow'],
   error:    ['error', 'red'],
 };
 
-const LOGIN_PROGRESS_KEYS = {
-  navigating: 'openingLoginPage',
+const REMOTE_STATUS_KEYS = {
+  unknown: 'remoteStatusUnknown', checking: 'remoteStatusChecking', reachable: 'remoteStatusReachable',
+  offline: 'remoteStatusOffline', auth_required: 'remoteStatusAuthRequired', error: 'remoteStatusError',
 };
 
-export default function DashboardView() {
+
+export default function DashboardView({ onNavigate }) {
   const pushToast = useToast();
   const { t } = useLocale();
 
-  const [state, setState] = useState({
-    loginStatus: 'idle',
-    proxyStatus: 'stopped',
-    connectionCount: 0,
-    cookieValid: false,
-    cookieCount: 0,
-    host: '127.0.0.1',
-    port: 3000,
-    wssUrl: '',
-    error: null,
-  });
+  const { snapshot, scope, getScope, loading, error, retry, flushDraft, stats, rates, ratePoints, statsLoading, statsError, retryStats } = useRuntime();
+  const config = snapshot?.runningConfig ?? snapshot?.desiredConfig;
+  const state = { ...snapshot, ...config, error: snapshot?.errorCode };
 
-  const [stats, setStats] = useState({
-    uptimeMs: 0,
-    totalBytesSent: 0,
-    totalBytesReceived: 0,
-    sessionCount: 0,
-    sessions: [],
-  });
 
-  const [loaded, setLoaded] = useState(false);
-  const [statusLoaded, setStatusLoaded] = useState(false);
-  const [loadError, setLoadError] = useState(false);
+  const loaded = !loading && Boolean(snapshot);
+  const statusLoaded = Boolean(snapshot);
+  const loadError = Boolean(error);
   const [pendingAction, setPendingAction] = useState(null);
   const [copied, setCopied] = useState(false);
   const [sshKeyPath, setSshKeyPath] = useState('');
@@ -68,78 +57,56 @@ export default function DashboardView() {
   const previousProxyStatusRef = useRef(state.proxyStatus);
   const pendingActionRef = useRef(null);
   const copyTimerRef = useRef(null);
-  const statusFieldVersionsRef = useRef({});
-  const statsVersionRef = useRef(0);
-  const sshCommand = sshKeyPath
-    ? `ssh -o StrictHostKeyChecking=accept-new -i "${sshKeyPath}" -p ${state.port} user@${state.host}`
-    : `ssh -o StrictHostKeyChecking=accept-new -p ${state.port} user@${state.host}`;
-
-  const loadDashboard = useCallback(async () => {
-    const statusVersionsAtStart = { ...statusFieldVersionsRef.current };
-    const statsVersionAtStart = statsVersionRef.current;
-    setLoaded(false);
-    setStatusLoaded(false);
-    setLoadError(false);
-    const [statusResult, statsResult, keyResult] = await Promise.allSettled([
-      getStatus(),
-      getStats(),
-      getSshKeyInfo(),
-    ]);
-
-    const status = statusResult.status === 'fulfilled' ? statusResult.value : null;
-    const nextStats = statsResult.status === 'fulfilled' ? statsResult.value : null;
-    const keyInfo = keyResult.status === 'fulfilled' ? keyResult.value : null;
-
-    if (status) {
-      setState((prev) => {
-        const merged = { ...prev };
-        Object.entries(status).forEach(([key, value]) => {
-          const currentVersion = statusFieldVersionsRef.current[key] || 0;
-          const versionAtStart = statusVersionsAtStart[key] || 0;
-          if (currentVersion === versionAtStart) merged[key] = value;
-        });
-        return merged;
-      });
-    }
-    if (nextStats && statsVersionRef.current === statsVersionAtStart) setStats(nextStats);
-    if (keyInfo?.privateKeyPath) setSshKeyPath(keyInfo.privateKeyPath);
-    if (!status || !nextStats) setLoadError(true);
-    setStatusLoaded(Boolean(status));
-    setLoaded(true);
-  }, []);
+  const [recoveryPending, setRecoveryPending] = useState(false);
+  const [recoveryError, setRecoveryError] = useState(null);
+  const recoveryRequest = useRef(null);
+  const activeScope = useRef(scope);
+  activeScope.current = scope;
 
   useEffect(() => {
-    loadDashboard();
-  }, [loadDashboard]);
+    setRecoveryPending(false);
+    setRecoveryError(null);
+    return () => { recoveryRequest.current = null; };
+  }, [scope?.profileId, scope?.epoch]);
+
+  const handleRecoveryRetry = async () => {
+    if (recoveryRequest.current || snapshot?.storageErrorCode || snapshot?.operation || snapshot?.remoteStatus === 'checking' || snapshot?.remoteStatus === 'auth_required') return;
+    const token = { scope };
+    recoveryRequest.current = token;
+    const accepts = () => recoveryRequest.current === token && sameScope(getScope?.() ?? activeScope.current, token.scope);
+    setRecoveryPending(true);
+    setRecoveryError(null);
+    try {
+      await flushDraft();
+      if (!accepts()) return;
+      await retryRecovery(token.scope);
+    } catch (failure) {
+      if (accepts() && failure?.code !== 'OPERATION_CANCELLED') setRecoveryError(failure);
+    } finally {
+      if (accepts()) { recoveryRequest.current = null; setRecoveryPending(false); }
+    }
+  };
+  const targetHost = state.host === '0.0.0.0' ? '127.0.0.1' : state.host === '::' ? '::1' : state.host;
+  const sshHost = targetHost?.includes(':') ? `[${targetHost}]` : targetHost;
+  const sshCommand = sshKeyPath
+    ? `ssh -o StrictHostKeyChecking=accept-new -i "${sshKeyPath}" -p ${state.port} user@${sshHost}`
+    : `ssh -o StrictHostKeyChecking=accept-new -p ${state.port} user@${sshHost}`;
+
+  const loadDashboard = retry;
+  useEffect(() => {
+    let active = true;
+    setSshKeyPath('');
+    if (!scope) return () => { active = false; };
+    getSshKeyInfo(scope).then((value) => {
+      if (active && sameScope(scope, getScope())) setSshKeyPath(value.scope === 'application' && value.client?.state === 'ready' ? value.client.privateKeyPath || '' : '');
+    }).catch(() => {});
+    return () => { active = false; };
+  }, [scope]);
 
   useEffect(() => () => {
     if (copyTimerRef.current !== null) clearTimeout(copyTimerRef.current);
   }, []);
 
-  useEffect(() => {
-    const applyLiveStatus = (patch) => {
-      Object.keys(patch).forEach((key) => {
-        statusFieldVersionsRef.current[key] = (statusFieldVersionsRef.current[key] || 0) + 1;
-      });
-      setState((prev) => ({ ...prev, ...patch }));
-    };
-
-    const unsubs = [
-      onLoginStatus((data) => applyLiveStatus({ loginStatus: data })),
-      onProxyStatus((data) => { if (data) applyLiveStatus(data); }),
-      onCookieStatus((data) => { if (data) applyLiveStatus(data); }),
-      onLoginProgress((data) => {
-        const key = LOGIN_PROGRESS_KEYS[data?.status];
-        if (key) pushToast('info', t(key));
-      }),
-      onStatsUpdate((data) => {
-        if (!data) return;
-        statsVersionRef.current += 1;
-        setStats(data);
-      }),
-    ];
-    return () => unsubs.forEach((u) => u?.());
-  }, [pushToast, t]);
 
   useEffect(() => {
     if (!statusLoaded) return;
@@ -153,15 +120,16 @@ export default function DashboardView() {
 
     if (state.proxyStatus !== previousProxyStatusRef.current) {
       if (state.proxyStatus === 'started') pushToast('success', t('proxyRunningToast'), t('listeningOn', state.host, state.port));
-      if (state.proxyStatus === 'error') pushToast('error', t('proxyError'), state.error);
+      if (state.proxyStatus === 'error') pushToast('error', t('proxyError'), formatApiError({ code: state.error }, t));
       previousProxyStatusRef.current = state.proxyStatus;
     }
   }, [statusLoaded, state.loginStatus, state.proxyStatus, t, pushToast, state.host, state.port, state.error]);
 
   const handleCopy = useCallback(async () => {
-    const ok = await copyToClipboard(sshCommand);
-    if (ok === false) {
-      pushToast('error', t('copyFailed'));
+    try {
+      await copyToClipboard(sshCommand);
+    } catch (error) {
+      pushToast('error', t('copyFailed'), formatApiError(error, t));
       return;
     }
     setCopied(true);
@@ -174,46 +142,37 @@ export default function DashboardView() {
   }, [pushToast, sshCommand, t]);
 
   const runAction = useCallback(async (action, fn) => {
-    if (pendingActionRef.current !== null) return;
-    const actionToken = Symbol(action);
+    if (snapshot?.storageErrorCode && action !== 'stop') return;
+    if (pendingActionRef.current !== null && !(action === 'stop' && pendingActionRef.current.action === 'start')) return;
+    const actionToken = { action };
     pendingActionRef.current = actionToken;
     setPendingAction(action);
     try {
-      const result = await fn();
-      if (result?.ok === false) throw new Error(result.error || t('unknownError'));
+      await flushDraft();
+      await fn(scope);
+
     } catch (error) {
-      pushToast('error', t('actionFailed'), error?.message || t('unknownError'));
+      if (error?.code !== 'OPERATION_CANCELLED') pushToast('error', t('actionFailed'), formatApiError(error, t));
     } finally {
       if (pendingActionRef.current === actionToken) {
         pendingActionRef.current = null;
         setPendingAction(null);
       }
     }
-  }, [pushToast, t]);
+  }, [pushToast, t, flushDraft, scope, snapshot?.storageErrorCode]);
 
-  const handleStartProxy = useCallback(() => {
-    if (pendingActionRef.current !== null) return;
-    if (state.proxyStatus === 'error'
-      && state.connectionCount > 0
-      && !window.confirm(t('confirmStopProxy', state.connectionCount))) return;
-    runAction('start', startProxy);
-  }, [runAction, state.connectionCount, state.proxyStatus, t]);
-
-  const handleStopProxy = useCallback(() => {
-    if (pendingActionRef.current !== null) return;
-    if (state.connectionCount > 0 && !window.confirm(t('confirmStopProxy', state.connectionCount))) return;
-    runAction('stop', stopProxy);
-  }, [runAction, state.connectionCount, t]);
+  const handleStartProxy = useCallback(() => runAction('start', startProxy), [runAction]);
+  const handleStopProxy = useCallback(() => runAction('stop', stopProxy), [runAction]);
 
   const [loginStatusKey, loginColor] = LOGIN_META_KEYS[state.loginStatus] || ['unknownStatus', 'yellow'];
   const [proxyStatusKey, proxyColor] = PROXY_META_KEYS[state.proxyStatus] || ['unknownStatus', 'yellow'];
   const canStartProxy = state.loginStatus === 'success'
     && state.cookieValid
-    && ['stopped', 'error'].includes(state.proxyStatus);
+    && !state.storageErrorCode && !state.operation && ['stopped', 'error'].includes(state.proxyStatus);
   const canStopProxy = ['starting', 'started', 'error'].includes(state.proxyStatus);
   const isRunning = state.proxyStatus === 'started';
 
-  if (!loaded) {
+  if (!loaded && !loadError) {
     return (
       <div className="dashboard-grid" aria-busy="true" aria-label={t('loadingDashboard')}>
         {[1,2,3,4,5,6].map((i) => (
@@ -241,6 +200,7 @@ export default function DashboardView() {
 
   return (
     <div className="dashboard-grid">
+      <SetupResume onNavigate={onNavigate} />
       {/* Auth Card */}
       <div className="card">
         <h2 className="card-header">
@@ -255,12 +215,13 @@ export default function DashboardView() {
             : state.cookieCount > 0
               ? t('nCookies', state.cookieCount)
               : t('noSessionCookies')}
+          {state.loginStage && <p role="status">{t(state.loginStage === 'opening' ? 'openingLoginPage' : state.loginStage === 'sso' ? 'loggingIn' : 'openWebSSHPage')}</p>}
         </div>
         <button
           className={`btn ${state.loginStatus === 'success' ? '' : 'btn-primary'}`}
           type="button"
           onClick={() => runAction('login', startLogin)}
-          disabled={pendingAction !== null || state.loginStatus === 'pending' || state.loginStatus === 'sso_done'}
+          disabled={Boolean(state.storageErrorCode) || pendingAction !== null || Boolean(state.operation) || state.loginStatus === 'pending' || state.loginStatus === 'sso_done'}
         >
           {pendingAction === 'login' ? t('loggingIn') : state.loginStatus === 'success' ? t('reLogin') : t('login')}
         </button>
@@ -280,18 +241,33 @@ export default function DashboardView() {
             : state.proxyStatus === 'starting'
               ? t('initializingSSH')
               : state.proxyStatus === 'error' && state.error
-                ? state.error
+                ? formatApiError({ code: state.error }, t)
                 : t('notRunning')}
         </div>
         <div style={{ display: 'flex', gap: '0.5rem' }}>
           <button type="button" className="btn btn-primary" onClick={handleStartProxy} disabled={!canStartProxy || pendingAction !== null}>
             {pendingAction === 'start' ? t('starting') : t('start')}
           </button>
-          <button type="button" className="btn btn-danger" onClick={handleStopProxy} disabled={!canStopProxy || pendingAction !== null}>
+          <button type="button" className="btn btn-danger" onClick={handleStopProxy} disabled={!canStopProxy || (pendingAction !== null && pendingAction !== 'start')}>
             {pendingAction === 'stop' ? t('stopping') : t('stop')}
           </button>
         </div>
       </div>
+
+      <section className="card dashboard-grid-wide network-recovery" aria-labelledby="recovery-heading" aria-busy={recoveryPending || state.remoteStatus === 'checking'}>
+        <h2 id="recovery-heading" className="card-header">
+          <span className="card-header-icon" aria-hidden="true"><IconGlobe /></span> {t('networkRecovery')}
+        </h2>
+        <p role="status">{t(REMOTE_STATUS_KEYS[state.remoteStatus] ?? 'remoteStatusUnknown')}</p>
+        <p className="settings-help">{t(state.desiredRunning ? 'recoveryDesiredRunning' : 'recoveryStoppedByUser')}</p>
+        {state.remoteStatus === 'auth_required' && <p className="settings-warning">{t('recoveryLoginRequired')}</p>}
+        {(recoveryError || (['offline', 'error'].includes(state.remoteStatus) && state.error)) && <p className="field-error" role="alert">{formatApiError(recoveryError ?? { code: state.error }, t)}</p>}
+        <button type="button" className="btn" disabled={recoveryPending || state.remoteStatus === 'checking' || state.remoteStatus === 'auth_required' || Boolean(state.storageErrorCode) || Boolean(state.operation)} onClick={() => { void handleRecoveryRetry(); }}>
+          {t(recoveryPending || state.remoteStatus === 'checking' ? 'recoveryChecking' : 'recoveryRetry')}
+        </button>
+        <p className="settings-help">{t('recoveryProofScope')}</p>
+        <p className="settings-help">{t('recoveryReconnectClients')}</p>
+      </section>
 
       {/* Traffic Stats (wide) */}
       {isRunning && (
@@ -317,6 +293,9 @@ export default function DashboardView() {
               <div className="stat-card-label">{t('activeSessions')}</div>
             </div>
           </div>
+          {statsLoading && <p role="status">{t('loadingTraffic')}</p>}
+          {statsError && <div role="alert">{formatApiError(statsError, t)} <button type="button" className="btn" onClick={retryStats}>{t('retry')}</button></div>}
+          <TrafficTrend rates={rates} points={ratePoints} />
         </div>
       )}
 
@@ -325,6 +304,7 @@ export default function DashboardView() {
         <h2 className="card-header">
           <span className="card-header-icon"><IconLink /></span> {t('sshConnection')}
         </h2>
+        {!isRunning && <p>{t('nextStartConfig')}</p>}
         <code style={{
           fontSize: '1.5rem',
           fontFamily: 'var(--font-mono)',
