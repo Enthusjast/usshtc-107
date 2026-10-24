@@ -169,6 +169,7 @@ test('stopped, starting, busy, missing-auth and locked contexts never start a li
     (f) => { f.snapshot.desiredRunning = false; },
     (f) => { f.snapshot.operation = 'logging_in'; },
     (f) => { f.snapshot.storageErrorCode = 'SETTINGS_LOCKED'; },
+    (f) => { f.snapshot.remoteStatus = 'auth_required'; f.snapshot.errorCode = 'AUTH_REQUIRED'; },
     (f) => f.setCookie(''),
   ]) {
     const f = fixture({ enabled: true }); mutate(f);

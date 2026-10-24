@@ -41,6 +41,7 @@ function fixture(options = {}) {
   let controller;
   const sockets = [], states = [], auth = [], recovered = [], starts = [], requests = [], hintReads = [];
   const deps = {
+    portalPreflight: options.portalPreflight || { run: async () => ({ ok: true }) },
     clock, net: { isOnline: () => { hintReads.push(clock.now()); return online; } },
     remoteReadyTimeoutMs: options.remoteReadyTimeoutMs,
     getSnapshot: () => snapshot, getConfig: () => config, getCookie: () => cookie, getPreferences: () => preferences,
@@ -524,4 +525,60 @@ test('custom readiness deadline is independent of handshake and is cancelled by 
     g.controller.dispose();
     assert.equal(g.clock.timers.size, 0);
   }
+});
+
+test('REST invalid token ends recovery without WSS, backoff or destructive auth callback', async () => {
+  let calls = 0;
+  const f = fixture({ portalPreflight: { run: async () => {
+    calls += 1;
+    throw Object.assign(new Error('AUTH_REQUIRED'), { code: 'AUTH_REQUIRED' });
+  } } });
+  const round = f.controller.retry(scopeOf(f));
+  await f.clock.tick(1000);
+  assert.deepEqual(await round, { errorCode: 'AUTH_REQUIRED' });
+  assert.equal(f.snapshot.remoteStatus, 'auth_required');
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.auth.length, 0);
+  await f.clock.tick(120000);
+  assert.equal(calls, 1);
+  f.controller.dispose();
+});
+
+test('every readiness attempt redoes preflight; operational failures retry without WSS or auth revocation', async () => {
+  const contexts = [];
+  const f = fixture({ portalPreflight: { run: async (context) => {
+    contexts.push(context);
+    if (contexts.length < 3) throw Object.assign(new Error('private'), { code: 'PORTAL_NETWORK' });
+    return { ok: true };
+  } } });
+  const round = f.controller.retry(scopeOf(f));
+  await f.clock.tick(1000);
+  assert.equal(f.snapshot.errorCode, 'PORTAL_NETWORK');
+  await f.clock.tick(2000);
+  assert.equal(f.requests.length, 0);
+  await f.clock.tick(4000);
+  assert.deepEqual(await round, { reachable: true });
+  assert.equal(contexts.length, 3);
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.auth.length, 0);
+  f.controller.dispose();
+});
+
+test('context cancellation aborts recovery preflight and ignores late success', async () => {
+  let finish;
+  let context;
+  const f = fixture({ portalPreflight: { run: (value) => {
+    context = value;
+    return new Promise((resolve) => { finish = resolve; });
+  } } });
+  const round = f.controller.retry(scopeOf(f));
+  await f.clock.tick(1000);
+  f.controller.suspend();
+  assert.equal(context.signal.aborted, true);
+  finish({ ok: true });
+  await flush();
+  assert.deepEqual(await round, { cancelled: true });
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.auth.length, 0);
+  f.controller.dispose();
 });

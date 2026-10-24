@@ -44,6 +44,7 @@ function fixture(options = {}) {
     },
   };
   const controller = createAppController({
+    portalPreflight: { run: async () => ({ ok: true }) },
     settingsStore: { getRoot: () => root, isLocked: () => false,
       getStorageErrorCode: () => options.storageErrorCode || null,
       retryLoad() { calls.push(['reload']); },

@@ -53,6 +53,7 @@ export default function SetupView({ onBusyChange, onNavigate, onSetupExit }) {
   const verified = Boolean(authenticated && connected && typeof diagnostic?.finishedAt === 'string'
     && Number.isFinite(Date.parse(diagnostic.finishedAt)) && diagnostic.checks.every((check) => check.status === 'passed')
     && passed('ssh-config', 'SSH_CONFIG_OK') && passed('local-listener', 'LOCAL_SSH_OK', 'ssh-auth')
+    && passed('token', 'TOKEN_OK') && passed('setup', 'SETUP_OK')
     && passed('wss', 'WSS_SHELL_READY') && passed('remote-command', 'REMOTE_COMMAND_OK'));
   const canNext = step === 'login' ? authenticated : step === 'config' ? reviewed : step === 'connect' ? connected : verified;
 

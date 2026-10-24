@@ -140,6 +140,7 @@ const authReady = electron.app.whenReady().then(() => {
       shell: { openExternal: async () => { throw new Error('External browser is disabled in acceptance'); } } },
     clock, log: { info() {}, warn() {}, error() {}, debug() {} },
     sshDirectory: path.join(root, 'home', '.ssh'),
+    portalPreflight: { validate: async () => ({ status: 'valid' }), setup: async () => ({ ok: true }), run: async () => ({ ok: true }) },
     autostartService: {
       getStatus: async () => ({ supported: false, enabled: false, approvalRequired: false, errorCode: null }),
       setEnabled: async () => { throw new Error('Acceptance must never register OS autostart'); },

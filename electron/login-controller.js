@@ -85,10 +85,14 @@ function createLoginController(deps) {
       return;
     }
     if (!finalize && state.loginStatus !== 'success') return;
+    const authenticated = cookie !== next || state.loginStatus !== 'success' || !state.cookieValid;
     cookie = next;
-    emit({ loginStatus: 'success', loginStage: null, cookieValid: true, cookieCount: values.length });
-    // The app validates the captured identity and performs persistence/connection outside this callback.
-    deps.onAuthenticated?.({ scope: { ...query.scope }, authGeneration: query.authGeneration, cookie: next });
+    if (authenticated) {
+      emit({ loginStatus: 'success', loginStage: null, cookieValid: true, cookieCount: values.length });
+      // An epoch refresh only observes existing credentials; it is not a new
+      // login and must not rearm the app's authentication/start lifecycle.
+      deps.onAuthenticated?.({ scope: { ...query.scope }, authGeneration: query.authGeneration, cookie: next });
+    }
     if (finalize) {
       cancelPoll();
       const old = window;

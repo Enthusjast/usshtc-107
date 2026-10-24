@@ -21,8 +21,8 @@ vi.mock('../src/contexts/RuntimeContext', async (original) => ({ ...await origin
 
 const config = { host: '127.0.0.1', port: 3000, cluster: 'training', loginNode: '11.11.10.202', cols: 80, rows: 24, useRoot: false, path: '', startupCommand: '', wssUrl: 'wss://fixed.invalid/' };
 const preview = { block: '# managed\nHost usshtc107\n  Port 3000\nHost *\n', changed: true, sourceHash: 'a'.repeat(64), configHash: 'b'.repeat(64), backupPath: null };
-const ids = ['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'wss', 'remote-command'];
-const codes = ['SETTINGS_OK', 'KEYS_OK', 'SSH_CONFIG_OK', 'LOCAL_SSH_OK', 'DNS_OK', 'TLS_OK', 'WSS_SHELL_READY', 'REMOTE_COMMAND_OK'];
+const ids = ['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'token', 'setup', 'wss', 'remote-command'];
+const codes = ['SETTINGS_OK', 'KEYS_OK', 'SSH_CONFIG_OK', 'LOCAL_SSH_OK', 'DNS_OK', 'TLS_OK', 'TOKEN_OK', 'SETUP_OK', 'WSS_SHELL_READY', 'REMOTE_COMMAND_OK'];
 let profiles;
 let listeners;
 const emit = (value) => listeners.forEach((listener) => listener(value));
@@ -278,6 +278,15 @@ describe('Temporary first-use setup', () => {
     ['readiness silence', (run) => changeCheck(run, 'wss', { status: 'failed', code: 'REMOTE_READY_TIMEOUT' })],
     ['a failed marker command', (run) => changeCheck(run, 'remote-command', { status: 'failed', code: 'REMOTE_COMMAND_FAILED' })],
     ['a missing marker command', (run) => ({ ...run, checks: run.checks.filter((check) => check.id !== 'remote-command') })],
+    ['a missing token check', (run) => ({ ...run, checks: run.checks.filter((check) => check.id !== 'token') })],
+    ['a missing setup check', (run) => ({ ...run, checks: run.checks.filter((check) => check.id !== 'setup') })],
+    ['old eight-check proof', (run) => ({ ...run, checks: run.checks.filter((check) => !['token', 'setup'].includes(check.id)) })],
+    ['a rejected token', (run) => changeCheck(run, 'token', { status: 'failed', code: 'AUTH_REQUIRED' })],
+    ['a skipped token check', (run) => changeCheck(run, 'token', { status: 'skipped' })],
+    ['token success with the wrong code', (run) => changeCheck(run, 'token', { code: 'SETUP_OK' })],
+    ['an unsuccessful setup request', (run) => changeCheck(run, 'setup', { status: 'failed', code: 'PORTAL_NETWORK' })],
+    ['a skipped setup check', (run) => changeCheck(run, 'setup', { status: 'skipped' })],
+    ['setup success with the wrong code', (run) => changeCheck(run, 'setup', { code: 'TOKEN_OK' })],
     ['a skipped independent check', (run) => changeCheck(run, 'keys', { status: 'skipped', code: 'DEPENDENCY_FAILED' })],
     ['an invalid completion timestamp', (run) => ({ ...run, finishedAt: 'invalid' })],
     ['a mismatched managed block', (run) => changeCheck(run, 'ssh-config', { status: 'failed', code: 'SSH_CONFIG_MISMATCH' })],

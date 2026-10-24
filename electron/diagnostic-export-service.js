@@ -4,10 +4,11 @@ const { redactLogMessage } = require('./log-redaction');
 const { validateLogFilters, filterLogs, isLogTimestamp } = require('../shared/log-filters.mjs');
 
 const MAX_EXPORT_BYTES = 8 * 1024 * 1024;
-const SETTINGS = ['host', 'port', 'cluster', 'loginNode', 'cols', 'rows', 'useRoot', 'path', 'startupCommand', 'healthProbeEnabled', 'wssUrl', 'sshAlias'];
-const CHECK_IDS = new Set(['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'wss', 'remote-command']);
+const SETTINGS = ['host', 'port', 'cluster', 'loginNode', 'cols', 'rows', 'useRoot', 'path', 'startupCommand', 'healthProbeEnabled', 'validateTokenPeriodically', 'wssUrl', 'sshAlias'];
+const CHECK_IDS = new Set(['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'token', 'setup', 'wss', 'remote-command']);
 const STATUSES = new Set(['pending', 'running', 'passed', 'failed', 'skipped']);
 const CODES = new Set(('SETTINGS_OK SETTINGS_INVALID SETTINGS_LOCKED KEYS_OK SSH_KEY_MISSING SSH_KEY_INVALID SSH_KEY_PERMISSIONS SSH_KEY_FINGERPRINT_MISMATCH SSH_CONFIG_OK SSH_CONFIG_MISSING SSH_CONFIG_MISMATCH SSH_ALIAS_CONFLICT SSH_CONFIG_INVALID LOCAL_SSH_OK LOCAL_PORT_AVAILABLE PORT_IN_USE LOCAL_SSH_FAILED DNS_OK DNS_FAILED TLS_OK TLS_FAILED WSS_SHELL_READY REMOTE_READY_TIMEOUT REMOTE_COMMAND_OK REMOTE_COMMAND_FAILED AUTH_REQUIRED WSS_FAILED NETWORK_UNAVAILABLE TIMEOUT CANCELLED DEPENDENCY_FAILED DIAGNOSTIC_DEADLINE').split(' '));
+for (const code of ['TOKEN_OK', 'SETUP_OK', 'PORTAL_NETWORK', 'PORTAL_TIMEOUT', 'PORTAL_PERMISSION', 'PORTAL_NOT_FOUND', 'PORTAL_UNIMPLEMENTED', 'PORTAL_QUOTA', 'PORTAL_UNKNOWN']) CODES.add(code);
 const LEVELS = new Set(['debug', 'info', 'warn', 'error']);
 function fail(code) { const error = new Error(code); error.code = code; return error; }
 function text(value, max = 256) { return typeof value === 'string' ? value.slice(0, max) : ''; }

@@ -116,6 +116,7 @@ function fixture(options = {}) {
     cancelPendingStart: () => calls.push(['cancel-start']), disconnectSession: () => true, dispose: async () => {},
   };
   const app = createAppController({ settingsStore: store, createCredentialStore: credentials, login, proxy,
+    portalPreflight: { run: async () => ({ ok: true }) },
     bindCallbacks: (value) => { callbacks = value; },
     confirmInterrupt: options.confirm || (async (value) => { calls.push(['confirm', value.action]); return true; }),
     clearHistory: (id) => { calls.push(['history-clear', id]); if (options.historyFailure) throw new ServiceError('HISTORY_STORAGE_FAILED'); },

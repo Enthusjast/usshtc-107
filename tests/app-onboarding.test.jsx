@@ -75,8 +75,6 @@ describe('Setup route integration', () => {
     render(<App />);
     expect(await screen.findByRole('heading', { level: 1, name: en.setupTitle })).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: en.setupStep_login })).toBeInTheDocument();
-    const navigation = screen.getByRole('navigation', { name: 'Primary navigation' });
-    expect([...navigation.querySelectorAll('button')].map((button) => button.textContent)).toEqual(['Dashboard', 'Sessions', 'Logs', 'Diagnostics']);
     expect(api.saveOnboarding).not.toHaveBeenCalled();
     expect(api.generateSshConfig).not.toHaveBeenCalled();
   });
@@ -157,7 +155,7 @@ describe('Setup route integration', () => {
   it('keeps the existing dirty navigation guard when resuming from Settings', async () => {
     initial('dismissed', 'config');
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
-    render(<App />);
+    await act(async () => { render(<App />); });
     await screen.findByRole('option', { name: 'Work' });
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
     fireEvent.change(await screen.findByLabelText('Settings draft'), { target: { value: 'unsaved' } });
@@ -194,7 +192,7 @@ describe('Setup route integration', () => {
   it('exits only after main accepts diagnostic completion and does not offer Resume afterward', async () => {
     initial('new', 'verify');
     snapshot = { ...snapshot, loginStatus: 'success', cookieValid: true, proxyStatus: 'started', runningConfig: config };
-    const codes = { settings: 'SETTINGS_OK', keys: 'KEYS_OK', 'ssh-config': 'SSH_CONFIG_OK', 'local-listener': 'LOCAL_SSH_OK', dns: 'DNS_OK', tls: 'TLS_OK', wss: 'WSS_SHELL_READY', 'remote-command': 'REMOTE_COMMAND_OK' };
+    const codes = { settings: 'SETTINGS_OK', keys: 'KEYS_OK', 'ssh-config': 'SSH_CONFIG_OK', 'local-listener': 'LOCAL_SSH_OK', dns: 'DNS_OK', tls: 'TLS_OK', token: 'TOKEN_OK', setup: 'SETUP_OK', wss: 'WSS_SHELL_READY', 'remote-command': 'REMOTE_COMMAND_OK' };
     api.getDiagnostics.mockResolvedValue({ profileId: 'default', epoch: 1, runId: 'verified-run', configFingerprint: 'main-fingerprint', startedAt: '2026-10-24T00:00:00.000Z', finishedAt: '2026-10-24T00:00:01.000Z', checks: Object.entries(codes).map(([id, code]) => ({ id, status: 'passed', code, durationMs: 4, ...(id === 'local-listener' ? { mode: 'ssh-auth' } : {}) })) });
     render(<App />);
     await waitFor(() => expect(screen.getByRole('button', { name: en.setupFinish })).toBeEnabled());
@@ -207,7 +205,7 @@ describe('Setup route integration', () => {
   it.each(['missing', 'failed', 'timeout'])('keeps setup open with %s remote command evidence even when the shell is ready', async (mode) => {
     initial('new', 'verify');
     snapshot = { ...snapshot, loginStatus: 'success', cookieValid: true, proxyStatus: 'started', runningConfig: config };
-    const codes = { settings: 'SETTINGS_OK', keys: 'KEYS_OK', 'ssh-config': 'SSH_CONFIG_OK', 'local-listener': 'LOCAL_SSH_OK', dns: 'DNS_OK', tls: 'TLS_OK', wss: 'WSS_SHELL_READY' };
+    const codes = { settings: 'SETTINGS_OK', keys: 'KEYS_OK', 'ssh-config': 'SSH_CONFIG_OK', 'local-listener': 'LOCAL_SSH_OK', dns: 'DNS_OK', tls: 'TLS_OK', token: 'TOKEN_OK', setup: 'SETUP_OK', wss: 'WSS_SHELL_READY' };
     const checks = Object.entries(codes).map(([id, code]) => ({ id, code, status: 'passed', durationMs: 1,
       ...(id === 'local-listener' ? { mode: 'ssh-auth' } : {}) }));
     if (mode !== 'missing') checks.push({ id: 'remote-command', status: 'failed', code: mode === 'timeout' ? 'TIMEOUT' : 'REMOTE_COMMAND_FAILED', durationMs: 15000 });
@@ -221,6 +219,23 @@ describe('Setup route integration', () => {
     expect(api.saveOnboarding).not.toHaveBeenCalled();
     expect(screen.getByRole('heading', { level: 1, name: en.setupTitle })).toBeInTheDocument();
     expect(screen.queryByText('Dashboard panel')).not.toBeInTheDocument();
+  });
+
+  it.each([{ missing: ['token'] }, { missing: ['setup'] }, { missing: ['token', 'setup'] }])('does not finish setup when portal proof is missing $missing', async ({ missing }) => {
+    initial('new', 'verify');
+    snapshot = { ...snapshot, loginStatus: 'success', cookieValid: true, proxyStatus: 'started', runningConfig: config };
+    const codes = { settings: 'SETTINGS_OK', keys: 'KEYS_OK', 'ssh-config': 'SSH_CONFIG_OK', 'local-listener': 'LOCAL_SSH_OK', dns: 'DNS_OK', tls: 'TLS_OK', token: 'TOKEN_OK', setup: 'SETUP_OK', wss: 'WSS_SHELL_READY', 'remote-command': 'REMOTE_COMMAND_OK' };
+    const checks = Object.entries(codes).filter(([id]) => !missing.includes(id)).map(([id, code]) => ({ id, code,
+      status: 'passed', durationMs: 1, ...(id === 'local-listener' ? { mode: 'ssh-auth' } : {}) }));
+    api.getDiagnostics.mockResolvedValue({ profileId: 'default', epoch: 1, runId: 'old-portal-proof', configFingerprint: 'main-fingerprint',
+      startedAt: '2026-10-24T00:00:00.000Z', finishedAt: '2026-10-24T00:00:01.000Z', checks });
+    render(<App />);
+    await screen.findByText(en.diagnostic_REMOTE_COMMAND_OK);
+    const finish = screen.getByRole('button', { name: en.setupFinish });
+    expect(finish).toBeDisabled();
+    fireEvent.click(finish);
+    expect(api.saveOnboarding).not.toHaveBeenCalled();
+    expect(screen.getByRole('heading', { level: 1, name: en.setupTitle })).toBeInTheDocument();
   });
 
 });

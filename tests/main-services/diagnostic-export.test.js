@@ -97,12 +97,13 @@ test('caps at 500 records and trims oldest whole records to the eight MiB limit'
   assert.equal(value.logs.every((entry) => typeof entry.message === 'string'), true);
 });
 
-test('exports all eight bounded proof checks and public profile options without remote command or output bodies', async (t) => {
-  const ids = ['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'wss', 'remote-command'];
-  const codes = ['SETTINGS_OK', 'KEYS_OK', 'SSH_CONFIG_OK', 'LOCAL_SSH_OK', 'DNS_OK', 'TLS_OK', 'WSS_SHELL_READY', 'REMOTE_COMMAND_OK'];
+test('exports all ten bounded proof checks and public profile options without remote command or output bodies', async (t) => {
+  const ids = ['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'token', 'setup', 'wss', 'remote-command'];
+  const codes = ['SETTINGS_OK', 'KEYS_OK', 'SSH_CONFIG_OK', 'LOCAL_SSH_OK', 'DNS_OK', 'TLS_OK', 'TOKEN_OK', 'SETUP_OK', 'WSS_SHELL_READY', 'REMOTE_COMMAND_OK'];
   const remotePath = `/private/home/work with spaces/${'a'.repeat(300)}`;
   const f = fixture(t, { getSettings: () => ({ host: 'localhost', port: 3000, path: remotePath,
-    startupCommand: 'tmux new -A -s usshtc', healthProbeEnabled: true, cookie: 'private-cookie', privateKey: 'private-key' }),
+    startupCommand: 'tmux new -A -s usshtc', healthProbeEnabled: true, validateTokenPeriodically: true,
+    cookie: 'private-cookie', privateKey: 'private-key' }),
   getDiagnostics: () => ({ runId: 'run-proof', ...scope, configFingerprint: 'b'.repeat(64), authGeneration: 4,
     startedAt: time, finishedAt: time, command: 'private-command', output: 'private-output',
     checks: ids.map((id, index) => ({ id, status: 'passed', code: codes[index], durationMs: 1,
@@ -116,6 +117,7 @@ test('exports all eight bounded proof checks and public profile options without 
   assert.equal(value.settings.path, remotePath.replace('/private/home', '[HOME]'));
   assert.equal(value.settings.startupCommand, 'tmux new -A -s usshtc');
   assert.equal(value.settings.healthProbeEnabled, true);
+  assert.equal(value.settings.validateTokenPeriodically, true);
   for (const secret of ['private-cookie', 'private-key', 'private-command', 'private-output', 'private-stderr', '/private/home']) {
     assert.equal(raw.includes(secret), false, secret);
   }
@@ -137,3 +139,25 @@ test('exports readiness and command failures distinctly and excludes obsolete ha
   assert.equal(Object.hasOwn(value.settings, 'startupCommand'), false);
   assert.equal(raw.includes('private-command'), false);
 });
+
+for (const stage of ['token', 'setup']) {
+  test(`exports REST ${stage} failure without credentials or response bodies`, async (t) => {
+    const outcomes = [
+      { id: 'token', status: stage === 'token' ? 'failed' : 'passed', code: stage === 'token' ? 'AUTH_REQUIRED' : 'TOKEN_OK' },
+      { id: 'setup', status: stage === 'token' ? 'skipped' : 'failed', code: stage === 'token' ? 'DEPENDENCY_FAILED' : 'PORTAL_TIMEOUT' },
+      { id: 'wss', status: 'skipped', code: 'DEPENDENCY_FAILED' },
+      { id: 'remote-command', status: 'skipped', code: 'DEPENDENCY_FAILED' },
+    ];
+    const f = fixture(t, { getDiagnostics: () => ({ runId: `run-${stage}-failed`, ...scope,
+      configFingerprint: 'd'.repeat(64), startedAt: time, finishedAt: time,
+      checks: outcomes.map((check) => ({ ...check, durationMs: 10, cookie: 'private-token-cookie',
+        token: 'private-token', body: 'private-response-body' })) }) });
+    await f.service.exportDiagnostics(scope);
+    const raw = fs.readFileSync(f.filePath, 'utf8');
+    const value = JSON.parse(raw);
+    assert.deepEqual(value.diagnostics.checks.map(({ id, status, code }) => ({ id, status, code })), outcomes);
+    for (const secret of ['private-token-cookie', 'private-token', 'private-response-body']) {
+      assert.equal(raw.includes(secret), false, secret);
+    }
+  });
+}

@@ -5,6 +5,7 @@ const { ServiceError } = require('./ipc-contract');
 const { validateSettingsPatch } = require('../shared/settings-schema.mjs');
 const { buildWssUrl, buildWssOptions } = require('./wss-connection');
 const { REMOTE_READY_TIMEOUT } = require('./constants');
+const { createPortalPreflight, operationalCode } = require('./portal-preflight');
 
 const RETRY_DELAYS_MS = Object.freeze([1000, 2000, 4000, 8000, 16000, 30000]);
 const HANDSHAKE_TIMEOUT_MS = 5000;
@@ -20,6 +21,7 @@ function createRecoveryController(deps) {
   const clock = deps.clock || globalThis;
   const adapters = deps.adapters || {};
   const createWebSocket = adapters.createWebSocket || ((url, options) => new WebSocket(url, options));
+  const portalPreflight = deps.portalPreflight || createPortalPreflight({ tlsCa: adapters.tlsCa });
   let active = null;
   let hintTimer = null;
   let disposed = false;
@@ -41,10 +43,11 @@ function createRecoveryController(deps) {
     const scope = { profileId: snapshot.profileId, epoch: snapshot.epoch };
     const config = deps.getConfig(scope);
     const cookie = deps.getCookie(scope);
-    const transportKey = JSON.stringify([scope.profileId, scope.epoch,
+    const authGeneration = deps.getAuthGeneration?.(scope) ?? null;
+    const transportKey = JSON.stringify([scope.profileId, scope.epoch, authGeneration,
       ...CONFIG_FIELDS.map((field) => config?.[field]), config?.wssUrl, cookie]);
     const key = JSON.stringify([transportKey, snapshot.desiredRunning, snapshot.storageErrorCode]);
-    return { snapshot, scope, config, cookie, key, transportKey };
+    return { snapshot, scope, config, cookie, authGeneration, key, transportKey };
   }
 
   function current(round) {
@@ -194,7 +197,16 @@ function createRecoveryController(deps) {
     if (!current(round)) { settle(round, { cancelled: true }); return; }
     publish(round.context, 'checking');
     if (!current(round)) { settle(round, { cancelled: true }); return; }
-    const result = await probe(round);
+    let result;
+    try {
+      await portalPreflight.run({ ...round.context, signal: round.controller.signal,
+        assertCurrent: () => { if (!current(round)) throw new ServiceError('OPERATION_CANCELLED'); } });
+      if (!current(round)) { settle(round, { cancelled: true }); return; }
+      result = await probe(round);
+    } catch (error) {
+      result = { code: error?.code === 'AUTH_REQUIRED' ? 'AUTH_REQUIRED' : operationalCode(error?.code),
+        terminal: error?.code === 'AUTH_REQUIRED' };
+    }
     if (!current(round)) { settle(round, { cancelled: true }); return; }
     if (result.ok) {
       const recovered = unhealthy;
@@ -214,6 +226,8 @@ function createRecoveryController(deps) {
         } catch (error) {
           if (!current(round)) { settle(round, { cancelled: true }); return; }
           const code = ['PORT_IN_USE', 'SETTINGS_INVALID', 'SETTINGS_LOCKED', 'AUTH_REQUIRED',
+            'PORTAL_NETWORK', 'PORTAL_TIMEOUT', 'PORTAL_PERMISSION', 'PORTAL_NOT_FOUND',
+            'PORTAL_UNIMPLEMENTED', 'PORTAL_QUOTA', 'PORTAL_UNKNOWN',
             'SSH_KEY_MISSING', 'SSH_KEY_INVALID', 'SSH_KEY_FINGERPRINT_MISMATCH'].includes(error?.code)
             ? error.code : 'PROXY_START_FAILED';
           blocked = round.context.key;
@@ -226,6 +240,12 @@ function createRecoveryController(deps) {
       return;
     }
     unhealthy = true;
+    if (result.code === 'AUTH_REQUIRED' && !result.statusCode) {
+      blocked = round.context.key;
+      publish(round.context, 'auth_required', 'AUTH_REQUIRED');
+      settle(round, { errorCode: 'AUTH_REQUIRED' });
+      return;
+    }
     if (result.statusCode) {
       blocked = round.context.key;
       publish(round.context, 'auth_required', 'AUTH_REQUIRED');

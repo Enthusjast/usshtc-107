@@ -8,8 +8,9 @@ const { validateSettingsPatch } = require('../shared/settings-schema.mjs');
 const { PLATFORM, MAX_WSS_PAYLOAD_BYTES, REMOTE_READY_TIMEOUT } = require('./constants');
 const { buildWssUrl, buildWssOptions } = require('./wss-connection');
 const { probeRemoteCommand, REMOTE_COMMAND_TIMEOUT_MS } = require('./remote-command-probe');
+const { createPortalPreflight, operationalCode } = require('./portal-preflight');
 
-const CHECK_IDS = Object.freeze(['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'wss', 'remote-command']);
+const CHECK_IDS = Object.freeze(['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'token', 'setup', 'wss', 'remote-command']);
 const CONFIG_FIELDS = Object.freeze(['host', 'port', 'cluster', 'loginNode', 'cols', 'rows', 'useRoot', 'path', 'startupCommand', 'sshAlias', 'wssUrl']);
 const KEY_CODES = new Set(['SSH_KEY_MISSING', 'SSH_KEY_INVALID', 'SSH_KEY_PERMISSIONS', 'SSH_KEY_FINGERPRINT_MISMATCH']);
 const CONFIG_CODES = new Set(['SSH_CONFIG_OK', 'SSH_CONFIG_MISSING', 'SSH_CONFIG_MISMATCH', 'SSH_ALIAS_CONFLICT', 'SSH_CONFIG_INVALID']);
@@ -73,6 +74,7 @@ function createDiagnosticsService(deps) {
   const createWebSocket = adapters.createWebSocket || ((url, options) => new WebSocket(url, options));
   const createSshClient = adapters.createSshClient || (() => new Client());
   const createServer = adapters.createServer || ((listener) => net.createServer(listener));
+  const portalPreflight = deps.portalPreflight || createPortalPreflight({ tlsCa: adapters.tlsCa });
   let active = null;
   let currentRunId = null;
   let latest = null;
@@ -167,7 +169,8 @@ function createDiagnosticsService(deps) {
         item.status = code.endsWith('_OK') || code === 'WSS_SHELL_READY' || code === 'LOCAL_PORT_AVAILABLE' ? 'passed' : 'failed';
       } catch (error) {
         const reason = checkController.signal.aborted ? checkController.signal.reason : null;
-        item.code = reason || fallback(error);
+        item.code = reason === 'TIMEOUT' && ['token', 'setup'].includes(id)
+          ? 'PORTAL_TIMEOUT' : reason || fallback(error);
         item.status = item.code === 'CANCELLED' ? 'skipped' : 'failed';
       } finally {
         clearTimer(timer);
@@ -248,11 +251,18 @@ function createDiagnosticsService(deps) {
         listen(socket, 'error', () => finish(failure('TLS_FAILED')));
         listen(socket, 'close', () => finish(failure('TLS_FAILED')));
       }), () => 'TLS_FAILED');
-      if (!cookie && !controller.signal.aborted && passed('settings') && passed('tls')) {
-        const item = dto.checks.find((value) => value.id === 'wss');
-        item.status = 'skipped'; item.code = 'AUTH_REQUIRED'; publish(dto);
-      } else {
-        await check('wss', ['settings', 'tls'], (checkSignal) => probe(checkSignal, ({ finish, own, listen }) => {
+      const portalContext = (checkSignal) => ({ cookie, scope, authGeneration, signal: checkSignal,
+        assertCurrent: () => { if (!isFresh()) throw failure('CANCELLED'); } });
+      await check('token', ['settings'], async (checkSignal) => {
+        const result = await portalPreflight.validate(portalContext(checkSignal));
+        return result.status === 'valid' ? 'TOKEN_OK' : result.status === 'invalid'
+          ? 'AUTH_REQUIRED' : operationalCode(result.errorCode);
+      }, (error) => operationalCode(error?.code), undefined, 10000);
+      await check('setup', ['settings', 'token'], async (checkSignal) => {
+        const result = await portalPreflight.setup(portalContext(checkSignal));
+        return result.ok ? 'SETUP_OK' : result.errorCode === 'PORTAL_TIMEOUT' ? 'PORTAL_TIMEOUT' : 'PORTAL_NETWORK';
+      }, (error) => error?.code === 'PORTAL_TIMEOUT' ? 'PORTAL_TIMEOUT' : 'PORTAL_NETWORK');
+      await check('wss', ['settings', 'tls', 'token', 'setup'], (checkSignal) => probe(checkSignal, ({ finish, own, listen }) => {
           let readyTimer = setTimer(() => finish(failure('TIMEOUT')), CHECK_TIMEOUT_MS);
           own({}, () => clearTimer(readyTimer));
           let opened = false;
@@ -295,7 +305,7 @@ function createDiagnosticsService(deps) {
           listen(ws, 'close', () => finish(failure('WSS_FAILED')));
         }), (error) => ['AUTH_REQUIRED', 'NETWORK_UNAVAILABLE', 'CANCELLED', 'REMOTE_READY_TIMEOUT', 'TIMEOUT'].includes(error?.code)
           ? error.code : 'WSS_FAILED', undefined, null);
-      }
+      // Token/setup REST failures never invoke the WSS credential-revocation callback.
       await check('remote-command', ['local-listener', 'wss'], async (checkSignal) => {
         if (!running || !isFresh()) throw failure('CANCELLED');
         const identity = await deps.getClientIdentity(scope);

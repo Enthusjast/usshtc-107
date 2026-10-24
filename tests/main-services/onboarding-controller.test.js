@@ -97,6 +97,7 @@ function fixture(t, options = {}) {
     return options.inspect ? options.inspect(candidate, saved) : sshConfig.inspect(configOptions(candidate, saved));
   };
   const app = createAppController({ settingsStore: store, proxy, login,
+    portalPreflight: { run: async () => ({ ok: true }) },
     createCredentialStore: () => ({ getSsoStatus: () => ({ username: 'private-account', hasPassword: true }) }),
     bindCallbacks: (value) => { callbacks = value; }, confirmInterrupt: async () => true,
     getDiagnostics: (candidate) => { calls.push(['get-diagnostics', candidate]); return latest ? structuredClone(latest) : null; },
@@ -115,6 +116,8 @@ function fixture(t, options = {}) {
       { id: 'local-listener', status: 'passed', code: 'LOCAL_SSH_OK', mode: 'ssh-auth', durationMs: 1 },
       { id: 'wss', status: 'passed', code: 'WSS_SHELL_READY', durationMs: 1 },
       { id: 'remote-command', status: 'passed', code: 'REMOTE_COMMAND_OK', durationMs: 1 },
+      { id: 'token', status: 'passed', code: 'TOKEN_OK', durationMs: 1 },
+      { id: 'setup', status: 'passed', code: 'SETUP_OK', durationMs: 1 },
     ], ...patch });
   latest = proof();
   const save = (patch = {}) => app.run('save-onboarding', { scope: currentScope(), status: 'completed',
@@ -201,9 +204,18 @@ for (const scenario of [
   ['failed WSS check', (f) => { const value = f.proof(); value.checks[1].status = 'failed'; f.setLatest(value); }],
   ['missing WSS check', (f) => { const value = f.proof(); value.checks = value.checks.filter((check) => check.id !== 'wss'); f.setLatest(value); }],
   ['handshake-only WSS', (f) => { const value = f.proof(); value.checks[1].code = 'WSS_HANDSHAKE_OK'; f.setLatest(value); }],
-  ['missing remote command', (f) => { const value = f.proof(); value.checks.pop(); f.setLatest(value); }],
+  ['missing remote command', (f) => { const value = f.proof(); value.checks = value.checks.filter((check) => check.id !== 'remote-command'); f.setLatest(value); }],
   ['failed remote command', (f) => { const value = f.proof(); value.checks[2].status = 'failed'; f.setLatest(value); }],
   ['stale authentication proof', (f) => { f.setLatest(f.proof({ authGeneration: 0 })); }],
+  ['missing token check', (f) => { const value = f.proof(); value.checks = value.checks.filter((check) => check.id !== 'token'); f.setLatest(value); }],
+  ['missing setup check', (f) => { const value = f.proof(); value.checks = value.checks.filter((check) => check.id !== 'setup'); f.setLatest(value); }],
+  ['old proof without token or setup', (f) => { const value = f.proof(); value.checks = value.checks.filter((check) => !['token', 'setup'].includes(check.id)); f.setLatest(value); }],
+  ['failed token check', (f) => { const value = f.proof(); Object.assign(value.checks.find((check) => check.id === 'token'), { status: 'failed', code: 'AUTH_REQUIRED' }); f.setLatest(value); }],
+  ['token success code without passed status', (f) => { const value = f.proof(); value.checks.find((check) => check.id === 'token').status = 'skipped'; f.setLatest(value); }],
+  ['token passed with wrong code', (f) => { const value = f.proof(); value.checks.find((check) => check.id === 'token').code = 'WSS_HANDSHAKE_OK'; f.setLatest(value); }],
+  ['failed setup check', (f) => { const value = f.proof(); Object.assign(value.checks.find((check) => check.id === 'setup'), { status: 'failed', code: 'PORTAL_NETWORK' }); f.setLatest(value); }],
+  ['setup success code without passed status', (f) => { const value = f.proof(); value.checks.find((check) => check.id === 'setup').status = 'skipped'; f.setLatest(value); }],
+  ['setup passed with wrong code', (f) => { const value = f.proof(); value.checks.find((check) => check.id === 'setup').code = 'TOKEN_OK'; f.setLatest(value); }],
 ]) {
   test(`completion rejects ${scenario[0]}`, async (t) => {
     const f = fixture(t);

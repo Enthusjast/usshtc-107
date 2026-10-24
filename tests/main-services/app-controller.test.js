@@ -6,6 +6,9 @@ const { createAppController } = require('../../electron/app-controller');
 const { DEFAULTS } = require('../../electron/constants');
 const { createDefaultRoot, publicSettings } = require('../../electron/settings-store');
 const { ServiceError } = require('../../electron/ipc-contract');
+const { EventEmitter } = require('node:events');
+const { createLoginController } = require('../../electron/login-controller');
+const { PLATFORM } = require('../../electron/constants');
 
 function deferred() {
   let resolve, reject;
@@ -75,7 +78,8 @@ function fixture(overrides = {}) {
     dispose: () => calls.push(['login-dispose']),
   };
   const app = createAppController({ settingsStore, proxy, login, createCredentialStore: () => credentials,
-    bindCallbacks: (value) => { callbacks = value; },
+    portalPreflight: { run: async () => ({ ok: true }) },
+    bindCallbacks: (value) => { callbacks = value; overrides.onBind?.(value); },
     confirmInterrupt: overrides.confirm || (async () => true),
     flush: overrides.flush || (() => { calls.push(['flush']); }),
     onExitPrepared: () => calls.push(['exit']),
@@ -576,4 +580,135 @@ test('update action rejects malformed versions and renderer installation paths b
   }
   await assert.rejects(f.app.run('install-update', { scope: f.currentScope(), version: '1.3.0', path: '/untrusted/installer' }), { code: 'INVALID_ARGUMENT' });
   assert.equal(installs, 0);
+});
+
+test('preflight runs only before a fresh proxy lifecycle, and repeats after stop', async () => {
+  const contexts = [];
+  const f = fixture({ services: { portalPreflight: { run: async (context) => { contexts.push(context); return { ok: true }; } } } });
+  await f.app.run('start', { scope: f.currentScope() });
+  await f.app.run('start', { scope: f.currentScope() });
+  assert.equal(contexts.length, 1);
+  assert.equal(contexts[0].cookie, 'SCOW_USER=fixture');
+  assert.equal(contexts[0].authGeneration, 1);
+  assert.ok(contexts[0].signal instanceof AbortSignal);
+  await f.app.run('stop', { scope: f.currentScope() });
+  await f.app.run('start', { scope: f.currentScope() });
+  assert.equal(contexts.length, 2);
+});
+
+test('invalid token gates listener startup but preserves the stored login and credentials', async () => {
+  const notices = [];
+  const f = fixture({ services: { portalPreflight: { run: async () => { throw new ServiceError('AUTH_REQUIRED'); } },
+    notify: (...args) => notices.push(args) } });
+  await assert.rejects(f.app.run('start', { scope: f.currentScope() }), { code: 'AUTH_REQUIRED' });
+  assert.equal(f.calls.some(([name]) => name === 'start' || name === 'cookie'), false);
+  assert.equal(f.app.getSnapshot().cookieValid, true);
+  assert.equal(f.app.getSnapshot().loginStatus, 'success');
+  assert.equal(f.app.getSnapshot().remoteStatus, 'auth_required');
+  assert.equal(notices.length, 1);
+});
+
+test('network preflight failures preserve credentials and do not bind or prompt login', async () => {
+  for (const code of ['PORTAL_NETWORK', 'PORTAL_TIMEOUT']) {
+    const notices = [];
+    const f = fixture({ services: { portalPreflight: { run: async () => { throw new ServiceError(code); } },
+      notify: (...args) => notices.push(args) } });
+    await assert.rejects(f.app.run('start', { scope: f.currentScope() }), { code });
+    assert.equal(f.app.getSnapshot().cookieValid, true);
+    assert.equal(f.calls.some(([name]) => name === 'start'), false);
+    assert.equal(notices.length, 0);
+  }
+});
+
+test('stopping during preflight cancels late success before listener startup', async () => {
+  const pending = deferred();
+  let context;
+  const f = fixture({ services: { portalPreflight: { run: (value) => { context = value; return pending.promise; } } } });
+  const start = f.app.run('start', { scope: f.currentScope() });
+  await turn();
+  const stop = f.app.run('stop', { scope: f.currentScope() });
+  await stop;
+  assert.equal(context.signal.aborted, true);
+  pending.resolve({ ok: true });
+  assert.deepEqual(await start, { cancelled: true });
+  assert.equal(f.calls.some(([name]) => name === 'start'), false);
+});
+
+test('REST-rejected start cannot replay authentication through a real login owner epoch refresh', async (t) => {
+  let callbacks;
+  let window;
+  let queries = 0;
+  let preflights = 0;
+  const cookies = new EventEmitter();
+  cookies.get = () => new Promise((resolve) => setImmediate(() => {
+    queries += 1;
+    resolve([{ name: 'SCOW_USER', value: 'fixture' }]);
+  }));
+  const partition = new EventEmitter();
+  partition.cookies = cookies;
+  partition.setPermissionCheckHandler = partition.setPermissionRequestHandler = () => {};
+  for (const method of ['clearData', 'clearCache', 'clearAuthCache', 'closeAllConnections']) partition[method] = async () => {};
+  const login = createLoginController({ getSession: () => partition, getWindow: () => null,
+    getConfig: () => ({ cluster: 'training', loginNode: 'node' }),
+    createWindow: () => {
+      window = new EventEmitter();
+      window.webContents = new EventEmitter();
+      window.webContents.getURL = () => `${PLATFORM.origin}/shell/training/node`;
+      window.webContents.setWindowOpenHandler = () => {};
+      window.webContents.executeJavaScript = async () => false;
+      window.loadURL = async () => {};
+      window.isDestroyed = () => Boolean(window.destroyed);
+      window.close = window.destroy = () => { window.destroyed = true; window.emit('closed'); };
+      return window;
+    },
+    onState: (value) => callbacks.onLoginState(value),
+    onAuthenticated: (value) => callbacks.onAuthenticated(value),
+    onAuthRequired: (value) => callbacks.onAuthRequired(value),
+  });
+  const f = fixture({ onBind: value => { callbacks = value; }, services: { login,
+    portalPreflight: { run: async () => { preflights += 1; throw new ServiceError('AUTH_REQUIRED'); } } } });
+  t.after(() => f.app.dispose());
+  await login.start();
+  window.webContents.emit('did-navigate', {}, `${PLATFORM.origin}/shell/training/node`);
+  await turn(); await turn();
+  assert.equal(f.app.getSnapshot().cookieValid, true);
+  assert.equal(window.destroyed, true);
+  assert.equal(f.calls.filter(([name]) => name === 'cookie').length, 1);
+  const before = f.currentScope();
+  await assert.rejects(f.app.run('start', { scope: before }), { code: 'AUTH_REQUIRED' });
+  for (let index = 0; index < 5; index += 1) await turn();
+  assert.equal(preflights, 1);
+  assert.equal(queries, 2);
+  assert.equal(f.currentScope().epoch, before.epoch + 1);
+  assert.equal(f.app.getSnapshot().operation, null);
+  assert.equal(f.app.getSnapshot().remoteStatus, 'auth_required');
+  assert.equal(f.app.getSnapshot().cookieValid, true);
+  assert.equal(login.getCookie(), 'SCOW_USER=fixture');
+  assert.equal(f.calls.filter(([name]) => name === 'cookie').length, 1);
+  assert.equal(f.calls.some(([name]) => name === 'start'), false);
+});
+
+test('explicit fresh starts replace stale auth-required reachability with their current preflight outcome', async () => {
+  let code = 'AUTH_REQUIRED';
+  const states = [];
+  const f = fixture({ services: {
+    onSnapshot: value => states.push(value),
+    portalPreflight: { run: async () => { if (code) throw Object.assign(new Error(code), { code }); } },
+  } });
+  await assert.rejects(f.app.run('start', { scope: f.currentScope() }), { code: 'AUTH_REQUIRED' });
+  assert.equal(f.app.getSnapshot().remoteStatus, 'auth_required');
+  code = 'PORTAL_NETWORK';
+  await assert.rejects(f.app.run('start', { scope: f.currentScope() }), { code: 'PORTAL_NETWORK' });
+  assert.equal(f.app.getSnapshot().remoteStatus, 'error');
+  assert.equal(f.app.getSnapshot().errorCode, 'PORTAL_NETWORK');
+  code = null;
+  await f.app.run('start', { scope: f.currentScope() });
+  assert.equal(f.app.getSnapshot().remoteStatus, 'unknown');
+  assert.equal(f.app.getSnapshot().cookieValid, true);
+  assert.equal(f.app.getSnapshot().errorCode, null);
+  assert.ok(states.some(value => value.remoteStatus === 'checking'));
+  assert.equal(states.some(value => value.remoteStatus === 'reachable'), false);
+  f.callbacks.onRemoteState({ ...f.currentScope(), remoteStatus: 'reachable' });
+  await f.app.run('start', { scope: f.currentScope() });
+  assert.equal(f.app.getSnapshot().remoteStatus, 'reachable');
 });

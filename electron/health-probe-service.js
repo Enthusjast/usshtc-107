@@ -25,12 +25,13 @@ function createHealthProbeService(deps) {
     const cookie = deps.getCookie(scope);
     const enabled = deps.getPreferences().healthProbeEnabled === true;
     const remoteNotReady = snapshot.errorCode === 'REMOTE_READY_TIMEOUT';
+    const authRequired = snapshot.remoteStatus === 'auth_required';
     const eligible = enabled && snapshot.desiredRunning === true && snapshot.proxyStatus === 'started'
-      && !snapshot.operation && !snapshot.storageErrorCode && !remoteNotReady && Boolean(cookie);
+      && !snapshot.operation && !snapshot.storageErrorCode && !remoteNotReady && !authRequired && Boolean(cookie);
     const authorityKey = JSON.stringify([scope.profileId, scope.epoch, cookie,
       ...CONFIG_FIELDS.map((field) => config[field]), ...CONFIG_FIELDS.map((field) => runningConfig[field])]);
     const key = JSON.stringify([authorityKey, enabled, snapshot.desiredRunning,
-      snapshot.proxyStatus, snapshot.operation, snapshot.storageErrorCode, remoteNotReady]);
+      snapshot.proxyStatus, snapshot.operation, snapshot.storageErrorCode, remoteNotReady, authRequired]);
     return { scope, snapshot, runningConfig, key, authorityKey, eligible, remoteNotReady };
   }
 

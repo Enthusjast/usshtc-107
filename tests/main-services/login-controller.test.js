@@ -274,3 +274,44 @@ test('aborted starts and reset tokens cannot create a window or continue partiti
   await assert.rejects(f.controller.start(), { code: 'OPERATION_CANCELLED' });
   assert.equal(f.controller.getCookie(), '');
 });
+
+test('same-cookie epoch refresh is observation, while a changed owned cookie authenticates the new scope', async (t) => {
+  const f = fixture();
+  t.after(() => f.controller.dispose());
+  await f.controller.start();
+  navigate(f.windows[0]);
+  f.requests[0].resolve([{ name: 'SCOW_USER', value: 'one' }]);
+  await turn();
+  const generation = f.authenticated[0].authGeneration;
+  const stateCount = f.states.length;
+  for (const epoch of [1, 2]) {
+    f.controller.setScope({ profileId: 'default', epoch });
+    f.requests[epoch].resolve([{ name: 'SCOW_USER', value: 'one' }]);
+    await turn();
+  }
+  assert.equal(f.authenticated.length, 1);
+  assert.equal(f.states.length, stateCount);
+  assert.equal(f.controller.getCookie(), 'SCOW_USER=one');
+  assert.equal(f.cleared.includes('credential-cookie'), false);
+  f.controller.setScope({ profileId: 'default', epoch: 3 });
+  f.requests[3].resolve([{ name: 'SCOW_USER', value: 'two' }]);
+  await turn();
+  assert.equal(f.authenticated.length, 2);
+  assert.equal(f.authenticated[1].scope.epoch, 3);
+  assert.equal(f.authenticated[1].authGeneration, generation);
+  assert.equal(f.controller.getCookie(), 'SCOW_USER=two');
+});
+
+test('an explicit fresh login may authenticate the same cookie and still finalizes its window', async (t) => {
+  const f = fixture();
+  t.after(() => f.controller.dispose());
+  for (const index of [0, 1]) {
+    await f.controller.start();
+    navigate(f.windows[index]);
+    f.requests[index].resolve([{ name: 'SCOW_USER', value: 'one' }]);
+    await turn();
+    assert.equal(f.authenticated.length, index + 1);
+    assert.equal(f.windows[index].destroyed, true);
+    assert.equal(f.timers.size, 0);
+  }
+});

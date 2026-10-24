@@ -7,6 +7,7 @@ const semver = require('semver');
 const { validateSettingsPatch, PROFILE_DEFAULTS, PROFILE_SETTING_KEYS, APP_SETTING_KEYS } = require('../shared/settings-schema.mjs');
 const { publicSettings, validateProfileName } = require('./settings-store');
 const { ServiceError } = require('./ipc-contract');
+const { createPortalPreflight, operationalCode } = require('./portal-preflight');
 
 const CONFIG_KEYS = ['host', 'port', 'cluster', 'loginNode', 'cols', 'rows', 'useRoot', 'path', 'startupCommand'];
 const keyActionError = (error, fallback) => error instanceof ServiceError ? error : new ServiceError(
@@ -43,6 +44,7 @@ function createAppController(deps) {
   const profile = (id = scope.profileId) => root().profiles.find((item) => item.id === id);
   const proxy = deps.proxy;
   const login = deps.login;
+  const portalPreflight = deps.portalPreflight || createPortalPreflight();
   let credentials = deps.createCredentialStore(root().activeProfileId);
   const log = deps.log || (() => {});
   let scope = { profileId: root().activeProfileId, epoch: 0 };
@@ -215,6 +217,31 @@ function createAppController(deps) {
     }
     advanceEpoch(token, 'proxy_start');
     assertToken(token, true);
+    const cookie = login.getCookie();
+    state.remoteStatus = 'checking';
+    publish();
+    try {
+      await waitFor(token, portalPreflight.run({ cookie, scope: token.executionScope,
+        authGeneration: token.authGeneration, signal: token.signal,
+        assertCurrent: () => {
+          assertToken(token, true);
+          if (login.getCookie() !== cookie) throw new ServiceError('OPERATION_CANCELLED');
+        } }), true);
+      assertToken(token, true);
+      state.remoteStatus = 'unknown';
+      publish();
+    } catch (error) {
+      assertToken(token, true);
+      const failure = error instanceof ServiceError ? error : new ServiceError(
+        error?.code === 'AUTH_REQUIRED' ? 'AUTH_REQUIRED' : operationalCode(error?.code));
+      if (failure.code === 'AUTH_REQUIRED' || failure.code.startsWith('PORTAL_')) {
+        state.remoteStatus = failure.code === 'AUTH_REQUIRED' ? 'auth_required' : 'error';
+        state.errorCode = failure.code;
+        publish();
+        if (failure.code === 'AUTH_REQUIRED') deps.notify?.('auth', {});
+      }
+      throw failure;
+    }
     const result = await waitFor(token, proxy.start(config(), login.getCookie(), token.executionScope), true);
     assertToken(token, true);
     return result;
@@ -493,6 +520,7 @@ function createAppController(deps) {
                 || typeof run?.finishedAt !== 'string' || !Number.isFinite(Date.parse(run.finishedAt))
                 || run.configFingerprint !== fingerprint || fingerprintConfig(settings()) !== fingerprint
                 || !passed('local-listener', 'LOCAL_SSH_OK', 'ssh-auth')
+                || !passed('token', 'TOKEN_OK') || !passed('setup', 'SETUP_OK')
                 || !passed('wss', 'WSS_SHELL_READY') || !passed('remote-command', 'REMOTE_COMMAND_OK')
                 || run.authGeneration !== authGeneration
                 || run.checks.some((check) => check.status !== 'passed')

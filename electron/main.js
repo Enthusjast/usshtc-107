@@ -25,12 +25,14 @@ const { createAutostartService } = require('./autostart-service');
 const { createRecoveryController } = require('./recovery-controller');
 const { createHealthProbeService } = require('./health-probe-service');
 const { createUpdateService } = require('./update-service');
+const { createPortalPreflight } = require('./portal-preflight');
 
 function startApplication(deps = {}) {
   const electron = deps.electron || require('electron');
   const { app } = electron;
   const fileSystem = deps.fs || fs;
   const clock = deps.clock || globalThis;
+  const portalPreflight = deps.portalPreflight || createPortalPreflight(deps.portalApiOptions);
   const processEvents = deps.process || process;
 
   // Electron parses this switch itself. Resolve paths before the first store, logger or partition access.
@@ -541,6 +543,7 @@ function startApplication(deps = {}) {
     autostart = deps.autostartService || createAutostartService({ app, appId: 'com.ustc.usshtc107' });
     controller = createAppController({ settingsStore, proxy, login, createCredentialStore, keyErrorCode,
       keys: sshKeys,
+      portalPreflight,
       onConfigSaved: invalidateDiagnostics,
       installUpdate: (payload, context) => updates.install(payload, context),
       onUpdatePreparing: () => {
@@ -607,6 +610,7 @@ function startApplication(deps = {}) {
       onExitPrepared: () => { queueMicrotask(() => { void coordinator.request(0); }); },
     });
     diagnostics = deps.diagnosticsService || createDiagnosticsService({
+      portalPreflight,
       getConfig: (scope) => {
         assertScope(scope);
         const saved = currentSettings();
@@ -650,6 +654,8 @@ function startApplication(deps = {}) {
     });
     recovery = deps.recoveryController || createRecoveryController({
       clock, net: deps.recoveryNet || net,
+      portalPreflight,
+      getAuthGeneration: () => controller.getAuthGeneration(),
       getSnapshot: () => controller.getSnapshot(), getPreferences: currentSettings,
       getConfig: (scope) => { assertScope(scope); const saved = currentSettings(); return { ...saved, wssUrl: buildWssUrl(saved) }; },
       getCookie: (scope) => {

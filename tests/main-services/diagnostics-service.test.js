@@ -136,6 +136,10 @@ function fixture(options = {}) {
     ...options.adapters,
   };
   const deps = {
+    portalPreflight: options.portalPreflight || {
+      validate: async () => cookie ? { status: 'valid' } : { status: 'invalid' },
+      setup: async () => ({ ok: true }),
+    },
     getConfig: () => saved,
     getRuntime: () => ({ proxyStatus: options.running ? 'started' : 'stopped', runningConfig: options.runningConfig || saved,
       storageErrorCode: options.locked ? 'SETTINGS_COMMIT_UNKNOWN' : null }),
@@ -172,9 +176,9 @@ test('ordered DTO streams running and final states; stopped local check is expli
   const promise = f.service.run(scope);
   assert.strictEqual(f.service.run(scope), promise);
   const result = await promise;
-  assert.deepEqual(result.checks.map((check) => check.id), ['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'wss', 'remote-command']);
+  assert.deepEqual(result.checks.map((check) => check.id), ['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'token', 'setup', 'wss', 'remote-command']);
   assert.deepEqual(codes(result), { settings: 'SETTINGS_OK', keys: 'KEYS_OK', 'ssh-config': 'SSH_CONFIG_OK',
-    'local-listener': 'LOCAL_PORT_AVAILABLE', dns: 'DNS_OK', tls: 'TLS_OK', wss: 'WSS_SHELL_READY', 'remote-command': 'DEPENDENCY_FAILED' });
+    'local-listener': 'LOCAL_PORT_AVAILABLE', dns: 'DNS_OK', tls: 'TLS_OK', token: 'TOKEN_OK', setup: 'SETUP_OK', wss: 'WSS_SHELL_READY', 'remote-command': 'DEPENDENCY_FAILED' });
   assert.ok(result.checks.filter((check) => check.id !== 'remote-command').every((check) => check.status === 'passed' && check.durationMs >= 0));
   assert.equal(item(result, 'remote-command').status, 'skipped');
   assert.equal(item(result, 'local-listener').mode, 'bind-only');
@@ -186,7 +190,7 @@ test('ordered DTO streams running and final states; stopped local check is expli
   assert.ok(f.resources.every((value) => value.closed));
   assert.deepEqual(f.service.get(scope), result);
   const copied = f.service.get(scope); copied.checks.length = 0;
-  assert.equal(f.service.get(scope).checks.length, 8);
+  assert.equal(f.service.get(scope).checks.length, 10);
   assert.equal(f.service.get({ ...scope, epoch: 2 }), null);
   f.setConfig({ ...config, port: 4000 });
   assert.equal(f.service.get(scope), null);
@@ -260,7 +264,8 @@ test('DNS/TLS dependency failures skip only dependent network checks; no cookie 
   const tlsFailure = await fixture({ tlsError: true }).service.run(scope);
   assert.equal(item(tlsFailure, 'tls').code, 'TLS_FAILED'); assert.equal(item(tlsFailure, 'wss').status, 'skipped');
   const f = fixture({ cookie: '' }); const noCookie = await f.service.run(scope);
-  assert.equal(item(noCookie, 'wss').code, 'AUTH_REQUIRED'); assert.equal(item(noCookie, 'wss').status, 'skipped');
+  assert.equal(item(noCookie, 'token').code, 'AUTH_REQUIRED');
+  assert.equal(item(noCookie, 'wss').code, 'DEPENDENCY_FAILED'); assert.equal(item(noCookie, 'wss').status, 'skipped');
   assert.equal(f.revoked.length, 0); assert.equal(f.requests.some(([type]) => type === 'wss'), false);
 });
 
@@ -437,6 +442,7 @@ async function realFixture(t, { status = 101, closeCode, running = true, trust =
   });
   const revoked = [];
   const service = createDiagnosticsService({
+    portalPreflight: { validate: async () => ({ status: 'valid' }), setup: async () => ({ ok: true }) },
     getConfig: () => saved,
     getRuntime: () => ({ proxyStatus: running ? 'started' : 'stopped', runningConfig: running ? saved : null }),
     getKeys: () => keyService.inspect({ sshDirectory, hostKeyPath, expected: {
@@ -732,5 +738,31 @@ test('shared probe pins host key, handles fragmented output and bounds stderr wi
     if (mode === 'true') assert.equal(sent, 'true');
     assert.equal(client.listenerCount('ready'), 0);
     assert.equal(channel.listenerCount('data'), 0);
+  }
+});
+
+test('REST invalid token skips setup, WSS and remote command without deleting credentials', async () => {
+  let setups = 0;
+  const f = fixture({ running: true, portalPreflight: {
+    validate: async () => ({ status: 'invalid' }), setup: async () => { setups += 1; return { ok: true }; },
+  } });
+  const result = await f.service.run(scope);
+  assert.equal(item(result, 'token').code, 'AUTH_REQUIRED');
+  for (const id of ['setup', 'wss', 'remote-command']) assert.equal(item(result, id).status, 'skipped');
+  assert.equal(setups, 0);
+  assert.equal(f.requests.some(([type]) => type === 'wss' || type === 'exec'), false);
+  assert.deepEqual(f.revoked, []);
+});
+
+test('token network failures and setup failures stay operational, without WSS or revocation', async () => {
+  for (const stage of ['token', 'setup']) {
+    const f = fixture({ portalPreflight: {
+      validate: async () => stage === 'token' ? { status: 'network_error', errorCode: 'PORTAL_TIMEOUT' } : { status: 'valid' },
+      setup: async () => ({ ok: false, errorCode: 'PORTAL_AUTH' }),
+    } });
+    const result = await f.service.run(scope);
+    assert.equal(item(result, stage).code, stage === 'token' ? 'PORTAL_TIMEOUT' : 'PORTAL_NETWORK');
+    assert.equal(item(result, 'wss').status, 'skipped');
+    assert.equal(f.revoked.length, 0);
   }
 });

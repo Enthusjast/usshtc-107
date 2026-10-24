@@ -6,7 +6,7 @@ import { useLocale } from '../i18n/LocaleContext';
 import { useToast } from '../components/Toast';
 import { IconActivity, IconSettings, IconKey, IconFileEdit, IconInfo } from '../components/Icons';
 
-const CHECK_IDS = ['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'wss', 'remote-command'];
+const CHECK_IDS = ['settings', 'keys', 'ssh-config', 'local-listener', 'dns', 'tls', 'token', 'setup', 'wss', 'remote-command'];
 const CHECK_STATUSES = new Set(['pending', 'running', 'passed', 'failed', 'skipped']);
 export const DIAGNOSTIC_CODES = new Set([
   'SETTINGS_OK', 'SETTINGS_INVALID', 'SETTINGS_LOCKED', 'KEYS_OK', 'SSH_KEY_MISSING', 'SSH_KEY_INVALID',
@@ -15,6 +15,8 @@ export const DIAGNOSTIC_CODES = new Set([
   'PORT_IN_USE', 'LOCAL_SSH_FAILED', 'DNS_OK', 'DNS_FAILED', 'TLS_OK', 'TLS_FAILED', 'WSS_SHELL_READY',
   'AUTH_REQUIRED', 'WSS_FAILED', 'NETWORK_UNAVAILABLE', 'TIMEOUT', 'CANCELLED', 'DEPENDENCY_FAILED', 'DIAGNOSTIC_DEADLINE',
   'REMOTE_READY_TIMEOUT', 'REMOTE_COMMAND_OK', 'REMOTE_COMMAND_FAILED',
+  'TOKEN_OK', 'SETUP_OK', 'PORTAL_NETWORK', 'PORTAL_TIMEOUT', 'PORTAL_PERMISSION', 'PORTAL_NOT_FOUND',
+  'PORTAL_UNIMPLEMENTED', 'PORTAL_QUOTA', 'PORTAL_UNKNOWN',
 ]);
 const CONFIG_FIELDS = ['host', 'port', 'cluster', 'loginNode', 'cols', 'rows', 'useRoot', 'path', 'startupCommand', 'wssUrl', 'sshAlias'];
 export const diagnosticIdentity = (snapshot, scope) => JSON.stringify([scope?.profileId, scope?.epoch,

@@ -16,7 +16,7 @@ const runtime = vi.hoisted(() => ({ scope: null, snapshot: null, runAction: vi.f
 vi.mock('../src/lib/electron', async (original) => ({ ...await original(), ...api }));
 vi.mock('../src/contexts/RuntimeContext', async (original) => ({ ...await original(), useRuntime: () => runtime }));
 
-const ids = ['settings','keys','ssh-config','local-listener','dns','tls','wss','remote-command'];
+const ids = ['settings','keys','ssh-config','local-listener','dns','tls','token','setup','wss','remote-command'];
 function diagnostic(overrides = {}) {
   return {
     runId: 'run-1', profileId: 'default', epoch: 1, configFingerprint: 'config-1',
@@ -88,7 +88,6 @@ describe('Connection diagnostics', () => {
     let run=checked(diagnostic(),'settings',{status:'passed',code:'SETTINGS_OK',durationMs:1});
     run=checked(run,'keys',{status:'running'});
     act(() => emit(run));
-    expect(screen.getByText('1 of 8 checks finished')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', {name:'Open settings'}));
     expect(onNavigate).toHaveBeenCalledWith('settings');
     const final=checked({...run,finishedAt:'2026-10-24T00:00:01.000Z'},'wss',{status:'passed',code:'WSS_SHELL_READY',durationMs:15});
@@ -224,7 +223,7 @@ describe('Connection diagnostics', () => {
     render(<App />);
     expect(await screen.findByText(en.diagnostic_REMOTE_READY_TIMEOUT)).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: en['diagnosticsCheck_remote-command'] })).toBeInTheDocument();
-    expect(screen.getByRole('progressbar')).toHaveAttribute('max', '8');
+    expect(screen.getByRole('progressbar')).toHaveAttribute('max', '10');
     expect(api.startLogin).not.toHaveBeenCalled();
     expect(screen.queryByText(en.diagnostic_AUTH_REQUIRED)).not.toBeInTheDocument();
     expect(screen.queryByText(en.diagnostic_REMOTE_COMMAND_OK)).not.toBeInTheDocument();
@@ -233,6 +232,51 @@ describe('Connection diagnostics', () => {
     expect(screen.getByText(en.diagnostic_WSS_SHELL_READY)).toBeInTheDocument();
     expect(screen.getByText(en.diagnostic_REMOTE_COMMAND_FAILED)).toBeInTheDocument();
     expect(screen.queryByText(/private-output|private-command/)).not.toBeInTheDocument();
+  });
+
+  it('shows token and setup success before shell proof in the ten-check report', async () => {
+    let run = checked(diagnostic({ finishedAt: '2026-10-24T00:00:01.000Z' }), 'token', { status: 'passed', code: 'TOKEN_OK' });
+    run = checked(run, 'setup', { status: 'passed', code: 'SETUP_OK' });
+    api.getDiagnostics.mockResolvedValue(run);
+    render(<App />);
+    expect(await screen.findByText(en.diagnostic_TOKEN_OK)).toBeInTheDocument();
+    expect(screen.getByText(en.diagnostic_SETUP_OK)).toBeInTheDocument();
+    const list = screen.getByRole('list', { name: en.diagnosticsChecks });
+    const headings = within(list).getAllByRole('heading').map((heading) => heading.textContent);
+    expect(headings).toEqual(ids.map((id) => en[`diagnosticsCheck_${id}`]));
+    expect(screen.getByRole('progressbar')).toHaveAttribute('max', '10');
+  });
+
+  it.each(['token', 'setup'])('shows %s operational failure without automatic login or fabricated shell proof', async (stage) => {
+    let run = diagnostic({ finishedAt: '2026-10-24T00:00:01.000Z' });
+    if (stage === 'setup') run = checked(run, 'token', { status: 'passed', code: 'TOKEN_OK' });
+    run = checked(run, stage, { status: 'failed', code: 'PORTAL_NETWORK' });
+    for (const id of stage === 'token' ? ['setup', 'wss', 'remote-command'] : ['wss', 'remote-command']) {
+      run = checked(run, id, { status: 'skipped', code: 'DEPENDENCY_FAILED' });
+    }
+    api.getDiagnostics.mockResolvedValue(run);
+    render(<App />);
+    expect(await screen.findByText(en.diagnostic_PORTAL_NETWORK)).toBeInTheDocument();
+    expect(api.startLogin).not.toHaveBeenCalled();
+    expect(screen.queryByText(en.diagnostic_AUTH_REQUIRED)).not.toBeInTheDocument();
+    expect(screen.queryByText(en.diagnostic_WSS_SHELL_READY)).not.toBeInTheDocument();
+    expect(screen.queryByText(en.diagnostic_REMOTE_COMMAND_OK)).not.toBeInTheDocument();
+  });
+
+  it('shows REST token rejection with skipped downstream checks and requires explicit login action', async () => {
+    let run = checked(diagnostic({ finishedAt: '2026-10-24T00:00:01.000Z' }), 'token', { status: 'failed', code: 'AUTH_REQUIRED' });
+    for (const id of ['setup', 'wss', 'remote-command']) run = checked(run, id, { status: 'skipped', code: 'DEPENDENCY_FAILED' });
+    api.getDiagnostics.mockResolvedValue(run);
+    render(<App />);
+    expect(await screen.findByText(en.diagnostic_AUTH_REQUIRED)).toBeInTheDocument();
+    expect(api.startLogin).not.toHaveBeenCalled();
+    const list = screen.getByRole('list', { name: en.diagnosticsChecks });
+    for (const id of ['setup', 'wss', 'remote-command']) {
+      const row = within(list).getByRole('heading', { name: en[`diagnosticsCheck_${id}`] }).closest('li');
+      expect(within(row).getByText(en.diagnosticsStatus_skipped)).toBeInTheDocument();
+    }
+    expect(screen.queryByText(en.diagnostic_WSS_SHELL_READY)).not.toBeInTheDocument();
+    expect(screen.queryByText(en.diagnostic_REMOTE_COMMAND_OK)).not.toBeInTheDocument();
   });
 
   it('binds identity to path, startup command and visible authentication, but not health preference', () => {

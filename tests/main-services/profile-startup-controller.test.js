@@ -85,6 +85,7 @@ async function fixture(t, document, { missingKeys = false } = {}) {
     return inspectKeys();
   };
   const application = startApplication({ electron, clock, process: new EventEmitter(), sshDirectory: path.join(directory, 'ssh'),
+    portalPreflight: { validate: async () => ({ status: 'valid' }), setup: async () => ({ ok: true }), run: async () => ({ ok: true }) },
     log: { info() {}, warn() {}, error() {} },
     sshKeyService: { inspect: inspectKeys, initialize: assertKeys, recover: () => {}, assertReady: assertKeys,
       getKeyMaterial: () => { assertKeys(); throw new Error('unexpected key material request'); } },

@@ -48,6 +48,7 @@ test('a real hostname bind does not falsely require restart when saved configura
     dispose() {},
   };
   controller = createAppController({ proxy, login,
+    portalPreflight: { run: async () => ({ ok: true }) },
     settingsStore: { getRoot: () => document, isLocked: () => false, getStorageErrorCode: () => null,
       save: candidate => { document = candidate; return { state: 'committed', durable: true }; } },
     createCredentialStore: () => ({ getSsoStatus: () => ({ username: '', hasPassword: false, storageAvailable: false }) }),
