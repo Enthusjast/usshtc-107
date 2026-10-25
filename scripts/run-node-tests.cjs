@@ -3,7 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
-const { fileURLToPath } = require('node:url');
+const { fileURLToPath, pathToFileURL } = require('node:url');
 const { redactLogMessage } = require('../electron/log-redaction');
 
 function enumerate(directory) {
@@ -21,9 +21,10 @@ function canonical(file) {
 }
 
 function execute(files, args, report) {
+  const reporter = pathToFileURL(path.join(__dirname, 'ci-node-reporter.cjs')).href;
   const reporters = report ? [
-    `--test-reporter=${path.join(__dirname, 'ci-node-reporter.cjs')}`, '--test-reporter-destination=stdout',
-    `--test-reporter=${path.join(__dirname, 'ci-node-reporter.cjs')}`, `--test-reporter-destination=${report}`,
+    `--test-reporter=${reporter}`, '--test-reporter-destination=stdout',
+    `--test-reporter=${reporter}`, `--test-reporter-destination=${report}`,
   ] : [];
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ['--test', ...args, ...reporters, ...files], { stdio: 'inherit' });

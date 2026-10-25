@@ -13,6 +13,7 @@
 | CI-4 | TLS 取消可产生 ECONNRESET | `events.once(socket, 'close')` 会因 error 提前拒绝 | 生产 `probe.own` 已在 terminate/destroy 前保留 error guard；修正夹具的关闭观察，允许预期 reset，但验证真实关闭、无命令、无凭据失效且不隐藏其他错误 |
 | CI-5 | 慢 runner 放大毫秒竞态 | 真实 25/45ms 计时 | 注入可控 clock，并等待请求/响应事件屏障；保留派发前取消不出网 |
 | CI-6 | Windows 本地路径分隔符/盘符 | `/native/...` 硬编码 | 使用平台临时路径，保留 Windows/POSIX 日志与 DTO 隐私断言 |
+| CI reporter | Windows 盘符被 ESM loader 当成 URI scheme | 首轮修复 CI 在测试开始前失败 | [CI 40184308684](https://github.com/Enthusjast/usshtc-107/actions/runs/40184308684) 确认 `ERR_UNSUPPORTED_ESM_URL_SCHEME`；用 `pathToFileURL` 传入 reporter，原始失败保持非零，没有当作测试通过 |
 | 本地 tmux | 继承宿主 SHELL/HOME/TMUX | 直接诊断观察到 zsh/oh-my-zsh 更新提示消费输入；历史失败是否为同一提示属推断 | 隔离夹具 shell 与 HOME/XDG，等待实际 tmux pane 提示后发命令；不改生产 tmux 行为 |
 | SEC-1 | 无 | 非测试建模问题 | 默认仅允许精确门户 host；替代 host/port 需受信任 Node 调用方显式 allowedHosts，拒绝子域伪装/通配/隐式信任，拒绝前不分配 agent 或出网 |
 | SEC-2 | 无 | getFileType 跟随链接，不能作为 no-follow 证明 | 元数据明确 kind；统一检查选中条目及祖先，默认拒绝链接、特殊文件与无法确认类型的条目；SCP 复用同一分类规则 |
