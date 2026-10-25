@@ -61,7 +61,7 @@ Windows PowerShell 先设置 `$env:APP_EXECUTABLE='C:\absolute\win-unpacked\ussh
 
 source 与 packaged 项目均使用私有 HOME/userData/sessionData/logs/SSH/XDG 目录、关闭自动连接/更新/自启动，并在主进程实查实际路径。测试侧拒绝外网；source 只使用固定本地 TLS/WSS 与隔离 CAS fixture，不代表真实学校登录、OS 密钥环或签名升级证据。packaged 不注入生产测试入口。沙箱保持开启；截图和原生上下文 trace 保存在 `test-results/`，CI 按平台分别保留。
 
-macOS 发布验收同时设置私有 `HOME` 与 CoreFoundation 的 `CFFIXED_USER_HOME`，在隔离目录创建、解锁专用系统钥匙串，结束后删除临时项，避免访问 runner 的真实钥匙串或阻塞在无人值守授权；不替换原生 `safeStorage`，也不使用明文凭据回退。
+macOS 发布验收同时设置私有 `HOME` 与 CoreFoundation 的 `CFFIXED_USER_HOME`，预建 `Library/Preferences` 以持久化原生钥匙串默认项及搜索列表，在隔离目录创建、解锁专用系统钥匙串，结束后删除临时项；不访问 runner 的真实钥匙串、不替换原生 `safeStorage`，也不使用明文凭据回退。
 
 文件传输 fixture 使用真实本地 HTTPS 与原始二进制，不再需要 GNU coreutils 或远端 shell 工具。source 的命令 fixture 在 POSIX 使用真实 Python PTY，在 Windows 使用已安装的 Git Bash 执行命令，仅对管道模式的终端设置做测试侧建模；这不是原生 Windows PTY 或真实学校平台的通过证据。
 

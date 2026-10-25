@@ -271,18 +271,8 @@ jobs:
             x64) app_directory=release/mac ;;
             *) echo 'Unsupported native macOS architecture' >&2; exit 1 ;;
           esac
-          (
-            sleep 45
-            mkdir -p test-results
-            pid=$(pgrep -n -x usshtc107)
-            sample "$pid" 1 1 -file "$GITHUB_WORKSPACE/test-results/macos-main.sample.txt"
-            screencapture -x "$GITHUB_WORKSPACE/test-results/macos-desktop.png"
-          ) &
-          observer=$!
           APP_EXECUTABLE="$GITHUB_WORKSPACE/$app_directory/usshtc107.app/Contents/MacOS/usshtc107" \
             npm run test:electron:packaged -- --output=test-results/packaged
-          kill "$observer" 2>/dev/null || true
-          wait "$observer" 2>/dev/null || true
 
       - name: Retain native packaged runtime screenshots and traces
         if: always() && steps.select.outputs.enabled == 'true'
