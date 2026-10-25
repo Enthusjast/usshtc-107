@@ -61,6 +61,8 @@ Windows PowerShell 先设置 `$env:APP_EXECUTABLE='C:\absolute\win-unpacked\ussh
 
 source 与 packaged 项目均使用私有 HOME/userData/sessionData/logs/SSH/XDG 目录、关闭自动连接/更新/自启动，并在主进程实查实际路径。测试侧拒绝外网；source 只使用固定本地 TLS/WSS 与隔离 CAS fixture，不代表真实学校登录、OS 密钥环或签名升级证据。packaged 不注入生产测试入口。沙箱保持开启；截图和原生上下文 trace 保存在 `test-results/`，CI 按平台分别保留。
 
+macOS 发布验收会创建并解锁临时系统钥匙串，结束后恢复默认钥匙串并删除临时项，避免无人值守 CI 阻塞在钥匙串授权；不替换原生 `safeStorage`，也不使用明文凭据回退。
+
 文件传输 fixture 使用真实本地 HTTPS 与原始二进制，不再需要 GNU coreutils 或远端 shell 工具。source 的命令 fixture 在 POSIX 使用真实 Python PTY，在 Windows 使用已安装的 Git Bash 执行命令，仅对管道模式的终端设置做测试侧建模；这不是原生 Windows PTY 或真实学校平台的通过证据。
 
 公开设置的默认值与校验由 `shared/settings-schema.mjs` 统一，renderer 校验仅供交互提示，主进程再次权威验证。IPC 成功响应为 `{ok:true,value}`，业务失败为 `{ok:false,error:{code,fieldErrors?}}`；取消操作是成功的 `{cancelled:true}` 值。前端只显示固定错误码的本地化文案，不显示主进程异常正文；缺少桌面 runtime/API 的动作会明确失败，不再静默成功。
