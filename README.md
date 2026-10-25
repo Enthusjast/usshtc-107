@@ -249,18 +249,13 @@ npm run dist:mac
 npm run dist:win
 ```
 
-Linux 可直接本地打包。项目使用 npm 11.18.0 的依赖安装脚本白名单；发布和 CI 会固定该版本并在严格模式下安装。macOS 和 Windows 配置了强制代码签名，缺少证书时会失败，以避免发布未签名安装包。
+项目使用 npm 11.18.0 的依赖安装脚本白名单；发布和 CI 会固定该版本并在严格模式下安装。Windows 和 macOS 发布包不进行开发者证书签名或 Apple 公证，不需要配置签名、公证 Secrets；macOS 显式禁用签名身份，CI 禁用证书自动发现。
 
-GitHub Actions 发布需要以下仓库 Secrets：
+未签名安装包可能触发 Windows 的未知发布者/SmartScreen 警告，macOS 可能由 Gatekeeper 拦截。请仅从本仓库 GitHub Release 下载，并先核对 `SHA256SUMS.txt` 和构建来源证明；这些完整性证明不等同于操作系统认可的开发者签名。不要关闭系统全局安全检查。Windows/macOS 的应用内升级仍保留平台验签保护，不承诺未签名版本能够应用内安装；请从官方 Release 页面下载后手动升级。
 
-| 平台 | Secrets |
-|---|---|
-| macOS | `MAC_CSC_LINK`, `MAC_CSC_KEY_PASSWORD`, `APPLE_API_KEY_BASE64`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER` |
-| Windows | `WIN_CSC_LINK`, `WIN_CSC_KEY_PASSWORD` |
+发布标签必须严格等于 `v<package.json version>`，例如 `v1.3.3`，且标签提交必须属于默认分支历史。应在仓库设置中保护 `v*` 标签。
 
-`MAC_CSC_LINK` 和 `WIN_CSC_LINK` 可使用 electron-builder 支持的 base64 证书值。`APPLE_API_KEY_BASE64` 是 App Store Connect `.p8` 私钥的 base64 内容。用于签名或发布的标签必须严格等于 `v<package.json version>`，例如修复版本使用 `v1.3.3`，且标签提交必须属于默认分支历史。应在仓库设置中保护 `v*` 标签；真实门户验收未完成前不创建本版本发布标签。
-
-发布流水线会验证签名和 macOS 公证，生成产物 SHA-256 校验文件和 GitHub 构建来源证明，并为实际生产依赖生成 CycloneDX SBOM。普通手动构建可以选择单个平台；Linux 可从功能分支构建，使用证书的 macOS/Windows 构建只能从默认分支或匹配版本的标签发起。创建 GitHub Release 时必须构建全部平台。
+发布流水线检查各平台安装包及更新 metadata，生成产物 SHA-256 校验文件和 GitHub 构建来源证明，并为实际生产依赖生成 CycloneDX SBOM。普通手动构建可以选择单个平台；macOS/Windows 构建只能从默认分支或匹配版本的标签发起。创建 GitHub Release 时必须构建全部平台。TLS、SSH 公钥认证和下载完整性校验保持不变。
 
 所有本地/CI builder 调用显式使用 `--publish never`，只有 release job 发布。macOS 单次构建产出 x64/arm64 DMG 和 ZIP，合并 `latest-mac.yml` 仅引用 ZIP；Windows 保留 exe、exe.blockmap 和 latest.yml，Linux 保留 AppImage、deb 和 latest-linux.yml，AppImage blockmap 位于镜像内。`scripts/verify-update-artifacts.cjs <目录> <win|mac|linux|all>` 在上传/发布前核对最终产物的版本、文件名、size/SHA512 和 blockmap；metadata 与 blockmap 一同进入 checksum 和 provenance，不能删除后再上传。
 
