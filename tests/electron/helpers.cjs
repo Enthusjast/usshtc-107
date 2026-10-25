@@ -122,7 +122,7 @@ async function launch(testInfo, { packaged = false } = {}) {
   const root = isolatedRoot(port);
   const env = privateEnvironment(root, packaged, executable);
   const keychain = packaged && process.platform === 'darwin'
-    ? path.join(root, 'home/Library/Keychains/login.keychain-db') : null;
+    ? path.join(root, 'home/Library/Keychains/usshtc107-acceptance.keychain-db') : null;
   let application, child;
   try {
     if (keychain) prepareKeychain(keychain, env);

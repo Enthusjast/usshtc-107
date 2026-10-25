@@ -126,10 +126,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Probe native keychain environment
-        if: steps.select.outputs.enabled == 'true' && matrix.target == 'mac'
-        run: node scripts/probe-native-keychain.cjs
-
       - name: Set up Node.js
         if: steps.select.outputs.enabled == 'true'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
