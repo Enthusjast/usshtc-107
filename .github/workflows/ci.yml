@@ -60,7 +60,8 @@ jobs:
           echo "PSCP_BINARY=/usr/bin/pscp" >> "$GITHUB_ENV"
           echo "PUTTYGEN_BINARY=/usr/bin/puttygen" >> "$GITHUB_ENV"
 
-      - name: Run Node and real transport tests three consecutive times
+      - name: Run Node and real transport tests three consecutive times on POSIX
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -69,12 +70,42 @@ jobs:
             npm run test:node
           done
 
-      - name: Run renderer interaction tests
-        run: npm run test:ui
+      - name: Run Node and real transport tests three consecutive times on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sshDirectory = Join-Path $env:WINDIR 'System32/OpenSSH'
+          $ssh = Join-Path $sshDirectory 'ssh.exe'
+          if (!(Test-Path $ssh)) { throw 'Native Windows OpenSSH client is unavailable' }
+          $env:PATH = "$sshDirectory;$env:PATH"
+          & $ssh -V
+          foreach ($attempt in 1..3) {
+            Write-Host "Node regression pass $attempt/3 on $env:RUNNER_OS"
+            npm run test:node
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
-      - name: Enforce Node and renderer coverage thresholds
+      - name: Run renderer interaction tests
+        id: renderer_tests
+        env:
+          USSHTC107_VITEST_REPORT_FILE: test-results/renderer-initial.json
+        run: npm run test:ui -- --reporter=default --reporter=./scripts/ci-vitest-reporter.cjs
+
+      - name: Enforce Node coverage thresholds
         if: runner.os == 'Linux'
-        run: npm run test:coverage
+        run: npm run test:node:coverage
+
+      - name: Enforce renderer coverage thresholds
+        id: renderer_coverage
+        if: runner.os == 'Linux'
+        env:
+          USSHTC107_VITEST_REPORT_FILE: test-results/renderer-coverage.json
+        run: npm run test:ui:coverage -- --reporter=default --reporter=./scripts/ci-vitest-reporter.cjs
+
+      - name: Diagnose failed renderer files once without clearing the original failure
+        if: failure() && (steps.renderer_tests.outcome == 'failure' || steps.renderer_coverage.outcome == 'failure')
+        run: node scripts/rerun-ui-failures.cjs test-results/renderer-initial.json test-results/renderer-coverage.json
 
       - name: Build renderer
         run: npm run build

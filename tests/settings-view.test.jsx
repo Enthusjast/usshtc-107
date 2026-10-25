@@ -841,14 +841,24 @@ it('keeps newer drafts edited while the key confirmation for an older revision i
 });
 
 it('rejects stale key reads after scope changes and retains only the current application DTO',async()=>{
- let finish; mocks.getSshKeyInfo.mockImplementationOnce(()=>new Promise(resolve=>{finish=resolve;}));
- const view=mount(); await screen.findByLabelText('Host');
+ let finishStale,finishCurrent;
+ mocks.getSshKeyInfo
+  .mockImplementationOnce(()=>new Promise(resolve=>{finishStale=resolve;}))
+  .mockImplementationOnce(()=>new Promise(resolve=>{finishCurrent=resolve;}));
+ const view=mount();
+ // Settings fields can commit before the independent key panel starts its passive read.
+ await waitFor(()=>expect(mocks.getSshKeyInfo).toHaveBeenCalledExactlyOnceWith(runtime.scope));
  runtime.scope={profileId:'b',epoch:2}; mocks.getSsoCredentials.mockResolvedValue({profileId:'b',username:'B',storageAvailable:true});
- mocks.getSshKeyInfo.mockResolvedValue({scope:'application',client:{state:'ready',publicKey:'ssh-ed25519 current',fingerprint:'SHA256:new-client',privateKeyPath:'/tmp/new'},host:{state:'ready',fingerprint:'SHA256:new-host',privateKeyPath:'/tmp/new-host'},recoveryRequired:false});
  view.rerender(<LocaleProvider><ToastProvider><SettingsView key="b"/></ToastProvider></LocaleProvider>);
- await screen.findByText('SHA256:new-client');
- await act(async()=>finish({scope:'application',client:{state:'ready',fingerprint:'SHA256:stale',publicKey:'ssh-ed25519 stale'},host:{state:'ready'},recoveryRequired:false}));
- expect(screen.queryByText('SHA256:stale')).not.toBeInTheDocument(); expect(screen.getByText('SHA256:new-client')).toBeInTheDocument();
+ await waitFor(()=>expect(mocks.getSshKeyInfo).toHaveBeenLastCalledWith(runtime.scope));
+ expect(mocks.getSshKeyInfo).toHaveBeenCalledTimes(2);
+ await act(async()=>finishCurrent({scope:'application',client:{state:'ready',publicKey:'ssh-ed25519 current',fingerprint:'SHA256:new-client',privateKeyPath:'/tmp/new'},host:{state:'ready',fingerprint:'SHA256:new-host',privateKeyPath:'/tmp/new-host'},recoveryRequired:false}));
+ expect(screen.getByText('SHA256:new-client')).toBeInTheDocument();
+ await act(async()=>finishStale({scope:'application',client:{state:'ready',fingerprint:'SHA256:stale',publicKey:'ssh-ed25519 stale'},host:{state:'ready'},recoveryRequired:false}));
+ expect(screen.queryByText('SHA256:stale')).not.toBeInTheDocument(); expect(screen.queryByText('ssh-ed25519 stale')).not.toBeInTheDocument();
+ expect(screen.getByText('SHA256:new-client')).toBeInTheDocument(); expect(screen.getByText('SHA256:new-host')).toBeInTheDocument();
+ fireEvent.click(screen.getByRole('button',{name:'Copy public key'}));
+ await waitFor(()=>expect(mocks.copyToClipboard).toHaveBeenCalledExactlyOnceWith('ssh-ed25519 current'));
 });
 
 it('rejects a stale operation result after another profile takes ownership',async()=>{
