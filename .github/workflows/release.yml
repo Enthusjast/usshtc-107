@@ -381,7 +381,7 @@ jobs:
               --no-audit --no-fund
             npm ci --omit=optional --ignore-scripts --no-audit --no-fund
             npm ls --all --omit=optional --json > installed.json
-            npm sbom --omit=optional \
+            npm sbom \
               --sbom-format=cyclonedx --sbom-type=application \
               > "$sbom_path"
           )

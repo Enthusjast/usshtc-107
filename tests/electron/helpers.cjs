@@ -78,6 +78,8 @@ function privateEnvironment(root, packaged, executable) {
   };
   for (const key of ['ELECTRON_RUN_AS_NODE', 'ELECTRON_DEV', 'NODE_OPTIONS', 'NODE_EXTRA_CA_CERTS', 'NODE_TLS_REJECT_UNAUTHORIZED', 'APPIMAGE', 'APPDIR', 'USSHTC107_FIXTURE_ROOT']) delete env[key];
   delete env.APP_EXPECTED_UPDATE_MODE;
+  // CoreFoundation resolves Keychain preferences independently of POSIX HOME.
+  if (process.platform === 'darwin') env.CFFIXED_USER_HOME = env.HOME;
   if (!packaged) env.USSHTC107_FIXTURE_ROOT = root;
   if (!packaged || !executable.endsWith('.AppImage')) delete env.APPIMAGE_EXTRACT_AND_RUN;
   return env;
