@@ -33,12 +33,17 @@ function extractScowToken(cookie) {
     return token;
   } catch (_) { throw new PortalApiError('UNKNOWN'); }
 }
-function classifyStatus(status, body, path) {
+function classifyStatus(status, body, path, contentType) {
   let value;
   try { value = JSON.parse(body.toString('utf8')); } catch (_) {}
   const code = value?.code;
   if (status === 401) return 'AUTH';
-  if (status === 403) return path === '/api/auth/validateToken' && value === null ? 'AUTH' : 'PERMISSION';
+  if (status === 403) {
+    // The deployed validator also rejects with an empty application/json body.
+    // This gates verification only; neither envelope proves token expiry.
+    const emptyJson = body.length === 0 && /^application\/json(?:\s*;|$)/i.test(contentType || '');
+    return path === '/api/auth/validateToken' && (value === null || emptyJson) ? 'AUTH' : 'PERMISSION';
+  }
   if (status === 404) return 'NOT_FOUND';
   if (status === 501) return 'UNIMPLEMENTED';
   if ([413, 429, 507].includes(status) || ['QUOTA_EXCEEDED', 'TOO_MANY_DESKTOPS'].includes(code)) return 'QUOTA';
@@ -188,7 +193,7 @@ function createPortalApiClient({ baseUrl = PLATFORM.url, allowedHosts = [PLATFOR
       const status = response.statusCode;
       if (status < 200 || status >= 300) {
         const errorBody = await collect(MAX_JSON_BYTES);
-        failure = new PortalApiError(classifyStatus(status, errorBody, path), status);
+        failure = new PortalApiError(classifyStatus(status, errorBody, path, response.headers['content-type']), status);
         throw failure;
       }
       if (options.expectedStatus && !options.expectedStatus.includes(status)) throw new PortalApiError('UNKNOWN', status);

@@ -19,8 +19,9 @@ async function fixture(t) {
       method: request.method });
     if (mode === 'network') { request.socket.destroy(); return; }
     if (url.pathname === '/api/auth/validateToken') {
-      response.writeHead(mode === 'invalid' ? 403 : 200, { 'Content-Type': 'application/json' });
-      response.end(mode === 'invalid' ? 'null' : JSON.stringify({ identityId: 'fixture-only' }));
+      const rejected = mode === 'invalid' || mode === 'invalid-empty-json';
+      response.writeHead(rejected ? 403 : 200, { 'Content-Type': 'application/json' });
+      response.end(mode === 'invalid-empty-json' ? '' : rejected ? 'null' : JSON.stringify({ identityId: 'fixture-only' }));
     } else {
       response.writeHead(mode === 'setup-failure' ? 403 : 200);
       response.end(mode === 'setup-failure' ? 'private setup body' : 'Already setup');
@@ -64,6 +65,16 @@ test('preflight never derives host permission from an injected base URL', async 
     await assert.rejects(portal.run(context()), { code: 'PORTAL_UNKNOWN' });
   }
   assert.equal(outgoing, 0);
+});
+
+test('empty JSON validator rejection stops before setup and retains the supplied credential', async t => {
+  const f = await fixture(t);
+  f.setMode('invalid-empty-json');
+  const value = context();
+  const cookie = value.cookie;
+  await assert.rejects(f.portal.run(value), { code: 'AUTH_REQUIRED' });
+  assert.deepEqual(f.requests.map(request => request.path), ['/api/auth/validateToken']);
+  assert.equal(value.cookie, cookie);
 });
 
 test('setup uses a four-second bound and disposes every client even on timeout', async () => {

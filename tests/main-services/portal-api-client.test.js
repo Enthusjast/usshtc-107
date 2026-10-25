@@ -169,6 +169,24 @@ test('endpoint-aware HTTP errors never turn file permissions or setup failures i
   }
 });
 
+test('deployed empty JSON validator rejection gates auth without reclassifying other permission responses', async t => {
+  let contentType = 'application/json';
+  let body = '';
+  const f = await fixture(t, (_request, response) => {
+    response.writeHead(403, contentType ? { 'Content-Type': contentType } : {});
+    response.end(body);
+  });
+  const client = f.client();
+  const auth = createAuthApi({ client });
+  assert.deepEqual(await auth.validateToken('invalid-fixture'), { status: 'invalid', errorCode: 'AUTH_REQUIRED' });
+  await assert.rejects(client.json('/api/file/fileExist'), { code: 'PORTAL_PERMISSION' });
+  for (const variant of [['text/html', ''], [undefined, ''], ['application/json-invalid', ''],
+    ['application/json', '{"code":"PERMISSION_DENIED"}'], ['application/json', 'false'], ['application/json', ' ']]) {
+    [contentType, body] = variant;
+    assert.deepEqual(await auth.validateToken('invalid-fixture'), { status: 'network_error', errorCode: 'PORTAL_PERMISSION' });
+  }
+});
+
 test('setup accepts only its known successful plain-text responses and omits authentication', async t => {
   let calls = 0;
   const f = await fixture(t, (request, response) => {
