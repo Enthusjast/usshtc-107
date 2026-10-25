@@ -50,6 +50,9 @@ P5 必须由获授权的账号完成，并发观察还需平台许可。只读�
 
 - [40184308684](https://github.com/Enthusjast/usshtc-107/actions/runs/40184308684)：Linux/macOS 各三次完整 Node 回归与后续原生验收通过；Windows 在自定义 reporter 的盘符导入处失败，已修复为 file URL。
 - [40184800641](https://github.com/Enthusjast/usshtc-107/actions/runs/40184800641)：macOS job 再次通过。Windows 更新校验组已通过，唯一失败为受控 OpenSSH Include 用例的 interval 0/17；保留断言，修复 CI 的原生 Windows shell/SSH 选择。Linux 三次 Node 回归及 Node 覆盖率均通过，renderer 覆盖率暴露旧 scoped-key 测试的请求启动屏障竞态；不提高超时、不放松 stale-response 断言。
+- [40187250942](https://github.com/Enthusjast/usshtc-107/actions/runs/40187250942)：Windows/macOS job 完整通过。Linux renderer 覆盖率发现 dashboard 在 null→loaded scope 首次提交后，旧 passive cleanup 可能清除刚由有效点击创建的恢复 token。仅失败 dashboard 文件的诊断重跑通过，但 job 仍因首次失败而失败，证明没有用重跑漂白状态。
+
+dashboard 这一项属于运行时缺陷而非单纯等待不足：恢复作用域的清理/初始化改为 layout effect，在已提交控件可交互之前完成。确定性回归在首个 loaded commit 的 sibling layout effect 中立即点击，验证只读恢复请求、pending 反馈、完成及不启动用户已停止的代理；不增加超时、睡眠或重试。
 
 renderer scoped-key 回归已改为等待两个作用域请求真正启动，再以 act 先完成当前响应、后完成旧响应；继续验证当前指纹、公钥复制与拒绝 stale 数据，不加长超时或增加重试。renderer 同样保留脱敏 manifest，并在原步骤失败后仅诊断重跑失败文件一次；原失败状态不被清除。
 

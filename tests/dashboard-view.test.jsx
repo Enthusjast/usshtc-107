@@ -2,7 +2,7 @@ import React from 'react';
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import { beforeEach, describe, it, expect, vi } from 'vitest';
 import DashboardView from '../src/views/DashboardView';
-import { RuntimeProvider } from '../src/contexts/RuntimeContext';
+import { RuntimeProvider, useRuntime } from '../src/contexts/RuntimeContext';
 import { LocaleProvider } from '../src/i18n/LocaleContext';
 import { ToastProvider } from '../src/components/Toast';
 import en from '../src/i18n/en';
@@ -11,7 +11,7 @@ vi.mock('../src/lib/electron', async (importOriginal) => ({ ...await importOrigi
 const config = { host: '0.0.0.0', port: 3000 };
 const snapshot = (revision, extra = {}) => ({ profileId: 'default', epoch: 1, revision, loginStatus: 'success', loginStage: null, cookieValid: true, cookieCount: 1, proxyStatus: 'started', desiredConfig: config, runningConfig: config, needsRestart: false, connectionCount: 1, desiredRunning: true, remoteStatus: 'unknown', operation: null, errorCode: null, storageErrorCode: null, ...extra });
 let emit, emitStats;
-function mount() { return render(<LocaleProvider><ToastProvider><RuntimeProvider><DashboardView /></RuntimeProvider></ToastProvider></LocaleProvider>); }
+function mount(afterDashboard=null) { return render(<LocaleProvider><ToastProvider><RuntimeProvider><DashboardView />{afterDashboard}</RuntimeProvider></ToastProvider></LocaleProvider>); }
 beforeEach(() => {
   vi.resetAllMocks();
   mocks.getSettings.mockResolvedValue({locale:'en'});
@@ -178,11 +178,26 @@ it('never calls recovery for a scope that changed while its draft acknowledgemen
 });
 
 it('does not ask to start a user-stopped proxy when manually checking connectivity',async()=>{
+ let finish; mocks.retryRecovery.mockImplementationOnce(()=>new Promise(resolve=>{finish=resolve;}));
  mocks.getStatus.mockResolvedValue(snapshot(1,{desiredRunning:false,proxyStatus:'stopped',runningConfig:null,remoteStatus:'offline'}));
- mount(); expect(await screen.findByText('Connection is not requested. A check will not start the proxy.')).toBeInTheDocument();
- fireEvent.click(screen.getByRole('button',{name:'Retry connection'}));
- await waitFor(()=>expect(mocks.retryRecovery).toHaveBeenCalled());
- expect(mocks.startProxy).not.toHaveBeenCalled(); expect(mocks.startLogin).not.toHaveBeenCalled();
+ function CheckOnLoadedCommit() {
+  const {snapshot}=useRuntime();
+  const clicked=React.useRef(false);
+  React.useLayoutEffect(()=>{
+   if(!snapshot||clicked.current) return;
+   clicked.current=true;
+   // Exercise an enabled control before the previous scope's passive cleanup runs.
+   screen.getByRole('button',{name:'Retry connection'}).click();
+  },[snapshot]);
+  return null;
+ }
+ mount(<CheckOnLoadedCommit/>);
+ await waitFor(()=>expect(mocks.retryRecovery).toHaveBeenCalledExactlyOnceWith({profileId:'default',epoch:1}));
+ expect(screen.getByText('Connection is not requested. A check will not start the proxy.')).toBeInTheDocument();
+ expect(screen.getByRole('button',{name:'Checking connection…'})).toBeDisabled();
+ expect(mocks.startProxy).not.toHaveBeenCalled(); expect(mocks.startLogin).not.toHaveBeenCalled(); expect(mocks.stopProxy).not.toHaveBeenCalled();
+ await act(async()=>finish({reachable:true}));
+ expect(screen.getByRole('button',{name:'Retry connection'})).toBeEnabled();
 });
 
 it('renders localized recovery instructions and authenticated-action guidance in Chinese',async()=>{

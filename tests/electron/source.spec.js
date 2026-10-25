@@ -369,6 +369,11 @@ test('real source official APIs: explicit credential-safe desktop/app actions an
     expect(await application.evaluate(({ app }) => app.__acceptance.portalCalls.filter(path => path === '/api/setup').length)).toBe(setups);
     await rpc(page, 'stopProxy', await scope(page));
     await waitState(page, { proxyStatus: 'stopped', operation: null, cookieValid: true });
+    const stoppedInstances = await application.evaluate(({ app }) => app.__acceptance.proxyInstances.length);
+    await page.getByRole('button', { name: 'Retry connection', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Retry connection', exact: true })).toBeEnabled();
+    await waitState(page, { proxyStatus: 'stopped', desiredRunning: false, runningConfig: null, operation: null });
+    expect(await application.evaluate(({ app }) => app.__acceptance.proxyInstances.length)).toBe(stoppedInstances);
     await navigate(page, 'Desktops & apps', 'Remote desktops and applications');
     await expect(page.getByRole('heading', { name: 'Fixture desktop', exact: true })).toBeVisible();
     await expect(page.getByRole('heading', { name: 'Fixture app session', exact: true })).toBeVisible();

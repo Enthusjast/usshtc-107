@@ -1,5 +1,5 @@
 import { formatApiError } from '../lib/api-errors';
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react';
 import {
   startLogin, startProxy, stopProxy,
   copyToClipboard, getSshKeyInfo, retryRecovery,
@@ -63,7 +63,8 @@ export default function DashboardView({ onNavigate }) {
   const activeScope = useRef(scope);
   activeScope.current = scope;
 
-  useEffect(() => {
+  // Retire the previous scope before newly committed controls can start recovery.
+  useLayoutEffect(() => {
     setRecoveryPending(false);
     setRecoveryError(null);
     return () => { recoveryRequest.current = null; };
