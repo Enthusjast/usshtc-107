@@ -1,12 +1,13 @@
 'use strict';
 
 const test = require('node:test');
+const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const https = require('node:https');
 const { EventEmitter } = require('node:events');
 const { WebSocketServer } = require('ws');
-const { harness, check, event, bounded } = require('../live/helpers.cjs');
+const { harness, check, event, bounded } = require('../fixtures/ssh-transport.cjs');
 
 // Public loopback-only test trust material. Certificate verification stays on;
 // the application is given this CA rather than disabling TLS verification.
@@ -68,10 +69,20 @@ async function faultServer(t) {
   };
 }
 
+test('transport harness requires explicit loopback WSS, fixture credentials and trusted test CA', async t => {
+  const valid = { cookie: 'SCOW_USER=loopback-fault-only', tlsCa: certificate, wssUrl: 'wss://127.0.0.1:12345/shell' };
+  for (const options of [{}, { ...valid, cookie: undefined }, { ...valid, tlsCa: undefined },
+    { ...valid, wssUrl: 'wss://example.invalid:443/shell' },
+    { ...valid, wssUrl: 'https://127.0.0.1:12345/shell' },
+    { ...valid, wssUrl: 'wss://127.0.0.1/shell' }]) {
+    await assert.rejects(harness(t, options), { code: 'LOCAL_FIXTURE_REQUIRED' });
+  }
+});
+
 for (const kind of ['exec', 'shell']) {
   test(`real TLS/WSS ${kind} silence times out without auth invalidation or early input`, { timeout: 12000 }, async (t) => {
     const remote = await faultServer(t);
-    const f = await harness(t, remote.options, { backend: 'proxy' });
+    const f = await harness(t, remote.options);
     const auth = [];
     const ready = [];
     f.proxy.on('auth-error', (value) => auth.push(value));
@@ -98,7 +109,7 @@ for (const kind of ['exec', 'shell']) {
 for (const kind of ['exec', 'shell']) {
   test(`real TLS/WSS ${kind} delayed empty data releases input only after readiness`, { timeout: 12000 }, async (t) => {
     const remote = await faultServer(t);
-    const f = await harness(t, { ...remote.options, remoteReadyTimeoutMs: 2000 }, { backend: 'proxy' });
+    const f = await harness(t, { ...remote.options, remoteReadyTimeoutMs: 2000 });
     const client = await f.connect();
     const connected = remote.peer();
     const ready = event(f.proxy, 'remote-ready');
@@ -127,7 +138,7 @@ for (const kind of ['exec', 'shell']) {
 
 test('real TLS/WSS first data after timeout cannot resurrect or replay the channel', { timeout: 12000 }, async (t) => {
   const remote = await faultServer(t);
-  const f = await harness(t, remote.options, { backend: 'proxy' });
+  const f = await harness(t, remote.options);
   const client = await f.connect();
   const connected = remote.peer();
   const timedOut = event(f.proxy, 'remote-not-ready');

@@ -323,11 +323,11 @@ tests/                    核心代理、安全服务和前端交互测试
 - 档案 `path` 默认为空，最多 1,024 字符，不接受控制字符，按字面保留空格并经 `URLSearchParams` 编码。已有 v2 设置在内存补齐缺省字段，不自动改写用户文件。
 - 单独构造 `ProxyServer` 而未传入 host key 时，也复用持久化 OpenSSH Ed25519 身份，不再按进程生成临时 RSA key；可用 `hostKeyPath` 指定隔离路径。默认路径与标准平台 userData 目录一致，自定义 Electron userData 仍由主进程显式提供身份。损坏或异类 key 拒绝启动，不删除旧文件。
 
-## 真实门户验收
+## 自动化验收范围
 
-`tests/live/` 只有同时设置 `LIVE_SMOKE=1` 和短期 `SCOW_TOKEN` 才联系真实门户；`portal-api.live.cjs` 校验 token、setup 并只读列出桌面/应用，不自动启动会话或上传文件。`LIVE_CONCURRENCY=1` 另启用 2/4/8 并发只读观察。没有凭据的跳过不算成功；真实 token/文件/桌面验收本轮未取得，local fixture 不能替代。运行与秘密处理见 [live 验收说明](tests/live/README.md)。
+CI 和测试仅使用隔离的本地 TLS/WSS、SSH、PTY、文件 API fixture 与原生 Electron 程序，不接入真实学校账号，也不要求提供有效或过期 token。真实账号在线测试、相关运行入口和账号验收前置条件已移除；生产 CLI 的 `SCOW_TOKEN` 用法保持不变。
 
-未提供凭据时 live 用例明确跳过，不算真实门户通过。当前修复计划要求真实门户验收，但本轮未提供有效/失效 token 与并发许可，因此 P5 仍受阻。本地 TLS/WSS、SSH、PTY 和 Electron fixture 不能替代学校平台、真实密钥环或 Windows/macOS 签名升级证据。失败归因、CI 诊断规则和发布门槛见 [1.3.3 修复记录](docs/ci-stability-1.3.3.md)；P5 未通过不发布。
+本地故障注入可用 `node --test tests/integration/remote-ready.test.js` 独立执行，始终要求显式 loopback WSS、测试 Cookie 与受信任测试 CA，没有真实服务回退。自动化结果不代表学校平台实时可用性、真实系统密钥环或 Windows/macOS 连续签名升级已验证。失败归因与 CI 诊断规则见 [1.3.3 修复记录](docs/ci-stability-1.3.3.md)。
 
 ## License
 

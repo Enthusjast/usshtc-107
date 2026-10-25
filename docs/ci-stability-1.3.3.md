@@ -19,7 +19,7 @@
 | SEC-2 | 无 | getFileType 跟随链接，不能作为 no-follow 证明 | 元数据明确 kind；统一检查选中条目及祖先，默认拒绝链接、特殊文件与无法确认类型的条目；SCP 复用同一分类规则 |
 | 实际认证拒绝 | 已部署 validator 与公开 null body 不同 | 仅生成无效 token 的真实探测观察到经 TLS 校验的 application/json、HTTP 403、0 字节 | 只为该 validator 的精确空 JSON 拒绝增加门禁分类；文件接口、HTML/无 MIME/非空权限 body 仍按权限失败，不删除 Cookie、不推断过期 |
 | BEH-1 / BEH-2 | 门户行为 | logout 无 exit 帧；EOF 已有有界静默排空 | 保留现有行为，文档不再把 EOF 写成“立即 disconnect”，也不声称慢命令一定完整 |
-| BEH-3 | 尚未归因 | 用户报告偶发 124 | 不自动重试或推测限流；保留 2/4/8、每档三轮的授权只读观察入口 |
+| BEH-3 | 尚未归因 | 曾报告偶发 124 | 不自动重试或推测限流；旧在线并发观察入口已移除，保留本地传输故障边界回归 |
 
 Windows 历史失败的确切原始异常已被旧代码丢弃。Node 的同步 JS realpath 与 native/promises realpath 对 Windows 别名的处理差异有源码依据，但将该次失败具体归因为短名或大小写仍是 **[INFERENCE]**；修复后的真实 Windows CI 结果和新检查点才是验收证据。
 
@@ -38,13 +38,13 @@ Windows 历史失败的确切原始异常已被旧代码丢弃。Node 的同步 
 
 本次不更改配置和密钥格式。按提交逆序 revert 可撤销修复；不要删除私钥、known_hosts 或凭据以绕过保护。旧版本会恢复旧安全边界，回滚不等于风险消失。
 
-## 验收状态与发布门槛
+## 验收范围调整
 
-有效账号、文件往返、桌面/应用打开及已知过期 token 验收尚未取得。默认环境没有 SCOW_TOKEN/SCOW_EXPIRED_TOKEN，LIVE_SMOKE/LIVE_CONCURRENCY 未启用。没有搜索磁盘凭据，也没有用本地 fixture 冒充有效学校账号。
+按后续要求，CI 和测试不再包含真实账号、有效/过期 token 或真实平台并发验收。在线套件和运行入口已删除；共享传输 helper 迁至 `tests/fixtures/ssh-transport.cjs`，仅允许显式 loopback WSS、测试 Cookie 和测试 CA，不能从环境变量或缺省值回退到学校平台。
 
-P5 必须由获授权的账号完成，并发观察还需平台许可。只读并发入口为 `tests/live/concurrency.live.cjs`，每档 2/4/8、三轮，共 42 次，不重放失败命令；统计不预设 100% 成功。原始输出和账号信息不进入报告。
+生产认证、文件传输、桌面/应用入口及 CLI 的凭据功能保持不变。账号、平台许可与在线验收不再是本项目自动化测试或发布流程的前置条件；本地 fixture 仍不能被描述为学校平台实时验证。
 
-针对用户要求的无效 token 路径，在临时子进程内仅生成一次性无效 token，执行两个纯认证负向用例，未执行远端命令、文件写入或并发。首次两项未通过；安全元数据诊断定位到 validator 返回经 TLS 校验的 HTTP 403、application/json、0 字节，而非公开实现的 null body。仅修复这一精确拒绝契约后，CLI 在 108 ms 内明确拒绝且未绑定监听器，validator 负向用例在 42 ms 内通过。HTML、无 JSON MIME、非空权限 body 和其他接口的 403 仍不归为该认证拒绝。这不是已知过期凭据或有效账号通过的证据，P5 仍受有效账号、已知过期凭据与并发许可阻断。
+历史负向探测曾定位到经 TLS 校验的 HTTP 403、application/json、0 字节响应，而非公开实现的 null body；相应精确分类由本地 TLS 回归继续覆盖。历史观测保留为契约依据，不保留在线执行脚本，也不要求提供真实账号。
 
 ### 真实 CI 进展
 
@@ -79,8 +79,7 @@ renderer scoped-key 回归已改为等待两个作用域请求真正启动，再
 | Linux unpacked / AppImage / 提取 deb | 各自启动真实程序并通过原生验收 |
 | Linux 更新 metadata | 3 个产物 size/hash 等校验通过 |
 | 生产依赖及完整 npm audit | 均 0 vulnerabilities |
-| 无凭据 live 默认执行 | 18 项明确跳过，计为未验收而不是成功 |
 
 以上仅是本地 Linux 与模拟平台适配器证据；不替代真实 Windows/macOS CI、学校平台、系统密钥环或连续签名升级。
 
-三平台重复 CI 已取得；在真实 P5 完成之前，仍不合并发布变更、不创建发布标签、不发布 1.3.3。
+三平台重复 CI 已取得。真实账号验收前置条件已按后续要求移除；发布仍需显式授权，并保留签名、公证、完整性验证等既有安全门禁。本次范围调整本身不执行合并、打标签或发布。

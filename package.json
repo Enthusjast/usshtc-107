@@ -29,7 +29,6 @@
     "test:ui:coverage": "vitest run --coverage",
     "test:electron": "playwright test --project=source",
     "test:electron:packaged": "playwright test --project=packaged",
-    "test:live": "node --test --test-concurrency=1 tests/live/exec.live.cjs tests/live/interactive.live.cjs tests/live/auth.live.cjs tests/live/portal-api.live.cjs tests/live/concurrency.live.cjs",
     "test:coverage": "npm run test:node:coverage && npm run test:ui:coverage",
     "start": "electron .",
     "cli": "node cli/main.cjs",
