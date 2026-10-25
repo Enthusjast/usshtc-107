@@ -388,6 +388,7 @@ async function realFixture(t, { status = 101, closeCode, running = true, trust =
   const wss = new WebSocketServer({ noServer: true });
   const peers = new Set();
   const sockets = new Set();
+  const upgradeErrors = [];
   let upgradedSocket;
   let resolveUpgrade;
   const upgradeSeen = new Promise((resolve) => { resolveUpgrade = resolve; });
@@ -396,6 +397,7 @@ async function realFixture(t, { status = 101, closeCode, running = true, trust =
     upgrades += 1;
     assert.equal(request.headers.cookie, 'session=real-fixture');
     upgradedSocket = socket;
+    socket.on('error', error => upgradeErrors.push(error.code));
     resolveUpgrade();
     if (hangUpgrade) return;
     if (status !== 101) return socket.end(`HTTP/1.1 ${status} Rejected\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
@@ -475,7 +477,7 @@ async function realFixture(t, { status = 101, closeCode, running = true, trust =
     fs.rmSync(root, { recursive: true, force: true });
   });
   return { service, root, sshDirectory, client, originalPrivate, revoked, address, upgradeSeen, upgradeSocket: () => upgradedSocket,
-    counters: () => ({ messages, sshSessions, upgrades }) };
+    counters: () => ({ messages, sshSessions, upgrades }), upgradeErrors };
 }
 
 test('real SSH diagnostics authenticate existing PKCS8 identity, pin host, and prove a marker exec through TLS/WSS', { timeout: 15000 }, async (t) => {
@@ -531,11 +533,15 @@ test('real pending WSS cancellation closes the TLS socket and never sends a comm
   const abort = new AbortController();
   const promise = f.service.run({ ...scope, signal: abort.signal });
   await f.upgradeSeen;
-  const closed = once(f.upgradeSocket(), 'close');
+  // events.once(close) rejects on error even with an error listener. A reset is
+  // a valid TLS cancellation outcome; observe the actual close separately.
+  const closed = new Promise(resolve => f.upgradeSocket().once('close', resolve));
   abort.abort();
   const result = await promise;
   assert.equal(item(result, 'wss').code, 'CANCELLED');
   await closed;
+  assert.equal(f.upgradeSocket().destroyed, true);
+  assert.ok(f.upgradeErrors.every(code => code === 'ECONNRESET'), 'cancellation may reset the peer but cannot hide other transport failures');
   assert.equal(f.revoked.length, 0); assert.equal(f.counters().messages, 0);
 });
 

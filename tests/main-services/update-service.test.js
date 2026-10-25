@@ -39,7 +39,7 @@ function fakeClock() {
   };
 }
 function fixture(t, options = {}) {
-  const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'usshtc-update-')));
+  const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'usshtc-update-')));
   const platform = options.platform || 'win32';
   const mounted = path.join(directory, options.appImage ? 'mount' : 'installed');
   const resourcesPath = path.join(mounted, 'resources');
@@ -320,6 +320,22 @@ test('download checksum/signature rejection clears readiness; a genuine network 
   f.downloadHook = null; await f.service.download(request);
   assert.equal(f.service.getState().phase, 'downloaded');
   assert.equal(f.logs.some(args => /private|Authorization|home/.test(args.join(' '))), false);
+});
+
+test('failed installer verification retains its internal checkpoint through the service without exposing it in public state', async t => {
+  const f = fixture(t);
+  await f.service.check();
+  fs.writeFileSync(f.file, Buffer.alloc(f.bytes.length, 13));
+  await assert.rejects(f.service.download(request), error => {
+    assert.equal(error.code, 'UPDATE_CHECKSUM_MISMATCH');
+    assert.equal(error.cause.verificationStep, 'digest');
+    assert.equal(error.cause.cause.code, 'UPDATE_CHECKSUM_MISMATCH');
+    assert.deepEqual(JSON.parse(JSON.stringify(error)), { code: 'UPDATE_CHECKSUM_MISMATCH' });
+    return true;
+  });
+  assert.equal(f.service.getState().errorCode, 'UPDATE_CHECKSUM_MISMATCH');
+  assert.doesNotMatch(JSON.stringify(f.states), /verificationStep|cause|digest/);
+  assert.equal(f.installs.length, 0);
 });
 
 test('installation verifies cache again only after preparation; corrupted ready bytes are never installed', async t => {

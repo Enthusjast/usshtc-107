@@ -111,10 +111,17 @@ function sameFile(left, right) {
 async function verifyUpdateFile(filePath, candidate, { signal, fs: fileSystem = fs } = {}) {
   let handle;
   let stream;
+  let verificationStep = 'input';
   const assertActive = () => {
-    if (signal?.aborted) throw updateError('UPDATE_PREPARATION_FAILED');
+    if (signal?.aborted) {
+      verificationStep = 'abort';
+      throw updateError('UPDATE_PREPARATION_FAILED');
+    }
   };
-  const abort = () => stream?.destroy(updateError('UPDATE_PREPARATION_FAILED'));
+  const abort = () => {
+    verificationStep = 'abort';
+    stream?.destroy(updateError('UPDATE_PREPARATION_FAILED'));
+  };
   try {
     assertActive();
     if (typeof filePath !== 'string' || !path.isAbsolute(filePath) || path.normalize(filePath) !== filePath
@@ -122,36 +129,67 @@ async function verifyUpdateFile(filePath, candidate, { signal, fs: fileSystem = 
       throw updateError('UPDATE_CHECKSUM_MISMATCH');
     }
     const api = fileSystem.promises;
+    verificationStep = 'realpath';
     if (await api.realpath(filePath) !== filePath) throw updateError('UPDATE_CHECKSUM_MISMATCH');
+    verificationStep = 'lstat';
     const initial = await api.lstat(filePath, { bigint: true });
-    if (!initial.isFile() || initial.isSymbolicLink() || initial.size !== BigInt(candidate.size)) throw updateError('UPDATE_CHECKSUM_MISMATCH');
+    if (!initial.isFile() || initial.isSymbolicLink()) throw updateError('UPDATE_CHECKSUM_MISMATCH');
+    verificationStep = 'size';
+    if (initial.size !== BigInt(candidate.size)) throw updateError('UPDATE_CHECKSUM_MISMATCH');
+    verificationStep = 'open';
     handle = await api.open(filePath, fileSystem.constants.O_RDONLY | (fileSystem.constants.O_NOFOLLOW || 0));
+    verificationStep = 'stat';
     const opened = await handle.stat({ bigint: true });
-    if (!opened.isFile() || !sameFile(initial, opened)) throw updateError('UPDATE_CHECKSUM_MISMATCH');
+    if (!opened.isFile()) throw updateError('UPDATE_CHECKSUM_MISMATCH');
+    verificationStep = 'sameFile';
+    if (!sameFile(initial, opened)) throw updateError('UPDATE_CHECKSUM_MISMATCH');
     assertActive();
     const digest = createHash('sha512');
     let size = 0;
+    verificationStep = 'stream';
     stream = handle.createReadStream({ autoClose: false, highWaterMark: 64 * 1024 });
     signal?.addEventListener('abort', abort, { once: true });
     assertActive();
     for await (const chunk of stream) {
       assertActive();
       size += chunk.length;
-      if (size > candidate.size) throw updateError('UPDATE_CHECKSUM_MISMATCH');
+      if (size > candidate.size) {
+        verificationStep = 'size';
+        throw updateError('UPDATE_CHECKSUM_MISMATCH');
+      }
       digest.update(chunk);
     }
     assertActive();
+    verificationStep = 'statAfter';
     const after = await handle.stat({ bigint: true });
+    verificationStep = 'lstatAfter';
     const final = await api.lstat(filePath, { bigint: true });
-    if (size !== candidate.size || !sameFile(opened, after) || !sameFile(after, final)
-        || !final.isFile() || final.isSymbolicLink() || await api.realpath(filePath) !== filePath
-        || !timingSafeEqual(digest.digest(), Buffer.from(candidate.sha512, 'base64'))) {
+    if (!final.isFile() || final.isSymbolicLink()) throw updateError('UPDATE_CHECKSUM_MISMATCH');
+    verificationStep = 'size';
+    if (size !== candidate.size) throw updateError('UPDATE_CHECKSUM_MISMATCH');
+    verificationStep = 'sameFileAfter';
+    if (!sameFile(opened, after)) throw updateError('UPDATE_CHECKSUM_MISMATCH');
+    verificationStep = 'sameFileFinal';
+    if (!sameFile(after, final)) throw updateError('UPDATE_CHECKSUM_MISMATCH');
+    verificationStep = 'realpathAfter';
+    if (await api.realpath(filePath) !== filePath) throw updateError('UPDATE_CHECKSUM_MISMATCH');
+    verificationStep = 'digest';
+    if (!timingSafeEqual(digest.digest(), Buffer.from(candidate.sha512, 'base64'))) {
       throw updateError('UPDATE_CHECKSUM_MISMATCH');
     }
     assertActive();
   } catch (error) {
-    if (signal?.aborted || error?.code === 'UPDATE_PREPARATION_FAILED') throw updateError('UPDATE_PREPARATION_FAILED');
-    throw updateError(error?.code === 'EACCES' || error?.code === 'EPERM' ? 'UPDATE_PERMISSION_DENIED' : 'UPDATE_CHECKSUM_MISMATCH');
+    const code = signal?.aborted || error?.code === 'UPDATE_PREPARATION_FAILED'
+      ? 'UPDATE_PREPARATION_FAILED'
+      : error?.code === 'EACCES' || error?.code === 'EPERM' ? 'UPDATE_PERMISSION_DENIED' : 'UPDATE_CHECKSUM_MISMATCH';
+    const failure = updateError(code);
+    // Internal diagnostics retain the exact failure without changing the public
+    // code/message or serializing private filesystem details into IPC payloads.
+    Object.defineProperties(failure, {
+      cause: { value: error },
+      verificationStep: { value: signal?.aborted ? 'abort' : verificationStep },
+    });
+    throw failure;
   } finally {
     signal?.removeEventListener('abort', abort);
     stream?.destroy();

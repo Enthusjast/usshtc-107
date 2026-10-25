@@ -30,7 +30,8 @@ function hasCode(code) {
   return error => error.code === code && error.message === code;
 }
 function temporary(t) {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'usshtc-update-security-')));
+  // Match fs.promises.realpath in the verifier, including Windows 8.3 aliases.
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'usshtc-update-security-')));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   return root;
 }
@@ -58,8 +59,8 @@ function interceptStream(intercept) {
             return Readable.from((async function* () {
               let index = 0;
               for await (const chunk of source) {
-                await intercept({ chunk, index: index++, options });
-                yield chunk;
+                const intercepted = await intercept({ chunk, index: index++, options });
+                yield intercepted ?? chunk;
               }
             })());
           },
@@ -172,6 +173,7 @@ test('release notes are plain text with a 64KiB UTF8 boundary and no markup or a
 
 test('stream verification accepts exact files, rechecks the same cached file, and refuses tampering', async t => {
   const { location } = payload(t);
+  assert.equal(await fs.promises.realpath(location), location);
   await verifyUpdateFile(location, candidate());
   await verifyUpdateFile(location, candidate());
   fs.writeFileSync(location, Buffer.alloc(BODY.length, 65));
@@ -198,6 +200,30 @@ test('stream verification checks 64KiB boundaries without loading the whole payl
     await verifyUpdateFile(location, expected, { fs: adapter });
     assert.ok(chunks >= Math.ceil(size / 65536));
   }
+});
+
+test('native path aliases are rejected before opening, while canonical payload paths verify', async t => {
+  const { location, root } = payload(t);
+  // Model a legacy realpath result retaining an 8.3/case alias. The native
+  // promise API resolves it to the stored name; accepting the alias is unsafe.
+  const alias = path.join(root, 'PAYLOA~1');
+  let opened = 0;
+  const adapter = {
+    ...fs,
+    promises: {
+      ...fs.promises,
+      realpath: async value => value === alias ? location : fs.promises.realpath(value),
+      async open(...args) { opened += 1; return fs.promises.open(...args); },
+    },
+  };
+  await assert.rejects(verifyUpdateFile(alias, candidate(), { fs: adapter }), error => {
+    assert.equal(error.code, 'UPDATE_CHECKSUM_MISMATCH');
+    assert.equal(error.verificationStep, 'realpath');
+    return true;
+  });
+  assert.equal(opened, 0);
+  await verifyUpdateFile(location, candidate(), { fs: adapter });
+  assert.equal(opened, 1);
 });
 
 test('stream verification rejects noncanonical, relative, missing, directory, and symlink paths', async t => {
@@ -234,10 +260,29 @@ test('replacement of a path during hashing fails despite identical bytes', async
   const { location, root } = payload(t);
   const replacement = path.join(root, 'replacement');
   fs.writeFileSync(replacement, BODY);
+  let attempted = false;
+  let lockingFailure;
   const adapter = interceptStream(({ index }) => {
-    if (index === 0) fs.renameSync(replacement, location);
+    if (index !== 0) return;
+    attempted = true;
+    try { fs.renameSync(replacement, location); } catch (error) {
+      if (process.platform === 'win32' && ['EACCES', 'EPERM'].includes(error.code)) lockingFailure = error;
+      throw error;
+    }
   });
-  await assert.rejects(verifyUpdateFile(location, candidate(), { fs: adapter }), hasCode('UPDATE_CHECKSUM_MISMATCH'));
+  await assert.rejects(verifyUpdateFile(location, candidate(), { fs: adapter }), error => {
+    // Windows may deny replacing an open file. Only that observed rename
+    // failure permits a permission code; unrelated failures must not pass.
+    assert.equal(error.code, lockingFailure ? 'UPDATE_PERMISSION_DENIED' : 'UPDATE_CHECKSUM_MISMATCH');
+    if (lockingFailure) {
+      assert.equal(error.cause, lockingFailure);
+      assert.equal(error.verificationStep, 'stream');
+    } else {
+      assert.ok(['sameFileAfter', 'sameFileFinal'].includes(error.verificationStep));
+    }
+    return true;
+  });
+  assert.equal(attempted, true);
 });
 
 test('growing, truncating, and failing streams never verify and close their descriptors', async t => {
@@ -261,6 +306,57 @@ test('growing, truncating, and failing streams never verify and close their desc
   }
 });
 
+test('intercepted stream bytes independently enforce size and digest without filesystem mutation', async t => {
+  const { location } = payload(t);
+  for (const [transform, step] of [
+    [chunk => Buffer.alloc(chunk.length, 65), 'digest'],
+    [chunk => Buffer.concat([chunk, Buffer.from('extra')]), 'size'],
+    [chunk => chunk.subarray(0, -1), 'size'],
+  ]) {
+    let intercepted = false;
+    const adapter = interceptStream(({ chunk }) => { intercepted = true; return transform(chunk); });
+    await assert.rejects(verifyUpdateFile(location, candidate(), { fs: adapter }), error => {
+      assert.equal(error.code, 'UPDATE_CHECKSUM_MISMATCH');
+      assert.equal(error.verificationStep, step);
+      assert.equal(error.cause.code, 'UPDATE_CHECKSUM_MISMATCH');
+      return true;
+    });
+    assert.equal(intercepted, true);
+    assert.deepEqual(fs.readFileSync(location), BODY);
+  }
+});
+
+test('stream-boundary metadata changes reject every identity field without real replacement or locks', async t => {
+  const { location } = payload(t);
+  for (const target of ['descriptor', 'path']) {
+    for (const key of ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs']) {
+      let intercepted = false;
+      const adapter = interceptStream(() => { intercepted = true; });
+      const changed = stat => {
+        if (intercepted) stat[key] += 1n;
+        return stat;
+      };
+      if (target === 'descriptor') {
+        const open = adapter.promises.open;
+        adapter.promises.open = async (...args) => {
+          const handle = await open(...args);
+          const stat = handle.stat;
+          handle.stat = async (...options) => changed(await stat(...options));
+          return handle;
+        };
+      } else {
+        adapter.promises.lstat = async (...args) => changed(await fs.promises.lstat(...args));
+      }
+      await assert.rejects(verifyUpdateFile(location, candidate(), { fs: adapter }), error => {
+        assert.equal(error.code, 'UPDATE_CHECKSUM_MISMATCH');
+        assert.equal(error.verificationStep, target === 'descriptor' ? 'sameFileAfter' : 'sameFileFinal');
+        return true;
+      });
+      assert.equal(intercepted, true);
+    }
+  }
+});
+
 test('a replacement between lstat and open is rejected before accepting its stream', async t => {
   const { location, root } = payload(t);
   const replacement = path.join(root, 'replacement');
@@ -275,7 +371,11 @@ test('a replacement between lstat and open is rejected before accepting its stre
       },
     },
   };
-  await assert.rejects(verifyUpdateFile(location, candidate(), { fs: adapter }), hasCode('UPDATE_CHECKSUM_MISMATCH'));
+  await assert.rejects(verifyUpdateFile(location, candidate(), { fs: adapter }), error => {
+    assert.equal(error.code, 'UPDATE_CHECKSUM_MISMATCH');
+    assert.equal(error.verificationStep, 'sameFile');
+    return true;
+  });
 });
 
 test('abort before or during hashing is fixed-code, closes the descriptor, and never returns success', async t => {
@@ -297,11 +397,123 @@ test('abort before or during hashing is fixed-code, closes the descriptor, and n
   assert.equal(closed, 1);
 });
 
-test('filesystem errors expose only fixed codes, not private paths or original errors', async t => {
+test('filesystem failures preserve exact internal causes while public errors remain fixed and serializable', async t => {
   const { location } = payload(t);
   for (const [code, expected] of [['EACCES', 'UPDATE_PERMISSION_DENIED'], ['EPERM', 'UPDATE_PERMISSION_DENIED'], ['EIO', 'UPDATE_CHECKSUM_MISMATCH']]) {
-    const adapter = { ...fs, promises: { ...fs.promises, realpath: async () => { throw Object.assign(new Error('secret path certificate raw JSON'), { code }); } } };
-    await assert.rejects(verifyUpdateFile(location, candidate(), { fs: adapter }), hasCode(expected));
+    const original = Object.assign(new Error('private filesystem detail'), { code });
+    const adapter = { ...fs, promises: { ...fs.promises, realpath: async () => { throw original; } } };
+    await assert.rejects(verifyUpdateFile(location, candidate(), { fs: adapter }), error => {
+      assert.equal(error.code, expected);
+      assert.equal(error.message, expected);
+      assert.equal(error.cause, original);
+      assert.equal(error.verificationStep, 'realpath');
+      assert.deepEqual(JSON.parse(JSON.stringify(error)), { code: expected });
+      return true;
+    });
+  }
+});
+
+test('every filesystem and stream checkpoint retains the exact unmapped error and closes opened descriptors', async t => {
+  const { location } = payload(t);
+  for (const step of ['realpath', 'lstat', 'open', 'stat', 'stream', 'statAfter', 'lstatAfter', 'realpathAfter']) {
+    const original = Object.assign(new Error('internal I/O failure'), { code: 'EIO' });
+    const adapter = interceptStream(() => { if (step === 'stream') throw original; });
+    let closed = 0;
+    for (const operation of ['realpath', 'lstat']) {
+      let calls = 0;
+      adapter.promises[operation] = async (...args) => {
+        calls += 1;
+        if (step === operation && calls === 1 || step === `${operation}After` && calls === 2) throw original;
+        return fs.promises[operation](...args);
+      };
+    }
+    const open = adapter.promises.open;
+    adapter.promises.open = async (...args) => {
+      assert.equal(args[1], fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      if (step === 'open') throw original;
+      const handle = await open(...args);
+      const stat = handle.stat;
+      const close = handle.close;
+      let calls = 0;
+      handle.stat = async (...options) => {
+        calls += 1;
+        if (step === 'stat' && calls === 1 || step === 'statAfter' && calls === 2) throw original;
+        return stat(...options);
+      };
+      handle.close = async () => { closed += 1; await close(); };
+      return handle;
+    };
+    await assert.rejects(verifyUpdateFile(location, candidate(), { fs: adapter }), error => {
+      assert.equal(error.code, 'UPDATE_CHECKSUM_MISMATCH');
+      assert.equal(error.message, 'UPDATE_CHECKSUM_MISMATCH');
+      assert.equal(error.cause, original);
+      assert.equal(error.verificationStep, step);
+      return true;
+    });
+    assert.equal(closed, ['realpath', 'lstat', 'open'].includes(step) ? 0 : 1);
+  }
+});
+
+test('initial descriptor metadata cannot differ from any lstat identity field', async t => {
+  const { location } = payload(t);
+  for (const key of ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs']) {
+    let streamed = false;
+    const adapter = interceptStream(() => { streamed = true; });
+    const open = adapter.promises.open;
+    adapter.promises.open = async (...args) => {
+      const handle = await open(...args);
+      const stat = handle.stat;
+      handle.stat = async (...options) => {
+        const value = await stat(...options);
+        value[key] += 1n;
+        return value;
+      };
+      return handle;
+    };
+    await assert.rejects(verifyUpdateFile(location, candidate(), { fs: adapter }), error => {
+      assert.equal(error.code, 'UPDATE_CHECKSUM_MISMATCH');
+      assert.equal(error.verificationStep, 'sameFile');
+      return true;
+    });
+    assert.equal(streamed, false);
+  }
+});
+
+test('file-type and canonical-path checks reject independently at each filesystem boundary', async t => {
+  const { location } = payload(t);
+  for (const [step, kind] of [
+    ['lstat', 'directory'], ['lstat', 'symlink'], ['stat', 'directory'],
+    ['lstatAfter', 'directory'], ['lstatAfter', 'symlink'], ['realpathAfter', 'alias'],
+  ]) {
+    let streamed = false;
+    const adapter = interceptStream(() => { streamed = true; });
+    const changeType = stat => {
+      if (kind === 'directory') stat.isFile = () => false;
+      if (kind === 'symlink') stat.isSymbolicLink = () => true;
+      return stat;
+    };
+    adapter.promises.lstat = async (...args) => {
+      const stat = await fs.promises.lstat(...args);
+      return step === (streamed ? 'lstatAfter' : 'lstat') ? changeType(stat) : stat;
+    };
+    if (step === 'stat') {
+      const open = adapter.promises.open;
+      adapter.promises.open = async (...args) => {
+        const handle = await open(...args);
+        const stat = handle.stat;
+        handle.stat = async (...options) => changeType(await stat(...options));
+        return handle;
+      };
+    }
+    if (step === 'realpathAfter') {
+      adapter.promises.realpath = async value => streamed ? path.join(path.dirname(value), 'alias') : fs.promises.realpath(value);
+    }
+    await assert.rejects(verifyUpdateFile(location, candidate(), { fs: adapter }), error => {
+      assert.equal(error.code, 'UPDATE_CHECKSUM_MISMATCH');
+      assert.equal(error.verificationStep, step);
+      return true;
+    });
+    assert.equal(streamed, step.endsWith('After'));
   }
 });
 

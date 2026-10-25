@@ -60,8 +60,17 @@ jobs:
           echo "PSCP_BINARY=/usr/bin/pscp" >> "$GITHUB_ENV"
           echo "PUTTYGEN_BINARY=/usr/bin/puttygen" >> "$GITHUB_ENV"
 
-      - name: Run Node, renderer, and real SSH transport tests
-        run: npm test
+      - name: Run Node and real transport tests three consecutive times
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            echo "Node regression pass ${attempt}/3 on ${RUNNER_OS}"
+            npm run test:node
+          done
+
+      - name: Run renderer interaction tests
+        run: npm run test:ui
 
       - name: Enforce Node and renderer coverage thresholds
         if: runner.os == 'Linux'

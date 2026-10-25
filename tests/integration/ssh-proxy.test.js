@@ -27,6 +27,14 @@ async function until(predicate) {
 
 async function fixture(t, { mode = 'echo', status = 101, acceptingConnections = true, startupCommand = '' } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'usshtc107-transport-'));
+  const paneReady = `PANE_READY_${crypto.randomBytes(6).toString('hex')}`;
+  const shellEnv = path.join(root, 'shell-env');
+  const peerEnv = { ...process.env, TERM: 'xterm-256color', TMUX_TMPDIR: root,
+    HOME: root, XDG_CONFIG_HOME: root, SHELL: '/bin/sh', ENV: shellEnv };
+  delete peerEnv.TMUX;
+  delete peerEnv.TMUX_PANE;
+  // Only the attached tmux pane emits this prompt, not its outer PTY shell.
+  fs.writeFileSync(shellEnv, `if [ -n "$TMUX" ]; then PS1='${paneReady}> '; fi\n`);
   const sshDirectory = path.join(root, '.ssh');
   const diskIdentity = ensureClientKeyPair({ sshDirectory });
   assert.match(fs.readFileSync(diskIdentity.privateKeyPath, 'utf8'), /BEGIN PRIVATE KEY/);
@@ -46,7 +54,7 @@ async function fixture(t, { mode = 'echo', status = 101, acceptingConnections = 
     await proxy?.stop();
     for (const peer of peers) peer.ws.terminate();
     for (const child of children) child.kill();
-    if (startupCommand) spawnSync('tmux', ['kill-server'], { env: { ...process.env, TMUX_TMPDIR: root }, timeout: 5000 });
+    if (startupCommand) spawnSync('tmux', ['kill-server'], { env: peerEnv, timeout: 5000 });
     await new Promise((resolve) => wss.close(resolve));
     await new Promise((resolve) => server.close(resolve));
     fs.rmSync(root, { recursive: true, force: true });
@@ -68,7 +76,7 @@ async function fixture(t, { mode = 'echo', status = 101, acceptingConnections = 
     let child;
     if (mode === 'pty') {
       child = spawn('python3', [path.join(__dirname, '../fixtures/pty-peer.py')], {
-        stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, TERM: 'xterm-256color', TMUX_TMPDIR: root },
+        stdio: ['pipe', 'pipe', 'pipe'], env: peerEnv,
       });
       children.add(child);
       child.on('error', () => ws.terminate());
@@ -122,7 +130,7 @@ async function fixture(t, { mode = 'echo', status = 101, acceptingConnections = 
     await once(client, 'ready');
     return client;
   }
-  return { proxy, peers, connect, identity, root, address };
+  return { proxy, peers, connect, identity, root, address, paneReady };
 }
 
 function shell(client, pty = { term: 'xterm', cols: 120, rows: 40 }) {
@@ -265,7 +273,33 @@ test('real handshake 401/403 alone revoke auth, WSS close 1008/1011 do not', { t
 
 test('candidate gate rejects TCP until activated; concurrent start/stop leaves no listener', { timeout: 15000 }, async (t) => {
   const f = await fixture(t, { acceptingConnections: false });
-  await assert.rejects(f.connect(), /connection|handshake|socket/i);
+  const accepted = [];
+  const sessions = [];
+  f.proxy.on('connection', count => accepted.push(count));
+  f.proxy.on('session-open', session => sessions.push(session));
+  const candidate = new Client();
+  t.after(() => candidate.destroy());
+  let ready = false;
+  const errors = [];
+  candidate.on('ready', () => { ready = true; });
+  candidate.on('error', error => errors.push(error));
+  const closed = new Promise(resolve => candidate.once('close', resolve));
+  candidate.connect({
+    host: f.address.host, port: f.address.port, username: 'fixture',
+    privateKey: f.identity.privateKey, readyTimeout: 2000,
+  });
+  await closed;
+  for (const error of errors) {
+    assert.notEqual(error.level, 'client-timeout');
+    assert.notEqual(error.code, 'ETIMEDOUT');
+  }
+  assert.equal(ready, false);
+  assert.deepEqual(accepted, []);
+  assert.deepEqual(sessions, []);
+  assert.equal(f.proxy._clients.size, 0);
+  assert.equal(f.proxy._sockets.size, 0);
+  assert.deepEqual(f.proxy.getSessions(), []);
+  assert.equal(f.peers.length, 0);
   f.proxy.setAcceptingConnections(true);
   const client = await f.connect();
   client.end();
@@ -294,6 +328,7 @@ test('opted-in tmux preserves shell state across real SSH/WSS disconnect and rea
   const marker = crypto.randomBytes(12).toString('hex');
   let firstText = '';
   first.on('data', chunk => { firstText += chunk.toString(); });
+  await until(() => firstText.includes(f.paneReady));
   first.write(`USSHTC_PROOF=$(printf '%s%s' '${marker.slice(0, 12)}' '${marker.slice(12)}'); printf '\\n%s\\n' "$USSHTC_PROOF"\r`);
   await until(() => firstText.includes(marker));
   const closed = once(first, 'close'); first.close(); await closed;
@@ -301,6 +336,7 @@ test('opted-in tmux preserves shell state across real SSH/WSS disconnect and rea
   const next = crypto.randomBytes(12).toString('hex');
   let secondText = '';
   second.on('data', chunk => { secondText += chunk.toString(); });
+  await until(() => secondText.includes(f.paneReady));
   second.write(`printf '\\n%s%s:%s\\n' '${next.slice(0, 12)}' '${next.slice(12)}' "$USSHTC_PROOF"\r`);
   await until(() => secondText.includes(`${next}:${marker}`));
   second.close();

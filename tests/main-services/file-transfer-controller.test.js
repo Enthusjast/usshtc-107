@@ -2,8 +2,13 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const os = require('node:os');
+const path = require('node:path');
 const { createFileTransferController, MAX_QUEUED, MAX_HISTORY } = require('../../electron/file-transfer/controller');
 const flush = () => new Promise(resolve => setImmediate(resolve));
+const localDirectory = path.join(os.tmpdir(), 'usshtc107-native', 'private');
+const uploadPath = path.join(localDirectory, 'upload.bin');
+const downloadPath = path.join(localDirectory, 'download.bin');
 function harness(t, overrides = {}) {
   const state = { scope: { profileId: 'primary', epoch: 1 }, authGeneration: 1,
     cookie: 'SCOW_USER=private-test-token', cluster: 'cluster' };
@@ -12,8 +17,8 @@ function harness(t, overrides = {}) {
   const clients = [];
   const native = [];
   const dialog = {
-    async showOpenDialog(window, options) { native.push({ kind: 'open', options }); return { canceled: false, filePaths: ['/native/private/upload.bin'] }; },
-    async showSaveDialog(window, options) { native.push({ kind: 'save', options }); return { canceled: false, filePath: '/native/private/download.bin' }; },
+    async showOpenDialog(window, options) { native.push({ kind: 'open', options }); return { canceled: false, filePaths: [uploadPath] }; },
+    async showSaveDialog(window, options) { native.push({ kind: 'save', options }); return { canceled: false, filePath: downloadPath }; },
     async showMessageBox(window, options) { native.push({ kind: 'confirm', options }); return { response: 1 }; },
     ...overrides.dialog,
   };
@@ -41,7 +46,7 @@ test('native-only selection keeps cookie, local and remote paths outside safe tr
   const result = await h.controller.start(h.request());
   assert.equal(result.items[0].filename, 'upload.bin');
   assert.equal(result.transferId, result.items[0].id);
-  assert.equal(h.calls[0].options.localPath, '/native/private/upload.bin');
+  assert.equal(h.calls[0].options.localPath, uploadPath);
   assert.equal(h.calls[0].options.remotePath, '/remote/file.bin');
   assert.equal(h.native[0].kind, 'open');
   h.calls[0].options.onProgress({ bytes: 2, total: 3, phase: 'uploading', mode: 'single' });
@@ -54,13 +59,16 @@ test('native-only selection keeps cookie, local and remote paths outside safe tr
   assert.equal(item.bytes, 3);
   assert.equal(h.clients[0].disposed, true);
   const safe = JSON.stringify(h.snapshots);
-  assert.doesNotMatch(safe, /private-test-token|SCOW_USER|\/native\/|\/remote\//);
+  assert.doesNotMatch(safe, /private-test-token|SCOW_USER|usshtc107-native|\/remote\//);
+  for (const privatePath of [localDirectory, uploadPath, downloadPath]) {
+    assert.equal(safe.includes(JSON.stringify(privatePath).slice(1, -1)), false);
+  }
   assert.deepEqual(Object.keys(item).sort(), ['bytes', 'direction', 'filename', 'id', 'mode', 'phase', 'remoteTempsRetained', 'status', 'total']);
 });
 
 test('controller rejects arbitrary renderer local paths, cookies and unsafe remote paths', async t => {
   const h = harness(t);
-  for (const extra of [{ localPath: '/etc/passwd' }, { cookie: 'bad' }, { filePaths: ['/tmp/file'] }]) {
+  for (const extra of [{ localPath: uploadPath }, { cookie: 'bad' }, { filePaths: [uploadPath] }]) {
     await assert.rejects(h.controller.start(h.request('upload', extra)), { code: 'INVALID_ARGUMENT' });
   }
   for (const remotePath of ['relative', '/root/../target', '/root/..\\target', '/root/']) {
@@ -148,7 +156,7 @@ test('native dialog cancellation and stale native results do not enqueue work', 
   const pending = h.controller.start(h.request());
   h.state.authGeneration++;
   h.controller.update();
-  finish({ canceled: false, filePaths: ['/native/private/upload.bin'] });
+  finish({ canceled: false, filePaths: [uploadPath] });
   await assert.rejects(pending, { code: 'PROFILE_CHANGED' });
   assert.equal(h.calls.length, 0);
 });

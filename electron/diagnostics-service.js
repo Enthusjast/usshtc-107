@@ -47,6 +47,8 @@ function probe(signal, start) {
     const abort = () => finish(failure(signal.reason || 'CANCELLED'));
     const own = (resource, close) => {
       const disposeResource = () => {
+        // Install before terminate/destroy: pending TLS Upgrade cancellation can
+        // asynchronously report ECONNRESET after the probe handlers are removed.
         resource?.on?.('error', () => {});
         close();
       };

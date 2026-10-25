@@ -30,7 +30,7 @@ function nativeFixture(platform, initial = {}) {
   return { app, service, queries, changes, setCurrent(value) { current = value; } };
 }
 function linuxFixture(t, options = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'usshtc107-autostart-'));
+  const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'usshtc107-autostart-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const executable = path.join(root, options.filename || 'usshtc107');
   fs.writeFileSync(executable, 'test-only executable fixture', { mode: 0o700 });

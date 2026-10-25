@@ -36,7 +36,11 @@ function errorCode(error, fallback) {
   if (error?.code === 'ERR_CHECKSUM_MISMATCH') return 'UPDATE_CHECKSUM_MISMATCH';
   return fallback;
 }
-function failure(code) { return new ServiceError(code); }
+function failure(code, cause) {
+  const error = new ServiceError(code);
+  if (cause !== undefined) Object.defineProperty(error, 'cause', { value: cause });
+  return error;
+}
 function abortable(promise, signal) {
   return new Promise((resolve, reject) => {
     const abort = () => reject(failure('OPERATION_CANCELLED'));
@@ -219,7 +223,7 @@ function createUpdateService(deps = {}) {
       const stat = io.lstatSync(file);
       if (resolved !== file || !stat.isFile() || stat.isSymbolicLink()) throw failure('UPDATE_CHECKSUM_MISMATCH');
       return resolved;
-    } catch (error) { throw failure(errorCode(error, 'UPDATE_CHECKSUM_MISMATCH')); }
+    } catch (error) { throw failure(errorCode(error, 'UPDATE_CHECKSUM_MISMATCH'), error); }
   }
   function publisherNames() {
     return verifier.readPublisherNames(path.join(resourcesPath, 'app-update.yml'), { fs: io });
@@ -276,7 +280,7 @@ function createUpdateService(deps = {}) {
         const downloaded = validateInfo(event).candidate;
         if (!sameCandidate(candidate, downloaded)) throw failure('UPDATE_INVALID_METADATA');
         op.event = { file: canonicalFile(event.downloadedFile, candidate) };
-      } catch (error) { op.eventError = failure(errorCode(error, 'UPDATE_INVALID_METADATA')); }
+      } catch (error) { op.eventError = failure(errorCode(error, 'UPDATE_INVALID_METADATA'), error); }
     });
     listen(updater, 'appimage-filename-updated', newPath => {
       const active = intent;
@@ -400,7 +404,7 @@ function createUpdateService(deps = {}) {
         const code = errorCode(error, 'UPDATE_NETWORK');
         publish({ phase: 'error', progress: null, errorCode: code });
         log('warn', code);
-        throw failure(code);
+        throw failure(code, error);
       }
     });
   }
@@ -516,7 +520,7 @@ function createUpdateService(deps = {}) {
         const code = errorCode(error, fallback);
         publish({ phase: 'error', progress: null, errorCode: restartRequired ? 'UPDATE_RESTART_REQUIRED' : code });
         log('error', code);
-        throw failure(code);
+        throw failure(code, error);
       } finally { removeAbort(); }
     });
   }
