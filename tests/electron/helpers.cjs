@@ -5,6 +5,8 @@ const os = require('node:os');
 const path = require('node:path');
 const net = require('node:net');
 const { once } = require('node:events');
+const { randomBytes } = require('node:crypto');
+const { execFileSync } = require('node:child_process');
 const { _electron: electron, expect } = require('@playwright/test');
 const { createDefaultRoot } = require('../../electron/settings-store');
 
@@ -95,15 +97,38 @@ async function waitState(page, expected) {
   await expect.poll(async () => { state = await rpc(page, 'getStatus'); return state; }).toMatchObject(expected);
   return state;
 }
+function keychainCommand(env, args) {
+  try {
+    execFileSync('/usr/bin/security', args, { env, stdio: 'pipe', timeout: 10_000 });
+  } catch (error) {
+    // Do not include command arguments: create/unlock carry the temporary password.
+    throw new Error(`Native acceptance keychain ${args[0]} failed (${error.status ?? error.code})`);
+  }
+}
+function prepareKeychain(keychain, env) {
+  fs.mkdirSync(path.dirname(keychain), { recursive: true, mode: 0o700 });
+  const password = randomBytes(32).toString('hex');
+  for (const args of [
+    ['create-keychain', '-p', password, keychain],
+    ['set-keychain-settings', '-lut', '21600', keychain],
+    ['unlock-keychain', '-p', password, keychain],
+    ['default-keychain', '-d', 'user', '-s', keychain],
+    ['list-keychains', '-d', 'user', '-s', keychain],
+  ]) keychainCommand(env, args);
+}
 async function launch(testInfo, { packaged = false } = {}) {
   const executable = packaged ? packagedExecutable() : require('electron');
   const port = await unusedPort();
   const root = isolatedRoot(port);
+  const env = privateEnvironment(root, packaged, executable);
+  const keychain = packaged && process.platform === 'darwin'
+    ? path.join(root, 'home/Library/Keychains/login.keychain-db') : null;
   let application, child;
   try {
+    if (keychain) prepareKeychain(keychain, env);
     application = await electron.launch({ executablePath: executable, chromiumSandbox: true, timeout: 30_000,
       args: [...(packaged ? [] : [path.join(project, 'tests/fixtures/electron-entry.cjs')]), `--user-data-dir=${path.join(root, 'userData')}`],
-      env: privateEnvironment(root, packaged, executable), cwd: project,
+      env, cwd: project,
     });
     child = application.process();
     if (typeof testInfo.outputPath === 'function') await application.context().tracing.start({ screenshots: true, snapshots: true, sources: true });
@@ -117,7 +142,7 @@ async function launch(testInfo, { packaged = false } = {}) {
     await page.waitForFunction(() => window.electronAPI?.isElectron === true);
     if (!packaged) await application.evaluate(async ({ app }) => { await app.__acceptance.ready; });
     await waitState(page, { operation: null, proxyStatus: 'stopped' });
-    const context = { application, child, page, root, port, executable, packaged, testInfo, tracing: typeof testInfo.outputPath === 'function' };
+    const context = { application, child, page, root, port, executable, packaged, testInfo, env, keychain, tracing: typeof testInfo.outputPath === 'function' };
     await assertIsolation(context);
     return context;
   } catch (error) {
@@ -126,6 +151,7 @@ async function launch(testInfo, { packaged = false } = {}) {
       child.kill();
       await exited;
     }
+    if (keychain && fs.existsSync(keychain)) keychainCommand(env, ['delete-keychain', keychain]);
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     throw error;
   }
@@ -251,6 +277,7 @@ async function cleanup(context) {
       child.kill();
       await exited;
     }
+    if (context.keychain) keychainCommand(context.env, ['delete-keychain', context.keychain]);
     fs.rmSync(context.root, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 });
   }
 }

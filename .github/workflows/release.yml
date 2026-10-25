@@ -266,17 +266,6 @@ jobs:
         if: steps.select.outputs.enabled == 'true' && matrix.target == 'mac'
         shell: bash
         run: |
-          read -r default_keychain < <(security default-keychain -d user)
-          default_keychain=${default_keychain#\"}
-          default_keychain=${default_keychain%\"}
-          keychain="$RUNNER_TEMP/usshtc107-acceptance.keychain-db"
-          keychain_password=$(openssl rand -hex 32)
-          printf '::add-mask::%s\n' "$keychain_password"
-          security create-keychain -p "$keychain_password" "$keychain"
-          trap 'security default-keychain -d user -s "$default_keychain"; security delete-keychain "$keychain"' EXIT
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$keychain_password" "$keychain"
-          security default-keychain -d user -s "$keychain"
           case "$(node -p process.arch)" in
             arm64) app_directory=release/mac-arm64 ;;
             x64) app_directory=release/mac ;;
