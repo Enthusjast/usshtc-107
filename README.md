@@ -204,6 +204,8 @@ npm run cli -- get -- /remote/new-file.bin ./downloaded.bin
 
 GUI 只接受远程路径，本地文件/保存位置由带父窗口的原生对话框选择；最多 2 个活动传输、20 个排队项、50 条完成历史。列表只发布文件名、状态和确认字节，不把 Cookie、本地绝对路径或 VNC 链接传给 renderer。切档案、认证/连接上下文变化及退出会取消旧操作。
 
+文件传输按列表中的 POSIX mode 明确区分 `file/dir/link/other`，检查选中条目及祖先；符号链接、特殊文件和无法确认类型的元数据默认拒绝，不提供隐式跟随。检查与 HTTP 读写之间仍有竞态，不是服务端原子 no-follow 保证。门户 API 客户端默认只接受精确的官方 host；内网/测试替代 host 与端口必须由受信任 Node 调用方显式列入 `allowedHosts`，renderer 和 CLI 无此配置入口，TLS 校验不可关闭。
+
 ## 传统 SCP 兼容层
 
 本地代理处理 SCP exec 协议，文件与元数据仍走官方 HTTPS file API，不启动远端 scp，也不改变普通 exec。**OpenSSH 9 起 `scp` 默认使用 SFTP，本功能必须加 `-O`**；PuTTY 使用 `pscp -scp`。不提供 SFTP；WinSCP 强制 SCP 仅作观察项，不保证其额外 shell 命令格式兼容。
@@ -256,7 +258,7 @@ GitHub Actions 发布需要以下仓库 Secrets：
 | macOS | `MAC_CSC_LINK`, `MAC_CSC_KEY_PASSWORD`, `APPLE_API_KEY_BASE64`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER` |
 | Windows | `WIN_CSC_LINK`, `WIN_CSC_KEY_PASSWORD` |
 
-`MAC_CSC_LINK` 和 `WIN_CSC_LINK` 可使用 electron-builder 支持的 base64 证书值。`APPLE_API_KEY_BASE64` 是 App Store Connect `.p8` 私钥的 base64 内容。用于签名或发布的标签必须严格等于 `v<package.json version>`，例如当前版本使用 `v1.3.2`，且标签提交必须属于默认分支历史。应在仓库设置中保护 `v*` 标签。
+`MAC_CSC_LINK` 和 `WIN_CSC_LINK` 可使用 electron-builder 支持的 base64 证书值。`APPLE_API_KEY_BASE64` 是 App Store Connect `.p8` 私钥的 base64 内容。用于签名或发布的标签必须严格等于 `v<package.json version>`，例如修复版本使用 `v1.3.3`，且标签提交必须属于默认分支历史。应在仓库设置中保护 `v*` 标签；真实门户验收未完成前不创建本版本发布标签。
 
 发布流水线会验证签名和 macOS 公证，生成产物 SHA-256 校验文件和 GitHub 构建来源证明，并为实际生产依赖生成 CycloneDX SBOM。普通手动构建可以选择单个平台；Linux 可从功能分支构建，使用证书的 macOS/Windows 构建只能从默认分支或匹配版本的标签发起。创建 GitHub Release 时必须构建全部平台。
 
@@ -325,7 +327,7 @@ tests/                    核心代理、安全服务和前端交互测试
 
 `tests/live/` 只有同时设置 `LIVE_SMOKE=1` 和短期 `SCOW_TOKEN` 才联系真实门户；`portal-api.live.cjs` 校验 token、setup 并只读列出桌面/应用，不自动启动会话或上传文件。`LIVE_CONCURRENCY=1` 另启用 2/4/8 并发只读观察。没有凭据的跳过不算成功；真实 token/文件/桌面验收本轮未取得，local fixture 不能替代。运行与秘密处理见 [live 验收说明](tests/live/README.md)。
 
-未提供凭据时 live 用例明确跳过，不算真实门户通过。本轮由用户明确选择暂缓真实门户验收；本地 TLS/WSS、SSH、PTY 和 Electron fixture 只能证明本地路径，不能替代学校平台、真实密钥环或 Windows/macOS 签名升级证据。未执行发布。
+未提供凭据时 live 用例明确跳过，不算真实门户通过。当前修复计划要求真实门户验收，但本轮未提供有效/失效 token 与并发许可，因此 P5 仍受阻。本地 TLS/WSS、SSH、PTY 和 Electron fixture 不能替代学校平台、真实密钥环或 Windows/macOS 签名升级证据。失败归因、CI 诊断规则和发布门槛见 [1.3.3 修复记录](docs/ci-stability-1.3.3.md)；P5 未通过不发布。
 
 ## License
 

@@ -421,6 +421,7 @@ test('real source official APIs: explicit credential-safe desktop/app actions an
     expect(fs.existsSync(path.join(root, 'exports', 'must-not-be-downloaded.bin'))).toBe(false);
     expect(await application.evaluate(({ app }) => app.__acceptance.portal.requests.some(request =>
       request.pathname === '/api/file/download' && ['/outside/private.bin', '/remote/outside-link'].includes(request.query.path)))).toBe(false);
+    await unsafeRow.scrollIntoViewIfNeeded();
     await screenshot(context, 'source-refused-remote-symlink');
     const safeItems = await rpc(page, 'listTransfers', { scope: await scope(page) });
     expect(JSON.stringify(safeItems)).not.toMatch(/SCOW_USER|fixture-token|\/exports\/|fixture-vnc-private|fixture-app-private/);
