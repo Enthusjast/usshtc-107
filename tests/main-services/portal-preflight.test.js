@@ -29,7 +29,8 @@ async function fixture(t) {
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
-  const portal = createPortalPreflight({ baseUrl: `https://127.0.0.1:${server.address().port}/`, tlsCa: certificate });
+  const host = `127.0.0.1:${server.address().port}`;
+  const portal = createPortalPreflight({ baseUrl: `https://${host}/`, allowedHosts: [host], tlsCa: certificate });
   return { portal, requests, setMode: value => { mode = value; } };
 }
 const context = () => ({ cookie: 'other=not-forwarded; SCOW_USER=local-fixture-token',
@@ -54,6 +55,15 @@ test('API rejection gates setup, while network and setup HTTP failures remain op
   await assert.rejects(f.portal.run(context()), { code: 'PORTAL_NETWORK', message: 'PORTAL_NETWORK' });
   f.setMode('setup-failure');
   await assert.rejects(f.portal.run(context()), { code: 'PORTAL_NETWORK', message: 'PORTAL_NETWORK' });
+});
+
+test('preflight never derives host permission from an injected base URL', async () => {
+  let outgoing = 0;
+  for (const baseUrl of ['https://evil.example', 'https://107.ustc.edu.cn.evil.example', 'https://127.0.0.1:444']) {
+    const portal = createPortalPreflight({ baseUrl, request() { outgoing += 1; } });
+    await assert.rejects(portal.run(context()), { code: 'PORTAL_UNKNOWN' });
+  }
+  assert.equal(outgoing, 0);
 });
 
 test('setup uses a four-second bound and disposes every client even on timeout', async () => {

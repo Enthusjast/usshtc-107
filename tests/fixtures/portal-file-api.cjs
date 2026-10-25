@@ -243,10 +243,12 @@ async function portalFixture(t, options = {}) {
   });
   server.on('connection', socket => { sockets.add(socket); socket.once('close', () => sockets.delete(socket)); });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
-  const baseUrl = `https://127.0.0.1:${server.address().port}`;
-  const client = createPortalApiClient({ baseUrl, tlsCa, cookie: `SCOW_USER=${options.token || 'fixture-token'}` });
+  const host = `127.0.0.1:${server.address().port}`;
+  const baseUrl = `https://${host}`;
+  const allowedHosts = [host];
+  const client = createPortalApiClient({ baseUrl, allowedHosts, tlsCa, cookie: `SCOW_USER=${options.token || 'fixture-token'}` });
   const api = createFileApi({ client });
-  fixture = { root, local, remote, baseUrl, tlsCa, client, api, files, dirs, symlinks, metadata, home,
+  fixture = { root, local, remote, baseUrl, allowedHosts, tlsCa, client, api, files, dirs, symlinks, metadata, home,
     requests, errors, initializations, downloads, server };
   t.after(async () => {
     client.dispose();

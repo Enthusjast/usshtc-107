@@ -24,7 +24,7 @@ async function cli(fixture, argv, { env = { SCOW_TOKEN: 'fixture-token' }, signa
     loadIdentity: forbidden,
     createPortalApiClient(options) {
       clientOptions.push(options);
-      return createPortalApiClient({ ...options, baseUrl: fixture.baseUrl, tlsCa: fixture.tlsCa });
+      return createPortalApiClient({ ...options, baseUrl: fixture.baseUrl, allowedHosts: fixture.allowedHosts, tlsCa: fixture.tlsCa });
     },
   });
   assert.equal(signals.listenerCount('SIGINT'), 0);
@@ -82,12 +82,14 @@ test('CLI overwrite requires explicit permission and a replacement-capable backe
   assert.equal(f.requests.some(item => item.method === 'DELETE'), false);
 });
 
-test('CLI rejects a base-url flag rather than exposing a credential forwarding target', async t => {
+test('CLI rejects origin and allowlist flags rather than exposing credential forwarding controls', async t => {
   const f = await portalFixture(t);
-  const result = await cli(f, ['get', '--base-url', f.baseUrl, '--', '/remote/source', path.join(f.local, 'final')]);
-  assert.equal(result.code, 1);
-  assert.equal(result.clientOptions.length, 0);
-  assert.equal(f.requests.length, 0);
+  for (const [flag, value] of [['--base-url', f.baseUrl], ['--allowed-hosts', f.allowedHosts[0]]]) {
+    const result = await cli(f, ['get', flag, value, '--', '/remote/source', path.join(f.local, 'final')]);
+    assert.equal(result.code, 1);
+    assert.equal(result.clientOptions.length, 0);
+    assert.equal(f.requests.length, 0);
+  }
 });
 
 test('CLI transfers require SCOW_TOKEN even when no proxy configuration or key exists', async t => {

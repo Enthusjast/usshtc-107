@@ -13,7 +13,7 @@ async function collect(body) {
   for await (const chunk of body) chunks.push(Buffer.from(chunk));
   return Buffer.concat(chunks);
 }
-const info = { name: 'file.bin', type: 'FILE', mtime: '2026-10-24T00:00:00Z', mode: 0o600, size: 17 };
+const info = { name: 'file.bin', type: 'FILE', mtime: '2026-10-24T00:00:00Z', mode: 0o100600, size: 17 };
 
 function fakeClient(responses = {}) {
   const calls = [];
@@ -135,11 +135,12 @@ test('existence/type/list unwrap only official response envelopes and listing ne
     '/api/file/fileExist': { result: false },
     '/api/file/getFileType': { type: 'file' },
     '/api/file/list': { items: [{ ...info, backendPath: '/private/path', password: 'discard' },
-      { ...info, name: 'directory', type: 'DIR', size: 0 }] },
+      { ...info, name: 'directory', type: 'DIR', mode: 0o040700, size: 0 }] },
   });
   assert.equal(await api.fileExist({ cluster, path: target }), false);
   assert.equal(await api.getFileType({ cluster, path: target }), 'file');
-  assert.deepEqual(await api.list({ cluster, path: '/remote' }), [info, { ...info, name: 'directory', type: 'DIR', size: 0 }]);
+  assert.deepEqual(await api.list({ cluster, path: '/remote' }), [{ ...info, kind: 'file' },
+    { ...info, name: 'directory', type: 'DIR', kind: 'dir', mode: 0o040700, size: 0 }]);
   for (const call of calls) {
     assert.equal(call.mode, 'json');
     expectedStatus(call.options.expectedStatus, 200);
@@ -213,16 +214,21 @@ test('file type accepts exactly the lowercase values evidenced in both backend i
   }
 });
 
-test('listing preserves raw mode including symlinks and special files rather than following or relabelling them', async () => {
+test('listing classifies POSIX kinds and fails closed on absent or inconsistent kind bits', async () => {
   const items = [
     { ...info, name: 'regular', mode: 0o100640 },
     { ...info, name: 'directory', type: 'DIR', mode: 0o040750 },
-    { ...info, name: 'link', mode: 0o120777 },
+    { ...info, name: 'link', mode: 0o120777, kind: 'file' },
     { ...info, name: 'fifo', mode: 0o010600 },
+    { ...info, name: 'socket', mode: 0o140600 },
     { ...info, name: 'permission-only', mode: 0o600 },
+    { ...info, name: 'no-mode-bits', mode: 0 },
+    { ...info, name: 'mislabeled-directory', mode: 0o040700 },
+    { ...info, name: 'mislabeled-file', type: 'DIR', mode: 0o100600 },
   ];
+  const kinds = ['file', 'dir', 'link', 'other', 'other', 'other', 'other', 'other', 'other'];
   const { api } = fakeClient({ '/api/file/list': { items } });
-  assert.deepEqual(await api.list({ cluster, path: '/remote' }), items);
+  assert.deepEqual(await api.list({ cluster, path: '/remote' }), items.map((item, index) => ({ ...item, kind: kinds[index] })));
 });
 
 test('TLS fixture makes one directory per mkdir with encoded paths and preserves metadata', async t => {
@@ -237,7 +243,7 @@ test('TLS fixture makes one directory per mkdir with encoded paths and preserves
   assert.equal(await f.api.getFileType({ cluster, path: `${directory}/data` }), 'file');
   const items = await f.api.list({ cluster, path: directory });
   assert.deepEqual(items.find(item => item.name === 'data'), {
-    name: 'data', type: 'FILE', mode: 0o100640, size: 4, mtime: '2026-10-25T12:34:56.000Z',
+    name: 'data', type: 'FILE', kind: 'file', mode: 0o100640, size: 4, mtime: '2026-10-25T12:34:56.000Z',
   });
   assert.equal(items.find(item => item.name === 'nested').mode, 0o040700);
   await assert.rejects(f.api.mkdir({ cluster, path: directory }), { statusCode: 409 });
@@ -253,9 +259,10 @@ test('TLS fixture exposes symlink lstat mode while getFileType follows links lik
   f.symlinks.set('/remote/dangling', 'absent');
   const items = await f.api.list({ cluster, path: '/remote' });
   assert.deepEqual(items.find(item => item.name === 'link'), {
-    name: 'link', type: 'FILE', mode: 0o120777, size: 4, mtime: '2026-01-01T00:00:00.000Z',
+    name: 'link', type: 'FILE', kind: 'link', mode: 0o120777, size: 4, mtime: '2026-01-01T00:00:00.000Z',
   });
   assert.equal(items.find(item => item.name === 'directory-link').type, 'FILE');
+  assert.equal(items.find(item => item.name === 'directory-link').kind, 'link');
   assert.equal(await f.api.getFileType({ cluster, path: '/remote/link' }), 'file');
   assert.equal(await f.api.getFileType({ cluster, path: '/remote/directory-link' }), 'dir');
   await assert.rejects(f.api.getFileType({ cluster, path: '/remote/dangling' }), { statusCode: 400 });

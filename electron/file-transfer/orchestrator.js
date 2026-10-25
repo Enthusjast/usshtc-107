@@ -4,11 +4,12 @@ const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { Readable } = require('node:stream');
+const { fileKind } = require('../portal-api/file-api');
 
 const MAX_BYTES = 64 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const SAFE_CODES = new Set(['TRANSFER_PATH', 'TRANSFER_LIMIT', 'TRANSFER_EXISTS', 'TRANSFER_CHANGED',
-  'TRANSFER_METADATA', 'TRANSFER_HASH', 'TRANSFER_IO', 'TRANSFER_DIRECTORY', 'TRANSFER_TEMP_CONFLICT',
+  'TRANSFER_METADATA', 'TRANSFER_HASH', 'TRANSFER_IO', 'TRANSFER_DIRECTORY', 'TRANSFER_TEMP_CONFLICT', 'TRANSFER_UNSAFE_TYPE',
   'PROFILE_CHANGED', 'PORTAL_AUTH', 'PORTAL_NETWORK', 'PORTAL_TIMEOUT', 'PORTAL_PERMISSION',
   'PORTAL_NOT_FOUND', 'PORTAL_UNIMPLEMENTED', 'PORTAL_QUOTA', 'PORTAL_UNKNOWN', 'PORTAL_CANCELLED']);
 function failure(code) { return Object.assign(new Error(code), { code }); }
@@ -86,7 +87,33 @@ function sourceRange(handle, start, size, scope) {
     }
   })(), { objectMode: false, highWaterMark: 64 * 1024 });
 }
+async function inspectRemote(scope, absolute, { allowMissing = false } = {}) {
+  if (absolute === '/') return 'dir';
+  const parts = absolute.slice(1).split('/');
+  let directory = '/';
+  for (let index = 0; index < parts.length; index++) {
+    const entries = await scope.call('list', { path: directory });
+    if (!Array.isArray(entries)) throw failure('TRANSFER_METADATA');
+    const entry = entries.find(item => item?.name === parts[index]);
+    if (!entry) {
+      if (allowMissing && index === parts.length - 1) return null;
+      throw failure('PORTAL_NOT_FOUND');
+    }
+    const kind = fileKind(entry);
+    if (kind !== 'file' && kind !== 'dir') throw failure('TRANSFER_UNSAFE_TYPE');
+    if (index < parts.length - 1 && kind !== 'dir') throw failure('TRANSFER_DIRECTORY');
+    directory = path.posix.join(directory, entry.name);
+    if (index === parts.length - 1) return kind;
+  }
+  throw failure('TRANSFER_PATH');
+}
+async function requireRemoteFile(scope, source) {
+  if (await inspectRemote(scope, source) !== 'file') throw failure('TRANSFER_DIRECTORY');
+}
 async function remoteHash(scope, source, { handle, expectedSize, onBytes } = {}) {
+  // list exposes lstat mode; getFileType follows links and is not no-follow proof.
+  // These checks cannot make the portal's subsequent operation atomic/no-follow.
+  await requireRemoteFile(scope, source);
   const stream = await scope.call('download', { path: source });
   const hash = crypto.createHash('sha256');
   let bytes = 0;
@@ -112,16 +139,16 @@ async function remoteHash(scope, source, { handle, expectedSize, onBytes } = {})
     scope.check();
     if (stream.contentLength != null && bytes !== stream.contentLength
         || expectedSize !== undefined && bytes !== expectedSize) throw failure('TRANSFER_CHANGED');
+    await requireRemoteFile(scope, source);
     return { bytes, sha256: hash.digest('hex') };
   } finally { stream.cancel?.(); }
 }
 async function targetPreflight(scope, destination, overwrite) {
-  if (await scope.call('fileExist', { path: destination })) {
-    if (!overwrite) throw failure('TRANSFER_EXISTS');
-    if (await scope.call('getFileType', { path: destination }) !== 'file') throw failure('TRANSFER_DIRECTORY');
-    return true;
-  }
-  return false;
+  const kind = await inspectRemote(scope, destination, { allowMissing: true });
+  if (!kind) return false;
+  if (!overwrite) throw failure('TRANSFER_EXISTS');
+  if (kind !== 'file') throw failure('TRANSFER_DIRECTORY');
+  return true;
 }
 function safeError(error, remoteTempsRetained, remoteTargetMayBeChanged = false) {
   const result = failure(SAFE_CODES.has(error?.code) ? error.code : 'TRANSFER_IO');
@@ -171,6 +198,7 @@ async function upload(input, maxAllowedBytes = MAX_BYTES) {
     mode = multipart && total >= multipart.chunkSizeByte ? 'multipart' : 'single';
     progress('uploading');
     if (mode === 'single') {
+      await targetPreflight(scope, staging, false);
       await scope.call('upload', { path: staging, source: sourceRange(source, 0, total, scope), size: total, chunk: false, originPath: '' });
       bytes = total;
       progress('uploading');
@@ -180,12 +208,16 @@ async function upload(input, maxAllowedBytes = MAX_BYTES) {
         const size = Math.min(multipart.chunkSizeByte, total - offset);
         const hash = await hashRange(source, offset, size, scope, total);
         const chunkName = `${hash}_${index}.scowuploadtemp`;
-        await scope.call('upload', { path: path.posix.join(multipart.tempFileDir, chunkName),
+        const chunkPath = path.posix.join(multipart.tempFileDir, chunkName);
+        await targetPreflight(scope, chunkPath, false);
+        await targetPreflight(scope, staging, false);
+        await scope.call('upload', { path: chunkPath,
           source: sourceRange(source, offset, size, scope), size, chunk: true, originPath: staging });
         offset += size;
         bytes = offset;
         progress('uploading');
       }
+      await targetPreflight(scope, staging, false);
       await scope.call('mergeFileChunks', { path: directory, name, sizeByte: total });
     }
     progress('verifying');
@@ -198,6 +230,7 @@ async function upload(input, maxAllowedBytes = MAX_BYTES) {
     // Official API preflight is intentionally NOT an atomic remote no-clobber promise.
     // A concurrent creator can race this last check and the server's move operation.
     const exists = await targetPreflight(scope, destination, input.overwrite === true);
+    await requireRemoteFile(scope, staging);
     if (exists && input.overwriteInPlace === true) {
       // Standard SCP permits in-place replacement. Plain SFTP rename does not.
       // Opt-in callers retain the verified staging file and must report that a
@@ -238,7 +271,6 @@ async function download(input) {
       if (!input.overwrite) throw failure('TRANSFER_EXISTS');
       if (!existing.isFile()) throw failure('TRANSFER_DIRECTORY');
     } catch (error) { if (error.code !== 'ENOENT') throw error; }
-    if (await scope.call('getFileType', { path: source }) !== 'file') throw failure('TRANSFER_DIRECTORY');
     progress('hashing');
     const before = await remoteHash(scope, source);
     total = before.bytes;
@@ -256,6 +288,7 @@ async function download(input) {
     target = null;
     scope.check();
     progress('publishing');
+    await requireRemoteFile(scope, source);
     if (input.overwrite === true) await fs.rename(temporary, destination);
     else {
       try { await fs.link(temporary, destination); }

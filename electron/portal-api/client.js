@@ -3,6 +3,7 @@
 const https = require('node:https');
 const tls = require('node:tls');
 const { validateHeaderValue } = require('node:http');
+const { isIP } = require('node:net');
 const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const { validateCookie } = require('../credential-store');
@@ -43,12 +44,30 @@ function classifyStatus(status, body, path) {
   if ([413, 429, 507].includes(status) || ['QUOTA_EXCEEDED', 'TOO_MANY_DESKTOPS'].includes(code)) return 'QUOTA';
   return 'UNKNOWN';
 }
-function createPortalApiClient({ baseUrl = PLATFORM.url, cookie = '', tlsCa, request = https.request,
+function validateAllowedHost(host) {
+  if (typeof host !== 'string' || /[\u0000-\u0020\u007f-\u009f]/.test(host)) throw new Error();
+  const match = /^(\[[0-9a-fA-F:.]+\]|[A-Za-z0-9.-]+)(?::([0-9]+))?$/.exec(host);
+  if (!match) throw new Error();
+  const hostname = match[1];
+  if (hostname.startsWith('[')) {
+    if (isIP(hostname.slice(1, -1)) !== 6) throw new Error();
+  } else {
+    if (hostname.length > 253 || !hostname.replace(/\.$/, '').split('.').every(label =>
+      /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(label))) throw new Error();
+  }
+  if (match[2] !== undefined && (!/^(?:0|[1-9][0-9]{0,4})$/.test(match[2]) || Number(match[2]) > 65535)) throw new Error();
+  // Reject URL-invalid numeric addresses as well as malformed DNS/IP authorities.
+  new URL(`https://${host}`);
+}
+function createPortalApiClient({ baseUrl = PLATFORM.url, allowedHosts = [PLATFORM.domain], cookie = '', tlsCa, request = https.request,
   clock = globalThis, timeoutMs = 10000 } = {}) {
   let base;
   try {
+    if (!Array.isArray(allowedHosts)) throw new Error();
+    for (const host of allowedHosts) validateAllowedHost(host);
     base = new URL(baseUrl);
     if (base.protocol !== 'https:' || base.username || base.password || base.search || base.hash || base.pathname !== '/') throw new Error();
+    if (!allowedHosts.includes(base.host)) throw new Error();
   } catch (_) { throw new PortalApiError('UNKNOWN'); }
   const token = extractScowToken(cookie);
   const ca = tlsCa == null ? undefined : [...tls.rootCertificates, ...(Array.isArray(tlsCa) ? tlsCa : [tlsCa])];

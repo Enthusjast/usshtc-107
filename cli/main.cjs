@@ -67,6 +67,7 @@ const MESSAGES = Object.freeze({
   TRANSFER_HASH: 'File integrity verification failed; no destination was published.',
   TRANSFER_IO: 'Local file operation failed.',
   TRANSFER_DIRECTORY: 'Only regular files are supported; directories are never replaced.',
+  TRANSFER_UNSAFE_TYPE: 'Remote links, special files and unverified file types are refused. Choose a regular file path.',
   TRANSFER_TEMP_CONFLICT: 'The portal returned existing temporary chunks; no chunks were reused or replaced.',
 });
 async function run(argv = process.argv.slice(2), dependencies = {}) {

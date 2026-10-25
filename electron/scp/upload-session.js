@@ -26,8 +26,7 @@ function guardApi(context, expectedSize, destination) {
   };
   const guarded = {
     remoteTargetMayBeChanged: false,
-    async fileExist(input) { return Boolean((await context.target(input.path)).kind); },
-    async getFileType(input) { await regular(input.path); return 'file'; },
+    async list(input) { return context.list(input.path); },
     async initMultipartUpload(input) {
       await directory(input.path);
       return context.call('initMultipartUpload', input);

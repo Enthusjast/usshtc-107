@@ -324,7 +324,15 @@ test('slow HTTPS stream obeys total deadline and removes local parts without ret
 });
 
 test('mid-upload authentication expiry stops immediately and exposes only fixed code plus retention state', async t => {
-  const f = await portalFixture(t, { chunkSizeByte: 32768, authAfterRequest: 3 });
+  let uploadRequests = 0;
+  let requestsAtExpiry;
+  const f = await portalFixture(t, { chunkSizeByte: 32768, beforeRequest({ pathname, response, fixture }) {
+    if (pathname.endsWith('/upload') && ++uploadRequests === 2) {
+      requestsAtExpiry = fixture.requests.length;
+      response.writeHead(401);
+      response.end();
+    }
+  } });
   const source = path.join(f.local, 'source');
   await fs.writeFile(source, crypto.randomBytes(100000));
   await assert.rejects(upload({ ...options(f), localPath: source, remotePath: '/remote/final' }), error => {
@@ -333,7 +341,8 @@ test('mid-upload authentication expiry stops immediately and exposes only fixed 
     assert.equal(String(error).includes('fixture-token'), false);
     return true;
   });
-  assert.equal(f.requests.length, 4);
+  assert.equal(uploadRequests, 2, 'authentication expires after one acknowledged chunk');
+  assert.equal(f.requests.length, requestsAtExpiry, 'no request after authentication expiry');
   assert.equal(f.files.has('/remote/final'), false);
   noPublish(f);
   noRemoteCleanup(f);
@@ -433,4 +442,200 @@ test('download creates a private 0600 local part before receiving payload and re
   await download({ ...options(f), remotePath: '/remote/source', localPath: path.join(f.local, 'final') });
   assert.ok(observed);
   assert.deepEqual(await fs.readdir(f.local), ['final']);
+});
+
+test('TLS downloads refuse outside-tree file links, directory links and dangling links without fetching their targets', async t => {
+  const f = await portalFixture(t);
+  f.dirs.add('/outside');
+  f.files.set('/outside/secret', Buffer.from('outside bytes'));
+  f.symlinks.set('/remote/file-link', '/outside/secret');
+  f.symlinks.set('/remote/dir-link', '/outside');
+  f.symlinks.set('/remote/dangling', '/outside/missing');
+  for (const remote of ['/remote/file-link', '/remote/dir-link', '/remote/dir-link/secret', '/remote/dangling']) {
+    await assert.rejects(download({ ...options(f), remotePath: remote, localPath: path.join(f.local, 'final') }),
+      { code: 'TRANSFER_UNSAFE_TYPE' });
+  }
+  assert.equal(operations(f, 'getFileType').length, 0, 'following getFileType is never used as kind proof');
+  assert.equal(operations(f, 'download').length, 0);
+  assert.equal(operations(f, 'list').some(item => item.query.path === '/remote/dir-link'), false,
+    'a directory link is refused before listing through it');
+  assert.deepEqual(await fs.readdir(f.local), []);
+});
+
+test('TLS uploads refuse selected links and linked ancestors even with explicit overwrite', async t => {
+  const f = await portalFixture(t, { moveOverwrite: true });
+  const source = path.join(f.local, 'source');
+  await fs.writeFile(source, 'replacement');
+  f.dirs.add('/outside');
+  f.files.set('/outside/secret', Buffer.from('original'));
+  f.symlinks.set('/remote/file-link', '/outside/secret');
+  f.symlinks.set('/remote/dir-link', '/outside');
+  f.symlinks.set('/remote/dangling', '/outside/missing');
+  for (const overwrite of [false, true]) {
+    for (const remote of ['/remote/file-link', '/remote/dir-link', '/remote/dir-link/new', '/remote/dangling']) {
+      await assert.rejects(upload({ ...options(f), localPath: source, remotePath: remote, overwrite }),
+        { code: 'TRANSFER_UNSAFE_TYPE' });
+    }
+  }
+  assert.equal(f.files.get('/outside/secret').toString(), 'original');
+  assert.equal(f.files.has('/outside/new'), false);
+  assert.equal(operations(f, 'initMultipartUpload').length, 0);
+  assert.equal(operations(f, 'upload').length, 0);
+  assert.equal(operations(f, 'getFileType').length, 0);
+  noPublish(f);
+});
+
+for (const mode of [0o010600, 0o140600, 0o600, 0]) {
+  test(`TLS transfers reject selected and ancestor entries with unsafe mode ${mode.toString(8)}`, async t => {
+    const f = await portalFixture(t);
+    const source = path.join(f.local, 'source');
+    await fs.writeFile(source, 'data');
+    f.files.set('/remote/unsafe', Buffer.from('original'));
+    f.metadata.set('/remote/unsafe', { mode });
+    f.dirs.add('/remote/unsafe-directory');
+    f.metadata.set('/remote/unsafe-directory', { mode });
+    f.files.set('/remote/unsafe-directory/child', Buffer.from('child'));
+    for (const remote of ['/remote/unsafe', '/remote/unsafe-directory/child']) {
+      await assert.rejects(download({ ...options(f), localPath: path.join(f.local, 'final'), remotePath: remote }),
+        { code: 'TRANSFER_UNSAFE_TYPE' });
+      await assert.rejects(upload({ ...options(f), localPath: source, remotePath: remote, overwrite: true }),
+        { code: 'TRANSFER_UNSAFE_TYPE' });
+    }
+    assert.equal(f.files.get('/remote/unsafe').toString(), 'original');
+    assert.equal(operations(f, 'download').length, 0);
+    assert.equal(operations(f, 'upload').length, 0);
+    noPublish(f);
+    await noParts(f.local);
+  });
+}
+
+test('TLS upload refuses a staging-name link introduced after initialization before writing any bytes', async t => {
+  const f = await portalFixture(t, { afterRequest({ pathname, fixture }) {
+    if (pathname.endsWith('/initMultipartUpload')) {
+      fixture.symlinks.set(fixture.initializations.at(-1).target, '/outside/secret');
+    }
+  } });
+  f.dirs.add('/outside');
+  f.files.set('/outside/secret', Buffer.from('original'));
+  const source = path.join(f.local, 'source');
+  await fs.writeFile(source, 'payload');
+  await assert.rejects(upload({ ...options(f), localPath: source, remotePath: '/remote/final' }),
+    error => error.code === 'TRANSFER_UNSAFE_TYPE' && error.remoteTempsRetained === true);
+  assert.equal(f.files.get('/outside/secret').toString(), 'original');
+  assert.equal(operations(f, 'upload').length, 0);
+  noPublish(f);
+});
+
+test('TLS multipart upload refuses a server temporary-directory link before writing chunks', async t => {
+  const f = await portalFixture(t, { chunkSizeByte: 3 });
+  const source = path.join(f.local, 'source');
+  await fs.writeFile(source, 'payload');
+  f.dirs.add('/outside');
+  await assert.rejects(upload({ ...options(f), localPath: source, remotePath: '/remote/final',
+    onProgress(event) {
+      if (event.phase === 'uploading' && event.bytes === 0) {
+        const directory = f.initializations.at(-1).tempFileDir;
+        f.dirs.delete(directory);
+        f.symlinks.set(directory, '/outside');
+      }
+    },
+  }), { code: 'TRANSFER_UNSAFE_TYPE' });
+  assert.equal(operations(f, 'upload').length, 0);
+  assert.equal(operations(f, 'mergeFileChunks').length, 0);
+  noPublish(f);
+});
+
+for (const mutateAncestor of [false, true]) {
+  test(`TLS upload rejects ${mutateAncestor ? 'ancestor' : 'staging file'} link mutation before readback`, async t => {
+    const f = await portalFixture(t, { afterUpload({ fixture, query }) {
+      if (mutateAncestor) {
+        fixture.dirs.delete('/remote/subdirectory');
+        fixture.symlinks.set('/remote/subdirectory', '/outside');
+      } else {
+        fixture.files.delete(query.path);
+        fixture.symlinks.set(query.path, '/outside/secret');
+      }
+    } });
+    f.dirs.add('/outside');
+    f.dirs.add('/remote/subdirectory');
+    f.files.set('/outside/secret', Buffer.from('payload'));
+    const source = path.join(f.local, 'source');
+    await fs.writeFile(source, 'payload');
+    await assert.rejects(upload({ ...options(f), localPath: source, remotePath: '/remote/subdirectory/final' }),
+      error => error.code === 'TRANSFER_UNSAFE_TYPE' && error.remoteTempsRetained === true);
+    assert.equal(operations(f, 'download').length, 0, 'same-content link targets are not accepted as verified readback');
+    assert.equal(f.files.get('/outside/secret').toString(), 'payload');
+    noPublish(f);
+  });
+}
+
+for (const mutateStaging of [false, true]) {
+  test(`TLS upload refuses ${mutateStaging ? 'staging' : 'destination'} link mutation before publication`, async t => {
+    const f = await portalFixture(t, { moveOverwrite: true });
+    f.dirs.add('/outside');
+    f.files.set('/outside/secret', Buffer.from('payload'));
+    const source = path.join(f.local, 'source');
+    await fs.writeFile(source, 'payload');
+    await assert.rejects(upload({ ...options(f), localPath: source, remotePath: '/remote/final', overwrite: true,
+      onProgress(event) {
+        if (event.phase !== 'publishing') return;
+        const target = mutateStaging ? f.initializations.at(-1).target : '/remote/final';
+        f.files.delete(target);
+        f.symlinks.set(target, '/outside/secret');
+      },
+    }), { code: 'TRANSFER_UNSAFE_TYPE' });
+    assert.equal(operations(f, 'download').length, 1, 'mutation occurs after complete staged readback');
+    assert.equal(f.files.get('/outside/secret').toString(), 'payload');
+    noPublish(f);
+  });
+}
+
+test('TLS download rechecks mode after each stream and refuses same-content link mutation before local publication', async t => {
+  const f = await portalFixture(t, { beforeDownload({ fixture, occurrence, query }) {
+    if (occurrence === 3) fixture.metadata.set(query.path, { mode: 0o120777 });
+  } });
+  f.files.set('/remote/source', Buffer.from('payload'));
+  await assert.rejects(download({ ...options(f), remotePath: '/remote/source', localPath: path.join(f.local, 'final') }),
+    { code: 'TRANSFER_UNSAFE_TYPE' });
+  assert.equal(operations(f, 'download').length, 3);
+  assert.deepEqual(await fs.readdir(f.local), []);
+});
+
+test('TLS download refuses an ancestor changed to a link at final publication', async t => {
+  const f = await portalFixture(t);
+  f.dirs.add('/remote/subdirectory');
+  f.dirs.add('/outside');
+  f.files.set('/remote/subdirectory/source', Buffer.from('payload'));
+  f.files.set('/outside/source', Buffer.from('payload'));
+  await assert.rejects(download({ ...options(f), remotePath: '/remote/subdirectory/source', localPath: path.join(f.local, 'final'),
+    onProgress(event) {
+      if (event.phase === 'publishing') {
+        f.dirs.delete('/remote/subdirectory');
+        f.symlinks.set('/remote/subdirectory', '/outside');
+      }
+    },
+  }), { code: 'TRANSFER_UNSAFE_TYPE' });
+  assert.equal(operations(f, 'download').length, 3);
+  assert.deepEqual(await fs.readdir(f.local), []);
+});
+
+test('TLS in-place overwrite refuses a link substituted before published readback and retains partial-change warning', async t => {
+  const f = await portalFixture(t, { afterUpload({ fixture, query }) {
+    if (query.path !== '/remote/existing') return;
+    fixture.files.delete(query.path);
+    fixture.symlinks.set(query.path, '/outside/secret');
+  } });
+  f.dirs.add('/outside');
+  f.files.set('/outside/secret', Buffer.from('payload'));
+  f.files.set('/remote/existing', Buffer.from('original'));
+  const source = path.join(f.local, 'source');
+  await fs.writeFile(source, 'payload');
+  await assert.rejects(upload({ ...options(f), localPath: source, remotePath: '/remote/existing',
+    overwrite: true, overwriteInPlace: true,
+  }), error => error.code === 'TRANSFER_UNSAFE_TYPE' && error.remoteTargetMayBeChanged === true
+    && error.remoteTempsRetained === true);
+  assert.equal(operations(f, 'upload').filter(item => item.query.path === '/remote/existing').length, 1);
+  assert.equal(operations(f, 'download').some(item => item.query.path === '/remote/existing'), false);
+  assert.equal(f.files.get('/outside/secret').toString(), 'payload');
+  noPublish(f);
 });

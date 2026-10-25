@@ -404,6 +404,24 @@ test('real source official APIs: explicit credential-safe desktop/app actions an
       .toBe(crypto.createHash('sha256').update(bytes).digest('hex'));
     await expect(page.getByRole('progressbar', { name: 'Transfer progress — native-api.bin' })).toHaveAttribute('value', '100');
     await screenshot(context, 'source-official-api-transfers');
+    await application.evaluate(({ app }) => {
+      app.__acceptance.portal.dirs.add('/outside');
+      app.__acceptance.portal.files.set('/outside/private.bin', Buffer.from('fixture-private-file-body'));
+      app.__acceptance.portal.symlinks.set('/remote/outside-link', '/outside/private.bin');
+    });
+    await page.locator('#transfer-remote-path').fill('/remote/outside-link');
+    await control(context, { nextExport: 'must-not-be-downloaded.bin' });
+    await page.getByRole('button', { name: 'Download a file…', exact: true }).click();
+    await expect.poll(async () => (await rpc(page, 'listTransfers', { scope: await scope(page) })).items.at(-1))
+      .toMatchObject({ filename: 'outside-link', status: 'failed', errorCode: 'TRANSFER_UNSAFE_TYPE' });
+    const unsafeRow = page.locator('article').filter({ has: page.getByRole('heading', { name: 'outside-link', exact: true }) });
+    await expect(unsafeRow.getByRole('alert')).toBeVisible();
+    await expect(unsafeRow.getByRole('alert')).not.toContainText('TRANSFER_UNSAFE_TYPE');
+    await expect(page.locator('body')).not.toContainText('fixture-private-file-body');
+    expect(fs.existsSync(path.join(root, 'exports', 'must-not-be-downloaded.bin'))).toBe(false);
+    expect(await application.evaluate(({ app }) => app.__acceptance.portal.requests.some(request =>
+      request.pathname === '/api/file/download' && ['/outside/private.bin', '/remote/outside-link'].includes(request.query.path)))).toBe(false);
+    await screenshot(context, 'source-refused-remote-symlink');
     const safeItems = await rpc(page, 'listTransfers', { scope: await scope(page) });
     expect(JSON.stringify(safeItems)).not.toMatch(/SCOW_USER|fixture-token|\/exports\/|fixture-vnc-private|fixture-app-private/);
     await control(context, { nextExport: 'portal-safe.json' });

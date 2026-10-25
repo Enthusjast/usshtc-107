@@ -10,7 +10,7 @@ const failure = (code) => Object.assign(new Error(code), { code });
 
 // A call owns its HTTP client. No successful setup receipt survives a proxy lifecycle.
 function createPortalPreflight({ createClient = createPortalApiClient, createApi = createAuthApi,
-  baseUrl, tlsCa, request } = {}) {
+  baseUrl, allowedHosts, tlsCa, request } = {}) {
   async function call(context, execute) {
     const { cookie, signal, scope, authGeneration, assertCurrent } = context;
     const assertFresh = () => {
@@ -18,7 +18,7 @@ function createPortalPreflight({ createClient = createPortalApiClient, createApi
       assertCurrent?.();
     };
     assertFresh();
-    const client = createClient({ baseUrl, tlsCa, request, cookie });
+    const client = createClient({ baseUrl, allowedHosts, tlsCa, request, cookie });
     try {
       const result = await execute(createApi({ client }), {
         signal, scope: { ...scope, authGeneration }, assertCurrent: assertFresh,

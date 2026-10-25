@@ -6,6 +6,7 @@ const { parseScpCommand } = require('./command-parser');
 const { allocateTempFile } = require('./temp-file');
 const { runDownloadSession } = require('./download-session');
 const { runUploadSession } = require('./upload-session');
+const { fileKind } = require('../portal-api/file-api');
 
 const MAX_FILE_BYTES = 1024 ** 3;
 const MAX_SESSION_BYTES = 8 * 1024 ** 3;
@@ -48,6 +49,7 @@ function safeCode(error) {
   if (['TRANSFER_LIMIT', 'PORTAL_QUOTA', 'SCP_BUFFER_LIMIT'].includes(code)) return 'SCP_LIMIT';
   if (['ENOSPC', 'EDQUOT'].includes(code)) return 'SCP_TEMP_SPACE';
   if (code === 'TRANSFER_EXISTS') return 'SCP_EXISTS';
+  if (code === 'TRANSFER_UNSAFE_TYPE') return 'SCP_UNSAFE_TYPE';
   if (['TRANSFER_CHANGED', 'TRANSFER_METADATA', 'TRANSFER_HASH', 'TRANSFER_TEMP_CONFLICT'].includes(code)) return 'SCP_METADATA';
   if (['PORTAL_CANCELLED', 'ABORT_ERR'].includes(code)) return 'SCP_CANCELLED';
   if (['PORTAL_TIMEOUT', 'SCP_TIMEOUT'].includes(code)) return 'SCP_TIMEOUT';
@@ -71,9 +73,8 @@ function entryKind(entry) {
   if (entry.name.includes('\\') || !Number.isInteger(entry.mode) || entry.mode < 0 || entry.mode > 0xffffffff
       || !Number.isSafeInteger(entry.size) || entry.size < 0 || typeof entry.mtime !== 'string'
       || !Number.isFinite(Date.parse(entry.mtime))) throw failure('SCP_METADATA');
-  const type = entry.mode & 0o170000;
-  if (type === 0o100000 && entry.type === 'FILE') return 'file';
-  if (type === 0o040000 && entry.type === 'DIR') return 'dir';
+  const kind = fileKind(entry);
+  if (kind === 'file' || kind === 'dir') return kind;
   throw failure('SCP_UNSAFE_TYPE');
 }
 

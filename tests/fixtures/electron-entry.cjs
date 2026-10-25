@@ -156,7 +156,7 @@ const nativeRuntimeReady = startNativePortalApi(control).then(portal => {
       } } },
     clock, log: { info() {}, warn() {}, error() {}, debug() {} },
     sshDirectory: path.join(root, 'home', '.ssh'),
-    portalApiOptions: { baseUrl: portal.baseUrl, tlsCa: portal.tlsCa },
+    portalApiOptions: { baseUrl: portal.baseUrl, allowedHosts: portal.allowedHosts, tlsCa: portal.tlsCa },
     flush: async () => { if (portal.errors.length) throw new Error('Native portal fixture contract failed'); },
     autostartService: {
       getStatus: async () => ({ supported: false, enabled: false, approvalRequired: false, errorCode: null }),

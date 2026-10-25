@@ -31,7 +31,7 @@ async function fixture(t, options = {}) {
   const proxy = new ProxyServer({ host: '127.0.0.1', port: 0, cluster: 'cluster-1',
     cookie: 'SCOW_USER=fixture-token', hostKey, hostKeyPath: path.join(f.root, 'host-key'),
     authorizedKey: Buffer.from(pair.publicKeyRaw, 'base64'), authorizedKeyOpenSSH: pair.publicKey,
-    portalApiOptions: { baseUrl: f.baseUrl, tlsCa: f.tlsCa }, scpTempDirectory: path.join(f.root, 'scp-tmp'),
+    portalApiOptions: { baseUrl: f.baseUrl, allowedHosts: f.allowedHosts, tlsCa: f.tlsCa }, scpTempDirectory: path.join(f.root, 'scp-tmp'),
     webSocketFactory: () => { throw new Error('SCP must not create WSS'); }, shutdownTimeoutMs: 2000,
     ...options.proxy });
   proxy.on('error', () => {});

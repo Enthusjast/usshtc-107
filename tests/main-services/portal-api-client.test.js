@@ -9,9 +9,30 @@ const { once } = require('node:events');
 const { Readable } = require('node:stream');
 const { createPortalApiClient, PortalApiError, extractScowToken, MAX_JSON_BYTES } = require('../../electron/portal-api/client');
 const { createAuthApi } = require('../../electron/portal-api/auth-api');
+const { PLATFORM } = require('../../electron/constants');
 const ca = fs.readFileSync(path.join(__dirname, '../fixtures/loopback-test-only-cert.pem'));
 const key = fs.readFileSync(path.join(__dirname, '../fixtures/loopback-test-only-key.pem'));
 const cookie = 'other=unused; SCOW_USER=fixture-only-secret';
+
+function controlledClock() {
+  let now = 0;
+  const timers = new Map();
+  return {
+    setTimeout(callback, delay) {
+      const timer = { unref() {} };
+      timers.set(timer, { callback, deadline: now + delay });
+      return timer;
+    },
+    clearTimeout(timer) { timers.delete(timer); },
+    advance(milliseconds) {
+      now += milliseconds;
+      for (const [timer, { callback, deadline }] of timers) {
+        if (deadline <= now) { timers.delete(timer); callback(); }
+      }
+    },
+    get pending() { return timers.size; },
+  };
+}
 
 async function fixture(t, handler) {
   const sockets = new Set();
@@ -23,20 +44,85 @@ async function fixture(t, handler) {
   });
   server.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
-  const baseUrl = `https://127.0.0.1:${server.address().port}`;
+  const host = `127.0.0.1:${server.address().port}`;
+  const baseUrl = `https://${host}`;
+  const allowedHosts = [host];
   const clients = [];
   t.after(async () => {
     for (const client of clients) client.dispose();
     for (const socket of sockets) socket.destroy();
     await new Promise(resolve => server.close(resolve));
   });
-  return { server, requests, baseUrl, client(options = {}) {
-    const client = createPortalApiClient({ baseUrl, cookie, tlsCa: ca, ...options });
+  return { server, requests, baseUrl, allowedHosts, client(options = {}) {
+    const client = createPortalApiClient({ baseUrl, allowedHosts, cookie, tlsCa: ca, ...options });
     clients.push(client); return client;
   } };
 }
 
 const json = (response, status, body) => { response.writeHead(status, { 'Content-Type': 'application/json' }); response.end(JSON.stringify(body)); };
+
+test('default credential scope rejects unknown, subdomain-spoofed and alternate-port hosts before allocation', t => {
+  let outgoing = 0;
+  const agent = t.mock.method(https, 'Agent', function unexpectedAgent() { throw new Error('must not allocate'); });
+  for (const baseUrl of ['https://evil.example', 'https://107.ustc.edu.cn.evil.example',
+    'https://sub.107.ustc.edu.cn', 'https://107.ustc.edu.cn:444', 'https://127.0.0.1',
+    'https://107.ustc.edu.cn.', 'http://107.ustc.edu.cn', 'https://user:secret@107.ustc.edu.cn',
+    'https://107.ustc.edu.cn/api', 'https://107.ustc.edu.cn/?token=secret', 'https://107.ustc.edu.cn/#secret']) {
+    assert.throws(() => createPortalApiClient({ baseUrl, cookie, request() { outgoing += 1; } }), { code: 'PORTAL_UNKNOWN' });
+  }
+  assert.equal(outgoing, 0);
+  assert.equal(agent.mock.callCount(), 0);
+});
+
+test('the entire explicit allowlist is validated before requests or agent allocation', t => {
+  let outgoing = 0;
+  const agent = t.mock.method(https, 'Agent', function unexpectedAgent() { throw new Error('must not allocate'); });
+  const malformed = ['', null, 123, {}, new String('localhost'), 'https://localhost', 'user@localhost',
+    'user:password@localhost', 'localhost/', 'localhost/path', 'localhost?query', 'localhost#hash',
+    '*.example.com', 'local*host', 'localhost\\path', 'localhost\n', 'localhost\r', 'local\thost',
+    'localhost\u0000', 'localhost\u007f', 'localhost\u0085', ' localhost', 'localhost ', 'localhost:',
+    'localhost:-1', 'localhost:65536', 'localhost:01', 'localhost:abc', '-localhost', 'localhost-',
+    'local..host', 'local_host', '[not-ipv6]', '::1', '999.999.999.999'];
+  const invalidLists = [null, {}, PLATFORM.domain, [], [PLATFORM.domain, ,],
+    ...malformed.map(host => [PLATFORM.domain, host])];
+  for (const allowedHosts of invalidLists) {
+    assert.throws(() => createPortalApiClient({ allowedHosts, cookie, request() { outgoing += 1; } }), { code: 'PORTAL_UNKNOWN' });
+  }
+  assert.equal(outgoing, 0);
+  assert.equal(agent.mock.callCount(), 0);
+});
+
+test('the production origin remains the default exact credential destination', async t => {
+  let outgoing = 0;
+  const client = createPortalApiClient({ cookie, request(url, options) {
+    outgoing += 1;
+    assert.equal(url.host, PLATFORM.domain);
+    assert.equal(options.headers.Cookie, 'SCOW_USER=fixture-only-secret');
+    assert.equal(options.rejectUnauthorized, true);
+    throw new Error('fixture transport stop');
+  } });
+  t.after(() => client.dispose());
+  await assert.rejects(client.json('/api/file/fileExist'), { code: 'PORTAL_NETWORK' });
+  assert.equal(outgoing, 1);
+});
+
+test('only explicit exact loopback host and port permission sends Cookie over trusted local TLS', async t => {
+  const f = await fixture(t, (request, response) => {
+    assert.equal(request.headers.host, f.allowedHosts[0]);
+    assert.equal(request.headers.cookie, 'SCOW_USER=fixture-only-secret');
+    json(response, 200, { ok: true });
+  });
+  let outgoing = 0;
+  const request = (...args) => { outgoing += 1; return https.request(...args); };
+  assert.throws(() => f.client({ allowedHosts: undefined, request }), { code: 'PORTAL_UNKNOWN' });
+  assert.throws(() => f.client({ allowedHosts: ['127.0.0.1'], request }), { code: 'PORTAL_UNKNOWN' });
+  assert.throws(() => f.client({ baseUrl: f.baseUrl.replace('127.0.0.1', 'localhost'), request }), { code: 'PORTAL_UNKNOWN' });
+  assert.equal(outgoing, 0);
+  assert.deepEqual(f.requests, []);
+  assert.deepEqual(await f.client({ request }).json('/api/file/fileExist'), { ok: true });
+  assert.equal(outgoing, 1);
+  assert.deepEqual(f.requests, ['/api/file/fileExist']);
+});
 
 test('token validation sends only its scoped token, discards identity and accepts optional name', async t => {
   const f = await fixture(t, (request, response) => {
@@ -109,10 +195,23 @@ test('network failure and a bounded response deadline remain distinct from authe
     if (request.url.includes('reset')) request.socket.destroy();
     else { response.writeHead(200); response.flushHeaders(); }
   });
-  const client = f.client();
+  const clock = controlledClock();
+  let receivedHeaders;
+  const headers = new Promise(resolve => { receivedHeaders = resolve; });
+  const client = f.client({ clock, request(...args) {
+    const request = https.request(...args);
+    request.once('response', receivedHeaders);
+    return request;
+  } });
   const auth = createAuthApi({ client });
   await assert.rejects(client.json('/api/reset'), { code: 'PORTAL_NETWORK' });
-  assert.deepEqual(await auth.validateToken('valid-shaped-fixture', { timeoutMs: 25 }), { status: 'network_error', errorCode: 'PORTAL_TIMEOUT' });
+  assert.equal(clock.pending, 0);
+  const validation = auth.validateToken('valid-shaped-fixture', { timeoutMs: 1000 });
+  await headers;
+  assert.equal(clock.pending, 1);
+  clock.advance(1000);
+  assert.deepEqual(await validation, { status: 'network_error', errorCode: 'PORTAL_TIMEOUT' });
+  assert.equal(clock.pending, 0);
 });
 
 test('stream ownership rejects late bytes after a profile/authentication change', async t => {
@@ -128,13 +227,21 @@ test('stream ownership rejects late bytes after a profile/authentication change'
 
 test('unconsumed streams time out and cancellation before dispatch creates no request', async t => {
   const f = await fixture(t, (_request, response) => { response.writeHead(200); response.flushHeaders(); });
-  const client = f.client();
+  const clock = controlledClock();
+  let outgoing = 0;
+  const client = f.client({ clock, request(...args) { outgoing += 1; return https.request(...args); } });
   const controller = new AbortController(); controller.abort();
   await assert.rejects(client.json('/api/file/fileExist', { signal: controller.signal }), { code: 'PORTAL_CANCELLED' });
+  assert.equal(outgoing, 0);
+  assert.equal(clock.pending, 0);
   assert.deepEqual(f.requests, []);
-  const value = await client.stream('/api/file/download', { timeoutMs: 25 });
-  await new Promise(resolve => setTimeout(resolve, 45));
+  // Resolving stream() is the response-header barrier; no body consumer has started.
+  const value = await client.stream('/api/file/download', { timeoutMs: 1000 });
+  assert.equal(outgoing, 1);
+  assert.equal(clock.pending, 1);
+  clock.advance(1000);
   await assert.rejects(async () => { for await (const _bytes of value.body) {} }, { code: 'PORTAL_TIMEOUT' });
+  assert.equal(clock.pending, 0);
 });
 
 test('response size limits fail without returning a partial success or raw body', async t => {

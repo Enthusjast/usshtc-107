@@ -10,7 +10,7 @@ const CODES = new Set(['AUTH_REQUIRED', 'PROFILE_CHANGED', 'INVALID_ARGUMENT', '
   'PORTAL_AUTH', 'PORTAL_NETWORK', 'PORTAL_TIMEOUT', 'PORTAL_PERMISSION', 'PORTAL_NOT_FOUND',
   'PORTAL_UNIMPLEMENTED', 'PORTAL_QUOTA', 'PORTAL_UNKNOWN', 'PORTAL_CANCELLED',
   'TRANSFER_PATH', 'TRANSFER_LIMIT', 'TRANSFER_EXISTS', 'TRANSFER_CHANGED', 'TRANSFER_METADATA',
-  'TRANSFER_HASH', 'TRANSFER_IO', 'TRANSFER_DIRECTORY', 'TRANSFER_TEMP_CONFLICT']);
+  'TRANSFER_HASH', 'TRANSFER_IO', 'TRANSFER_DIRECTORY', 'TRANSFER_UNSAFE_TYPE', 'TRANSFER_TEMP_CONFLICT']);
 const STATUSES = new Set(['queued', 'running', 'completed', 'failed', 'cancelled']);
 const PHASES = new Set(['queued', 'hashing', 'negotiating', 'uploading', 'downloading', 'verifying', 'publishing', 'completed']);
 const MODES = new Set(['single', 'multipart']);

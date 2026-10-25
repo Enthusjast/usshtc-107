@@ -14,15 +14,23 @@ function absolutePath(value) {
   if (!result.startsWith('/') || path.posix.normalize(result) !== result) throw invalid();
   return result;
 }
+function fileKind(item) {
+  if (!item || !Number.isInteger(item.mode) || item.mode < 0 || item.mode > 0xffffffff) return 'other';
+  const type = item.mode & 0o170000;
+  if (type === 0o120000) return 'link';
+  if (type === 0o100000 && item.type === 'FILE') return 'file';
+  if (type === 0o040000 && item.type === 'DIR') return 'dir';
+  return 'other';
+}
 function fileInfo(item) {
   if (!item || typeof item.name !== 'string' || !item.name.length || item.name === '.' || item.name === '..'
       || /[\\/\u0000-\u001f\u007f]/.test(item.name) || !['FILE', 'DIR'].includes(item.type)
       || typeof item.mtime !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(item.mtime)
       || !Number.isFinite(Date.parse(item.mtime)) || !Number.isInteger(item.mode) || item.mode < 0 || item.mode > 0xffffffff
       || !Number.isSafeInteger(item.size) || item.size < 0) throw invalid();
-  // Preserve raw mode: the SSH backend labels symlinks FILE. Callers enforcing
-  // no-follow must inspect S_IFMT on selected entries, not trust the type enum.
-  return { name: item.name, type: item.type, mtime: item.mtime, mode: item.mode, size: item.size };
+  // The SSH backend labels links FILE; only matching POSIX kind bits prove an
+  // ordinary file/directory. Missing bits and inconsistent enums fail closed.
+  return { name: item.name, type: item.type, kind: fileKind(item), mtime: item.mtime, mode: item.mode, size: item.size };
 }
 function options(input) {
   const { signal, scope, assertCurrent, timeoutMs, maxBytes } = input;
@@ -122,4 +130,4 @@ function createFileApi({ client }) {
     },
   };
 }
-module.exports = { createFileApi };
+module.exports = { createFileApi, fileKind };

@@ -211,7 +211,7 @@ test('CLI get/put use the portal API directly without a proxy or SSH identity', 
   const stdout = capture();
   const stderr = capture();
   const dependencies = { stdout, stderr, env: { SCOW_TOKEN: 'fixture-token' }, signals: new EventEmitter(),
-    createPortalApiClient: options => createPortalApiClient({ ...options, baseUrl: fixture.baseUrl, tlsCa: fixture.tlsCa }) };
+    createPortalApiClient: options => createPortalApiClient({ ...options, baseUrl: fixture.baseUrl, allowedHosts: fixture.allowedHosts, tlsCa: fixture.tlsCa }) };
   assert.equal(await run(['put', '--', local, '/remote-file'], dependencies), 0, stderr.value);
   assert.match(stdout.value, /SHA-256 verified/);
   assert.equal(await run(['get', '--', '/remote-file', output], dependencies), 0, stderr.value);
