@@ -109,6 +109,9 @@ function keychainCommand(env, args) {
 }
 function prepareKeychain(keychain, env) {
   fs.mkdirSync(path.dirname(keychain), { recursive: true, mode: 0o700 });
+  // Security.framework silently drops default/search-list writes if this is absent.
+  const preferences = path.join(env.HOME, 'Library/Preferences');
+  fs.mkdirSync(preferences, { recursive: true, mode: 0o700 });
   const password = randomBytes(32).toString('hex');
   for (const args of [
     ['create-keychain', '-p', password, keychain],
@@ -117,6 +120,9 @@ function prepareKeychain(keychain, env) {
     ['default-keychain', '-d', 'user', '-s', keychain],
     ['list-keychains', '-d', 'user', '-s', keychain],
   ]) keychainCommand(env, args);
+  if (!fs.statSync(path.join(preferences, 'com.apple.security.plist')).isFile()) {
+    throw new Error('Native acceptance keychain preferences were not persisted');
+  }
 }
 async function launch(testInfo, { packaged = false } = {}) {
   const executable = packaged ? packagedExecutable() : require('electron');
